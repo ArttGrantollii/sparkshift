@@ -19,16 +19,29 @@ SparkShift is developed on Linux (WSL2 on Windows works). You need:
 
 - [uv](https://docs.astral.sh/uv/) — manages Python and project dependencies
 - Git
+- Java 17, 21, or 25 (development and CI use 21) — only for running the Spark tests
 
 ```bash
 git clone https://github.com/ArttGrantollii/sparkshift.git
 cd sparkshift
 uv sync
-uv run python -c "import sparkshift; print(sparkshift.__version__)"
+uv run pre-commit install
 ```
 
 `uv sync` installs the Python version pinned in `.python-version` if needed,
-creates a `.venv`, and installs SparkShift in editable mode.
+creates a `.venv`, and installs SparkShift in editable mode together with the
+development tools. PySpark is a development dependency only — SparkShift
+generates PySpark code but does not need Spark to run.
+
+### Running checks
+
+```bash
+uv run pytest                  # all tests, including real Spark
+uv run pytest -m "not spark"   # fast tests only; does not start Spark
+uv run pytest --cov            # with coverage report
+uv run ruff check .            # lint
+uv run ruff format --check .   # formatting
+```
 
 ## License
 

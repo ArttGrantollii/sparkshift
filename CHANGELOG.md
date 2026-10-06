@@ -10,3 +10,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Project skeleton: `src/` layout, `pyproject.toml` packaging, Apache-2.0 license.
+- Test and quality tooling: pytest, coverage, Ruff, and pre-commit hooks.
+- Architecture test ensuring the core package never imports PySpark.
+- Spark smoke test verifying a local SparkSession can execute SQL.

@@ -37,3 +37,41 @@ path = "src/sparkshift/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sparkshift"]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.6.2",
+    "pyspark>=4.2.0",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.16.10",
+]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes: unused imports, undefined names
+    "I",   # import sorting
+    "UP",  # pyupgrade: modern Python syntax
+    "B",   # flake8-bugbear: common bug patterns
+    "SIM", # flake8-simplify
+    "RUF", # Ruff-specific rules
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers", "--strict-config"]
+markers = [
+    "spark: starts a real local SparkSession (slower; requires Java)",
+]
+
+[tool.coverage.run]
+source = ["sparkshift"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
