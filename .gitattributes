@@ -1,0 +1,3 @@
+# Normalize line endings to LF in the repository and working tree,
+# regardless of the contributor's OS or git settings.
+* text=auto eol=lf

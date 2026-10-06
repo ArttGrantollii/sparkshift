@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sparkshift"
+dynamic = ["version"]
+description = "Convert SQL into readable, idiomatic, tested PySpark DataFrame code."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Art Grantolli" }]
+keywords = ["pyspark", "spark", "sql", "transpiler", "databricks", "data-engineering"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: Software Development :: Code Generators",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/ArttGrantollii/sparkshift"
+Repository = "https://github.com/ArttGrantollii/sparkshift"
+Issues = "https://github.com/ArttGrantollii/sparkshift/issues"
+Changelog = "https://github.com/ArttGrantollii/sparkshift/blob/main/CHANGELOG.md"
+
+[tool.hatch.version]
+path = "src/sparkshift/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sparkshift"]

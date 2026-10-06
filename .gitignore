@@ -1,0 +1,34 @@
+# Python bytecode and build artifacts
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+
+# Tool caches and reports
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Local Spark artifacts (created when tests start a SparkSession)
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Secrets — never commit. Use .env.example to document required variables.
+.env
+.env.*
+!.env.example
+
+# Editors and OS
+.idea/
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
