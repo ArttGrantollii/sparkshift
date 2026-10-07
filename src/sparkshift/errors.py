@@ -7,6 +7,8 @@ exception types of libraries SparkShift uses internally.
 
 from collections.abc import Sequence
 
+from sparkshift.diagnostics import Diagnostic
+
 
 class SparkShiftError(Exception):
     """Base class for all SparkShift errors."""
@@ -43,6 +45,20 @@ class SQLParseError(SparkShiftError):
         self.column = column
         location = f" (line {line}, column {column})" if line is not None else ""
         super().__init__(f"{message}{location}")
+
+
+class UnsupportedSQLError(SparkShiftError):
+    """The SQL is valid but uses constructs SparkShift cannot translate safely.
+
+    ``issues`` lists every unsupported construct found, not just the first, so
+    callers can show all of them at once.
+    """
+
+    def __init__(self, issues: Sequence[Diagnostic]) -> None:
+        self.issues = tuple(issues)
+        noun = "construct" if len(self.issues) == 1 else "constructs"
+        details = "\n".join(f"  - {issue}" for issue in self.issues)
+        super().__init__(f"{len(self.issues)} unsupported {noun}:\n{details}")
 
 
 class MultipleStatementsError(SparkShiftError):

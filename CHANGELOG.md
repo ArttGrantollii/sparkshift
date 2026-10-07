@@ -18,4 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SQL parsing for the generic dialect plus T-SQL, PostgreSQL, MySQL, Snowflake,
   BigQuery, and Oracle, with SparkShift error types (`SQLParseError`,
   `UnsupportedDialectError`, `MultipleStatementsError`) that report readable
-  messages with line and column. Parsing is internal; no public conversion API yet.
+  messages with line and column.
+- `sparkshift.convert()`: the first public API. Converts `SELECT * FROM table`
+  into PySpark and returns a `ConversionResult`; all other queries raise
+  `UnsupportedSQLError` listing every unsupported construct.
+- Intermediate representation and emitter (ADR 0003), with architecture tests
+  keeping SQLGlot out of both.

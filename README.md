@@ -5,9 +5,9 @@
 
 Convert SQL into readable, idiomatic, tested PySpark DataFrame code.
 
-> **Status: early development.** SparkShift does not convert anything yet.
-> This repository currently contains only the project foundation.
-> See [ROADMAP.md](ROADMAP.md) for planned scope.
+> **Status: early development.** The conversion pipeline works end to end, but
+> only for the simplest query shape (see below). Everything else is rejected
+> with a clear error. See [ROADMAP.md](ROADMAP.md) for planned scope.
 
 ## Goal
 
@@ -15,6 +15,38 @@ Given a SQL query, SparkShift aims to generate PySpark DataFrame API code that a
 data engineer would be comfortable maintaining — and to prove the generated code
 is correct by executing both the original SQL and the generated PySpark against
 the same data on real Apache Spark.
+
+## Usage
+
+```python
+import sparkshift
+
+result = sparkshift.convert("SELECT * FROM sales.customers")
+print(result.code)
+# result = spark.table("sales.customers")
+```
+
+Pass `dialect=` for non-generic SQL: `tsql`, `postgres`, `mysql`, `snowflake`,
+`bigquery`, or `oracle`.
+
+Queries SparkShift cannot translate safely raise `UnsupportedSQLError`, listing
+every unsupported construct:
+
+```text
+UnsupportedSQLError: 3 unsupported constructs:
+  - column list: name
+  - WHERE clause: WHERE age > 30
+  - ORDER BY clause: ORDER BY name
+```
+
+## Supported SQL
+
+| Construct | Status |
+|---|---|
+| `SELECT * FROM table` (including `schema.table` and quoted names) | Supported |
+| Everything else | Unsupported — rejected with an error |
+
+Support grows feature by feature; see the [roadmap](ROADMAP.md).
 
 ## Development setup
 

@@ -1,8 +1,60 @@
 """Architecture rules that must hold for the whole package."""
 
+import ast
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
+
+import sparkshift
+
+PACKAGE_DIR = Path(sparkshift.__file__).parent
+
+# Modules allowed to import SQLGlot directly. Keeping SQLGlot confined to the
+# frontend limits the impact of its API changes (see ADR 0001 and ADR 0003).
+SQLGLOT_FRONTEND = frozenset({"parsing", "translate"})
+
+# Modules that must not depend on SQLGlot at all, even indirectly. The emitter
+# and IR are shared by every frontend, including the planned SAS frontend.
+SQLGLOT_FREE = frozenset({"ir", "emit", "diagnostics", "errors"})
+
+
+def imported_modules(module: str) -> set[str]:
+    """Return the modules a sparkshift module imports, read from its source."""
+    tree = ast.parse((PACKAGE_DIR / f"{module}.py").read_text())
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module)
+    return names
+
+
+def all_modules() -> list[str]:
+    return sorted(path.stem for path in PACKAGE_DIR.glob("*.py"))
+
+
+def test_only_the_frontend_imports_sqlglot() -> None:
+    importers = {
+        module
+        for module in all_modules()
+        if any(name.split(".")[0] == "sqlglot" for name in imported_modules(module))
+    }
+
+    assert importers <= SQLGLOT_FRONTEND
+
+
+def test_ir_and_emitter_never_depend_on_sqlglot() -> None:
+    for module in SQLGLOT_FREE:
+        for name in imported_modules(module):
+            assert name.split(".")[0] != "sqlglot", f"{module} imports {name}"
+            if name.startswith("sparkshift."):
+                dependency = name.removeprefix("sparkshift.")
+                assert dependency in SQLGLOT_FREE, (
+                    f"{module} imports {dependency}, which may depend on SQLGlot"
+                )
+
 
 # Modules the core must never import. SparkShift generates PySpark code; it
 # never runs Spark. Keeping these out of the core keeps the runtime small and

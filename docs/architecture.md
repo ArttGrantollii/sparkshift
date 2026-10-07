@@ -1,8 +1,8 @@
 # Architecture
 
-> **Status:** forward-looking design note. The translation engine does not
-> exist yet. This document records the boundaries we intend to keep so that
-> early implementation choices do not block the planned interfaces.
+> **Status:** the pipeline below exists end to end for the smallest query
+> (`SELECT * FROM table`). Interfaces other than the Python API are planned.
+> This document records the boundaries that keep them possible.
 
 ## The core idea
 
@@ -22,23 +22,38 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    SQL[SQL text] --> Parse[SQLGlot parser]
+    SQL[SQL text] --> Parse["parsing.py<br/>(SQLGlot parser)"]
     Parse --> AST[SQLGlot AST]
-    AST --> Analyze[SparkShift analysis]
-    Analyze --> IR[Internal representation]
-    IR --> Emit[PySpark emitter]
-    Emit --> Result[Generated code<br/>+ warnings / unsupported]
+    AST --> Translate[translate.py]
+    Translate --> IR["IR<br/>(ir.py)"]
+    IR --> Emit[emit.py]
+    Emit --> Result["ConversionResult<br/>code + warnings"]
+    Translate -. unsupported .-> Error[UnsupportedSQLError<br/>all issues]
 ```
 
-- **SQLGlot** parses SQL from many dialects into a syntax tree
-  ([ADR 0001](adr/0001-use-sqlglot-for-parsing.md)).
-- **Analysis** walks the tree and decides, construct by construct, whether it
-  can be translated natively, translated with a warned fallback, or must be
-  rejected as unsupported.
-- **The emitter** turns the analyzed query into readable PySpark source code.
+| Stage | Module | Responsibility |
+|---|---|---|
+| Frontend | `parsing.py` | SQL text → SQLGlot syntax tree; converts SQLGlot errors into SparkShift errors ([ADR 0001](adr/0001-use-sqlglot-for-parsing.md)) |
+| Frontend | `translate.py` | Syntax tree → IR. Works from an allowlist: anything it does not explicitly handle is reported as unsupported, and all issues are collected before failing |
+| Middle | `ir.py` | SparkShift's own description of DataFrame operations ([ADR 0003](adr/0003-introduce-a-small-ir.md)) |
+| Backend | `emit.py` | IR → readable PySpark source |
+| Entry point | `api.py` | `convert(sql, dialect)` runs the stages in order |
 
-Whether a separate internal representation is needed — and what shape it
-takes — is decided when the first translation code is written (Phase 1.1).
+Only `parsing.py` and `translate.py` may import SQLGlot; the IR and emitter
+never depend on it. Both rules are enforced by `tests/test_architecture.py`.
+
+### Errors and warnings
+
+Errors are exceptions; warnings are data. Every exception derives from
+`SparkShiftError`. A query that cannot be translated safely raises
+`UnsupportedSQLError`, whose `issues` list every unsupported construct. A
+successful conversion returns a `ConversionResult` whose `warnings` describe
+anything the user should review.
+
+### Generated-code contract
+
+Generated code assigns the final DataFrame to a variable named `result` and
+expects a SparkSession named `spark` to exist, as in a Databricks notebook.
 
 ## Rules for the core
 
