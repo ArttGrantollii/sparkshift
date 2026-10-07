@@ -46,6 +46,11 @@ uv run ruff check .            # lint
 uv run ruff format --check .   # formatting
 ```
 
+## Design documents
+
+- [Architecture](docs/architecture.md) — how the core is structured and the rules that keep it portable
+- [Architecture Decision Records](docs/adr/) — significant decisions and their trade-offs
+
 ## License
 
 [Apache License 2.0](LICENSE)

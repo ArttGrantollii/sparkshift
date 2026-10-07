@@ -7,7 +7,7 @@ Status legend: **Done** · **In progress** · **Planned**
 
 | Phase | Scope | Status |
 |---|---|---|
-| 0 | Engineering foundation: packaging, tooling, CI | In progress |
+| 0 | Engineering foundation: packaging, tooling, CI, architecture notes | Done |
 | 1 | Core SQL → PySpark engine: expressions, SELECT/WHERE, joins, aggregation, ordering, window functions, CTEs, set operations — with Spark equivalence tests | Planned |
 | 2 | CLI (`sparkshift convert`), packaging polish, verified examples | Planned |
 | 3 | Advanced SQL: subqueries (IN / EXISTS), QUALIFY, multi-dialect testing, coverage reporting | Planned |
