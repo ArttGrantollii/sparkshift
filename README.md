@@ -1,5 +1,8 @@
 # SparkShift
 
+[![CI](https://github.com/ArttGrantollii/sparkshift/actions/workflows/ci.yml/badge.svg)](https://github.com/ArttGrantollii/sparkshift/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 Convert SQL into readable, idiomatic, tested PySpark DataFrame code.
 
 > **Status: early development.** SparkShift does not convert anything yet.
