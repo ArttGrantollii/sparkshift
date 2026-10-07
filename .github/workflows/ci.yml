@@ -21,7 +21,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v10
+      # setup-uv publishes only full version tags (no moving "v10" tag).
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
 
@@ -47,7 +48,7 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
