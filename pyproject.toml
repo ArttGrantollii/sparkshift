@@ -24,7 +24,9 @@ classifiers = [
     "Topic :: Software Development :: Code Generators",
     "Typing :: Typed",
 ]
-dependencies = []
+dependencies = [
+    "sqlglot>=30.21,<31",
+]
 
 [project.urls]
 Homepage = "https://github.com/ArttGrantollii/sparkshift"
@@ -73,5 +75,6 @@ source = ["sparkshift"]
 branch = true
 
 [tool.coverage.report]
+fail_under = 85
 show_missing = true
 skip_covered = false

@@ -43,8 +43,12 @@ so the dependency stays pure Python.
 
 - SparkShift is coupled to SQLGlot's syntax-tree classes, which change between
   major versions and release frequently. Mitigations: keep SQLGlot-specific
-  code inside the analysis layer, use a bounded version range, and rely on the
-  test suite to detect behavior changes on upgrade.
-- SQLGlot may accept SQL more leniently than the source database does. Parsing
-  successfully does not mean a construct is supported; SparkShift's own
-  analysis decides that.
+  code inside the analysis layer, use a bounded version range
+  (`sqlglot>=30.21,<31`), and rely on the test suite to detect behavior changes
+  on upgrade.
+- SQLGlot may accept SQL more leniently than the source database does — for
+  example, `SELECT FROM t` parses without error. Parsing successfully does not
+  mean a construct is supported; SparkShift's own analysis decides that.
+- SQLGlot's exceptions and error text expose Python internals (token and class
+  representations). `parsing.py` converts them into SparkShift errors with
+  readable messages and start-of-token positions.
