@@ -27,6 +27,8 @@ result = sparkshift.convert(
 print(result.code)
 ```
 
+<!-- Exact SparkShift output, checked by tests/test_readme.py. Not reformatted. -->
+<!-- fmt: off -->
 ```python
 from decimal import Decimal
 
@@ -40,6 +42,7 @@ result = (
     )
 )
 ```
+<!-- fmt: on -->
 
 The generated code imports what it uses, expects a SparkSession named `spark`
 (as in a Databricks notebook), and assigns the final DataFrame to `result`.

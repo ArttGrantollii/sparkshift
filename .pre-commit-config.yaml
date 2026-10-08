@@ -22,4 +22,5 @@ repos:
         name: ruff format
         entry: uv run --frozen ruff format
         language: system
-        types_or: [python, pyi]
+        # Markdown too: Ruff formats Python code blocks in docs, and CI checks them.
+        types_or: [python, pyi, markdown]
