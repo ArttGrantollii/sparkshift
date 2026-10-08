@@ -7,11 +7,13 @@ SQLGlot versions — so nothing is ever silently ignored. All unsupported parts
 are collected before failing, so users see them at once.
 """
 
+from decimal import Decimal
+
 from sqlglot import exp
 
+from sparkshift import ir
 from sparkshift.diagnostics import Diagnostic
 from sparkshift.errors import SQLParseError, UnsupportedSQLError
-from sparkshift.ir import Relation, TableScan
 
 _SELECT_PART_NAMES = {
     "with_": "WITH clause",
@@ -39,93 +41,259 @@ _TABLE_PART_NAMES = {
 # Parts of a table reference that make up its name.
 _TABLE_NAME_PARTS = frozenset({"this", "db", "catalog"})
 
+_BINARY_OPERATORS: dict[type[exp.Expression], ir.BinaryOperator] = {
+    exp.Add: ir.BinaryOperator.ADD,
+    exp.Sub: ir.BinaryOperator.SUBTRACT,
+    exp.Mul: ir.BinaryOperator.MULTIPLY,
+    exp.Div: ir.BinaryOperator.DIVIDE,
+    exp.Mod: ir.BinaryOperator.MODULO,
+    exp.EQ: ir.BinaryOperator.EQUAL,
+    exp.NEQ: ir.BinaryOperator.NOT_EQUAL,
+    exp.LT: ir.BinaryOperator.LESS,
+    exp.LTE: ir.BinaryOperator.LESS_EQUAL,
+    exp.GT: ir.BinaryOperator.GREATER,
+    exp.GTE: ir.BinaryOperator.GREATER_EQUAL,
+    exp.And: ir.BinaryOperator.AND,
+    exp.Or: ir.BinaryOperator.OR,
+}
 
-def translate(tree: exp.Expression, dialect: str | None = None) -> Relation:
+_INTEGER_DIVISION_HINT = (
+    "Dividing two integers discards the remainder in this dialect but not in "
+    "Spark, and SparkShift cannot see column types."
+)
+_SAFE_DIVISION_HINT = (
+    "Division by zero returns NULL in this dialect but raises an error in Spark."
+)
+_TSQL_PLUS_HINT = (
+    "T-SQL uses + for both addition and string concatenation, and SparkShift "
+    "cannot see column types."
+)
+
+
+def translate(tree: exp.Expression, dialect: str | None = None) -> ir.Relation:
     """Translate one parsed statement into IR.
 
-    ``dialect`` is the SQLGlot dialect the SQL was written in; it is used to
-    render SQL fragments in diagnostics.
+    ``dialect`` is the SQLGlot dialect the SQL was written in. It affects how
+    some operators are interpreted and how SQL fragments are shown in
+    diagnostics.
 
     Raises:
         SQLParseError: the statement is malformed in a way the parser accepted.
         UnsupportedSQLError: the statement uses unsupported constructs.
     """
-    if not isinstance(tree, exp.Select):
-        raise UnsupportedSQLError(
-            [
-                Diagnostic(
-                    f"{tree.key.upper()} statement",
-                    _fragment(tree, dialect),
-                    hint="Only SELECT queries can be converted.",
-                )
-            ]
-        )
-    if not tree.expressions:
-        # SQLGlot's grammar accepts "SELECT FROM t"; SQL does not.
-        raise SQLParseError("SELECT has no columns.")
-
-    issues: list[Diagnostic] = []
-    source: Relation | None = None
-
-    # Walk the parts in SQLGlot's declared order so diagnostics are deterministic.
-    for part in exp.Select.arg_types:
-        value = tree.args.get(part)
-        if part == "expressions":
-            _check_projection(value, dialect, issues)
-        elif part == "from_":
-            source = _translate_from(tree, dialect, issues)
-        elif value:
-            name = _SELECT_PART_NAMES.get(part, f"{part.strip('_').upper()} clause")
-            for node in value if isinstance(value, list) else [value]:
-                issues.append(Diagnostic(name, _fragment(node, dialect)))
-
-    if issues:
-        raise UnsupportedSQLError(issues)
-    assert source is not None  # a FROM-less query always records an issue
-    return source
+    return _Translator(dialect).statement(tree)
 
 
-def _check_projection(
-    expressions: list[exp.Expression],
-    dialect: str | None,
-    issues: list[Diagnostic],
-) -> None:
-    if len(expressions) == 1 and isinstance(expressions[0], exp.Star):
-        return
-    columns = ", ".join(_fragment(expression, dialect) for expression in expressions)
-    issues.append(Diagnostic("column list", columns))
+class _Translator:
+    def __init__(self, dialect: str | None) -> None:
+        self.dialect = dialect
+        self.issues: list[Diagnostic] = []
 
+    def statement(self, tree: exp.Expression) -> ir.Relation:
+        if not isinstance(tree, exp.Select):
+            self.unsupported(
+                f"{tree.key.upper()} statement",
+                tree,
+                hint="Only SELECT queries can be converted.",
+            )
+            raise UnsupportedSQLError(self.issues)
+        if not tree.expressions:
+            # SQLGlot's grammar accepts "SELECT FROM t"; SQL does not.
+            raise SQLParseError("SELECT has no columns.")
 
-def _translate_from(
-    select: exp.Select,
-    dialect: str | None,
-    issues: list[Diagnostic],
-) -> TableScan | None:
-    from_ = select.args.get("from_")
-    if from_ is None:
-        issues.append(Diagnostic("SELECT without FROM", _fragment(select, dialect)))
+        relation = self.select(tree)
+        if self.issues:
+            raise UnsupportedSQLError(self.issues)
+        assert relation is not None  # every failure path records an issue
+        return relation
+
+    # --- Queries ---------------------------------------------------------
+
+    def select(self, select: exp.Select) -> ir.Relation | None:
+        source: ir.Relation | None = None
+        items: tuple[ir.Expression, ...] | None = None
+
+        # Walk the parts in SQLGlot's declared order so diagnostics are
+        # deterministic.
+        for part in exp.Select.arg_types:
+            value = select.args.get(part)
+            if part == "expressions":
+                items = self.projection(value)
+            elif part == "from_":
+                source = self.from_(select)
+            elif value:
+                name = _SELECT_PART_NAMES.get(part, f"{part.strip('_').upper()} clause")
+                for node in value if isinstance(value, list) else [value]:
+                    self.unsupported(name, node)
+
+        if source is None or items is None:
+            return None
+        if items == (ir.Star(),):
+            return source
+        return ir.Project(source, items)
+
+    def from_(self, select: exp.Select) -> ir.TableScan | None:
+        from_ = select.args.get("from_")
+        if from_ is None:
+            self.unsupported("SELECT without FROM", select)
+            return None
+
+        table = from_.this
+        if not isinstance(table, exp.Table) or not isinstance(
+            table.this, exp.Identifier
+        ):
+            self.unsupported("FROM source other than a table", table)
+            return None
+
+        supported = True
+        for part in exp.Table.arg_types:
+            if part not in _TABLE_NAME_PARTS and table.args.get(part):
+                self.unsupported(_TABLE_PART_NAMES.get(part, f"table {part}"), table)
+                supported = False
+        if not supported:
+            return None
+        return ir.TableScan(tuple(identifier.name for identifier in table.parts))
+
+    def projection(
+        self, expressions: list[exp.Expression]
+    ) -> tuple[ir.Expression, ...] | None:
+        items = [self.projection_item(expression) for expression in expressions]
+        if any(item is None for item in items):
+            return None
+        return tuple(item for item in items if item is not None)
+
+    def projection_item(self, node: exp.Expression) -> ir.Expression | None:
+        if isinstance(node, exp.Star):
+            return ir.Star()
+        if isinstance(node, exp.Alias):
+            expression = self.expression(node.this)
+            return None if expression is None else ir.Alias(expression, node.alias)
+
+        expression = self.expression(node)
+        if (
+            isinstance(expression, ir.UnaryOp)
+            and expression.op is ir.UnaryOperator.NEGATE
+        ):
+            # Spark SQL names this column "(- x)" but PySpark names it
+            # "negative(x)"; an explicit alias makes the output name defined.
+            self.unsupported(
+                "negation without an alias",
+                node,
+                hint="Add an alias, for example: -amount AS negative_amount.",
+            )
+            return None
+        return expression
+
+    # --- Expressions -----------------------------------------------------
+
+    def expression(self, node: exp.Expression) -> ir.Expression | None:
+        """Translate one expression, recursing into its operands."""
+        if isinstance(node, exp.Paren):
+            # Parentheses only shape the tree; the tree already encodes them.
+            return self.expression(node.this)
+        if isinstance(node, exp.Column):
+            return self.column(node)
+        if isinstance(node, exp.Literal | exp.Boolean | exp.Null):
+            return self.literal(node)
+        if isinstance(node, exp.Neg):
+            return self.negation(node)
+        if isinstance(node, exp.Not):
+            operand = self.expression(node.this)
+            return (
+                None if operand is None else ir.UnaryOp(ir.UnaryOperator.NOT, operand)
+            )
+
+        operator = _BINARY_OPERATORS.get(type(node))
+        if operator is not None:
+            return self.binary(node, operator)
+
+        if isinstance(node, exp.Func):
+            name = node.name if isinstance(node, exp.Anonymous) else node.sql_name()
+            self.unsupported(f"function {name.upper()}", node)
+        else:
+            self.unsupported(f"{node.key.upper()} expression", node)
         return None
 
-    table = from_.this
-    if not isinstance(table, exp.Table) or not isinstance(table.this, exp.Identifier):
-        issues.append(
-            Diagnostic("FROM source other than a table", _fragment(table, dialect))
-        )
+    def column(self, node: exp.Column) -> ir.Column | None:
+        if isinstance(node.this, exp.Star):
+            self.unsupported("qualified star", node)
+            return None
+        return ir.Column(tuple(identifier.name for identifier in node.parts))
+
+    def literal(self, node: exp.Literal | exp.Boolean | exp.Null) -> ir.Literal:
+        if isinstance(node, exp.Null):
+            return ir.Literal(None)
+        if isinstance(node, exp.Boolean):
+            return ir.Literal(bool(node.this))
+        if node.is_string:
+            return ir.Literal(node.this)
+        return ir.Literal(_number(node.this))
+
+    def negation(self, node: exp.Neg) -> ir.Expression | None:
+        operand = self.expression(node.this)
+        if operand is None:
+            return None
+        # "-5" is a literal in Spark SQL; keep it one so types and names match.
+        if isinstance(operand, ir.Literal) and type(operand.value) in (
+            int,
+            Decimal,
+            float,
+        ):
+            return ir.Literal(-operand.value)  # type: ignore[operator]
+        return ir.UnaryOp(ir.UnaryOperator.NEGATE, operand)
+
+    def binary(
+        self, node: exp.Expression, operator: ir.BinaryOperator
+    ) -> ir.Expression | None:
+        hint = self.dialect_semantics_hint(node)
+        if hint is not None:
+            name = "+ operator" if isinstance(node, exp.Add) else "division"
+            self.unsupported(name, node, hint=hint)
+
+        # Translate both sides even after an issue, so their issues are reported too.
+        left = self.expression(node.this)
+        right = self.expression(node.args["expression"])
+        if hint is not None or left is None or right is None:
+            return None
+        return ir.BinaryOp(operator, left, right)
+
+    def dialect_semantics_hint(self, node: exp.Expression) -> str | None:
+        """Explain why an operator's meaning in the source dialect differs from
+        Spark's, or return None if it means the same."""
+        if isinstance(node, exp.Div) and node.args.get("typed"):
+            return _INTEGER_DIVISION_HINT
+        if isinstance(node, exp.Div) and node.args.get("safe"):
+            return _SAFE_DIVISION_HINT
+        if isinstance(node, exp.Add) and self.dialect == "tsql":
+            return _TSQL_PLUS_HINT
         return None
 
-    supported = True
-    for part in exp.Table.arg_types:
-        if part not in _TABLE_NAME_PARTS and table.args.get(part):
-            name = _TABLE_PART_NAMES.get(part, f"table {part}")
-            issues.append(Diagnostic(name, _fragment(table, dialect)))
-            supported = False
-    if not supported:
-        return None
+    # --- Diagnostics -----------------------------------------------------
 
-    return TableScan(tuple(identifier.name for identifier in table.parts))
+    def unsupported(self, message: str, node: object, hint: str | None = None) -> None:
+        self.issues.append(Diagnostic(message, self.fragment(node), hint))
+
+    def fragment(self, value: object) -> str:
+        if isinstance(value, exp.Expression):
+            return value.sql(dialect=self.dialect)
+        return str(value)
 
 
-def _fragment(value: object, dialect: str | None) -> str:
-    if isinstance(value, exp.Expression):
-        return value.sql(dialect=dialect)
-    return str(value)
+def _number(text: str) -> int | Decimal | float:
+    """Return the Python value matching Spark SQL's type for a numeric literal.
+
+    Spark SQL reads ``30`` as an integer, ``1.50`` as an exact decimal,
+    ``1.5e0`` as a double, and integers too large for 64 bits as decimals.
+    """
+    if "e" in text.lower():
+        return float(text)
+    if "." in text:
+        return Decimal(text)
+    value = int(text)
+    if not _INT64_MIN <= value <= _INT64_MAX:
+        return Decimal(text)
+    return value
+
+
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1

@@ -28,3 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   PySpark on the same datasets and compares results with SQL semantics
   (unordered multiset rows, exact schema, NULL-aware, float tolerance).
   Test datasets cover duplicates, NULLs, empty strings, and other edge cases.
+- Expressions in the SELECT list: columns, qualified columns, `*`, aliases,
+  literals (integer, exact decimal, double, string, boolean, NULL), arithmetic,
+  comparisons, and `AND`/`OR`/`NOT`. Generated code imports what it uses and
+  adds parentheses according to Python's operator precedence.
+- Operators whose meaning differs from Spark in the source dialect (integer
+  division in T-SQL/PostgreSQL, NULL-on-zero division in MySQL, `+` in T-SQL)
+  are rejected with an explanation.

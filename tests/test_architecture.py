@@ -26,6 +26,9 @@ def imported_modules(module: str) -> set[str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module == "sparkshift":
+            # "from sparkshift import ir" imports the module sparkshift.ir.
+            names.update(f"sparkshift.{alias.name}" for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             names.add(node.module)
     return names

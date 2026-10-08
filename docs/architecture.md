@@ -52,8 +52,11 @@ anything the user should review.
 
 ### Generated-code contract
 
-Generated code assigns the final DataFrame to a variable named `result` and
-expects a SparkSession named `spark` to exist, as in a Databricks notebook.
+Generated code imports what it uses, assigns the final DataFrame to a variable
+named `result`, and expects a SparkSession named `spark` to exist, as in a
+Databricks notebook. Parentheses follow Python's operator precedence, not
+SQL's, because PySpark expressions are built from Python operators (`&` and `|`
+bind more tightly than `==`).
 
 ## Rules for the core
 

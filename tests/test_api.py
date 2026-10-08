@@ -35,10 +35,33 @@ def test_unsupported_query_lists_every_issue() -> None:
         sparkshift.convert("SELECT name FROM customers WHERE age > 30 ORDER BY name")
 
     assert str(caught.value) == (
-        "3 unsupported constructs:\n"
-        "  - column list: name\n"
+        "2 unsupported constructs:\n"
         "  - WHERE clause: WHERE age > 30\n"
         "  - ORDER BY clause: ORDER BY name"
+    )
+
+
+def test_convert_generates_a_projection() -> None:
+    sql = (
+        "SELECT order_id, amount * 1.10 AS with_tax, "
+        "amount > 100 AND status = 'completed' AS big_sale FROM orders"
+    )
+
+    assert sparkshift.convert(sql).code == (
+        "from decimal import Decimal\n"
+        "\n"
+        "from pyspark.sql import functions as F\n"
+        "\n"
+        "result = (\n"
+        '    spark.table("orders")\n'
+        "    .select(\n"
+        '        F.col("order_id"),\n'
+        '        (F.col("amount") * F.lit(Decimal("1.10"))).alias("with_tax"),\n'
+        # Long expressions are not wrapped yet; this line is 99 characters.
+        '        ((F.col("amount") > F.lit(100)) & '
+        '(F.col("status") == F.lit("completed"))).alias("big_sale"),\n'
+        "    )\n"
+        ")\n"
     )
 
 

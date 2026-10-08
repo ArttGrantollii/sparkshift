@@ -5,8 +5,8 @@
 
 Convert SQL into readable, idiomatic, tested PySpark DataFrame code.
 
-> **Status: early development.** The conversion pipeline works end to end, but
-> only for the simplest query shape (see below). Everything else is rejected
+> **Status: early development.** SparkShift converts single-table `SELECT`
+> queries with column expressions (see below). Everything else is rejected
 > with a clear error. See [ROADMAP.md](ROADMAP.md) for planned scope.
 
 ## Goal
@@ -21,10 +21,28 @@ the same data on real Apache Spark.
 ```python
 import sparkshift
 
-result = sparkshift.convert("SELECT * FROM sales.customers")
+result = sparkshift.convert(
+    "SELECT order_id, amount * 1.10 AS with_tax FROM sales.orders"
+)
 print(result.code)
-# result = spark.table("sales.customers")
 ```
+
+```python
+from decimal import Decimal
+
+from pyspark.sql import functions as F
+
+result = (
+    spark.table("sales.orders")
+    .select(
+        F.col("order_id"),
+        (F.col("amount") * F.lit(Decimal("1.10"))).alias("with_tax"),
+    )
+)
+```
+
+The generated code imports what it uses, expects a SparkSession named `spark`
+(as in a Databricks notebook), and assigns the final DataFrame to `result`.
 
 Pass `dialect=` for non-generic SQL: `tsql`, `postgres`, `mysql`, `snowflake`,
 `bigquery`, or `oracle`.
@@ -33,8 +51,7 @@ Queries SparkShift cannot translate safely raise `UnsupportedSQLError`, listing
 every unsupported construct:
 
 ```text
-UnsupportedSQLError: 3 unsupported constructs:
-  - column list: name
+UnsupportedSQLError: 2 unsupported constructs:
   - WHERE clause: WHERE age > 30
   - ORDER BY clause: ORDER BY name
 ```
@@ -43,10 +60,37 @@ UnsupportedSQLError: 3 unsupported constructs:
 
 | Construct | Status |
 |---|---|
-| `SELECT * FROM table` (including `schema.table` and quoted names) | Supported |
-| Everything else | Unsupported — rejected with an error |
+| `SELECT ... FROM table` (including `schema.table` and quoted names) | Supported |
+| Columns, qualified columns (`table.column`), `*`, and `AS` aliases | Supported |
+| Literals: integers, decimals, doubles (`1.5e0`), strings, `TRUE`/`FALSE`, `NULL` | Supported |
+| Arithmetic: `+ - * / %` and unary `-` | Supported, with dialect exceptions below |
+| Comparisons: `= <> != < <= > >=` | Supported |
+| Logic: `AND OR NOT` (SQL three-valued logic with NULL) | Supported |
+| Everything else, including `WHERE`, joins, and functions | Unsupported — rejected with an error |
 
 Support grows feature by feature; see the [roadmap](ROADMAP.md).
+
+### Dialect differences
+
+SparkShift generates code with Spark semantics. Where a source dialect's
+operator means something different and SparkShift cannot tell which meaning
+applies without knowing column types, it rejects the construct rather than
+guess:
+
+| Construct | Dialects | Why it is rejected |
+|---|---|---|
+| `/` | T-SQL, PostgreSQL | Dividing two integers discards the remainder; Spark returns a fraction. |
+| `/` | MySQL | Division by zero returns NULL; Spark raises an error. |
+| `+` | T-SQL | `+` also concatenates strings. |
+
+### Known limitations
+
+- Database-specific string collation is not emulated. For example, MySQL and
+  SQL Server often compare strings case-insensitively; Spark compares them
+  case-sensitively.
+- An unaliased negation such as `SELECT -amount` must be given an alias, because
+  Spark SQL and PySpark name that output column differently.
+- Long expressions are not wrapped across lines yet.
 
 ## How correctness is verified
 
