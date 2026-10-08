@@ -80,6 +80,28 @@ class Alias:
     name: str
 
 
+class AggregateFunction(Enum):
+    COUNT = "count"
+    SUM = "sum"
+    AVG = "avg"
+    MIN = "min"
+    MAX = "max"
+
+
+@dataclass(frozen=True)
+class AggregateCall:
+    """An aggregate over the rows of a group, as in ``SUM(amount)``.
+
+    ``COUNT`` with no arguments counts rows, as in ``COUNT(*)``. Every other
+    call ignores NULL inputs, and returns NULL when all inputs are NULL
+    (``COUNT`` returns 0).
+    """
+
+    function: AggregateFunction
+    arguments: tuple["Expression", ...] = ()
+    distinct: bool = False
+
+
 @dataclass(frozen=True)
 class Star:
     """All columns of the input, as in ``SELECT *``, or of one input table when
@@ -88,7 +110,9 @@ class Star:
     qualifier: tuple[str, ...] = ()
 
 
-Expression: TypeAlias = Column | Literal | BinaryOp | UnaryOp | Alias | Star
+Expression: TypeAlias = (
+    Column | Literal | BinaryOp | UnaryOp | Alias | Star | AggregateCall
+)
 
 
 # --- Relations ---------------------------------------------------------------
@@ -166,6 +190,24 @@ class Project:
 
 
 @dataclass(frozen=True)
+class Aggregate:
+    """Group rows by ``keys`` and compute ``aggregates`` for each group.
+
+    The output has the key columns first, then the aggregates, as PySpark's
+    ``groupBy(...).agg(...)`` produces. With no keys, the whole input is one
+    group, and the output has exactly one row even when the input is empty.
+    """
+
+    source: "Relation"
+    keys: tuple[Expression, ...]
+    aggregates: tuple[Expression, ...]
+
+    def __post_init__(self) -> None:
+        if not self.keys and not self.aggregates:
+            raise ValueError("Aggregate needs keys or aggregates")
+
+
+@dataclass(frozen=True)
 class Distinct:
     """Remove duplicate rows; NULLs compare as equal, as in SQL's DISTINCT."""
 
@@ -186,5 +228,5 @@ class Limit:
 
 # Any IR node that produces a DataFrame.
 Relation: TypeAlias = (
-    TableScan | RelationAlias | Join | Filter | Project | Distinct | Limit
+    TableScan | RelationAlias | Join | Filter | Aggregate | Project | Distinct | Limit
 )

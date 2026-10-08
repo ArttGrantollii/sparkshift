@@ -131,6 +131,21 @@ class _Emitter:
             case ir.Filter(source=source, condition=condition):
                 start, calls = self.chain(source)
                 return start, [*calls, self.call("where", [self.expression(condition)])]
+            case ir.Aggregate(source=source, keys=keys, aggregates=aggregates):
+                start, calls = self.chain(source)
+                key_code = [self.expression(key) for key in keys]
+                aggregate_code = [self.expression(item) for item in aggregates]
+                if not aggregates:
+                    # Grouping without aggregates is the distinct key values.
+                    steps = [self.call("select", key_code), self.call("distinct", [])]
+                elif not keys:
+                    steps = [self.call("agg", aggregate_code)]
+                else:
+                    steps = [
+                        self.call("groupBy", key_code),
+                        self.call("agg", aggregate_code),
+                    ]
+                return start, [*calls, *steps]
             case ir.Project(source=source, items=items):
                 start, calls = self.chain(source)
                 arguments = [self.expression(item) for item in items]
@@ -195,6 +210,18 @@ class _Emitter:
                 )
             case ir.UnaryOp(op=op, operand=operand):
                 return f"{op.value}{self.operand(operand, _ATOM)}", _UNARY
+            case ir.AggregateCall(
+                function=function, arguments=arguments, distinct=distinct
+            ):
+                self.uses_functions = True
+                if not arguments:
+                    # COUNT(*): count rows, whatever their values.
+                    return "F.count(F.lit(1))", _ATOM
+                name = function.value
+                if distinct:
+                    name = f"{name}_distinct"
+                code = ", ".join(self.expression(argument) for argument in arguments)
+                return f"F.{name}({code})", _ATOM
             case ir.BinaryOp(op=op, left=left, right=right):
                 precedence = _PRECEDENCE[op]
                 if op is ir.BinaryOperator.OR:
@@ -307,6 +334,7 @@ def _walk(plan: ir.Relation) -> Iterator[ir.Relation]:
         case (
             ir.RelationAlias(source=source)
             | ir.Filter(source=source)
+            | ir.Aggregate(source=source)
             | ir.Project(source=source)
             | ir.Distinct(source=source)
             | ir.Limit(source=source)

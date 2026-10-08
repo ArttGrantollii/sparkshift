@@ -45,6 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   joined tables so qualified columns resolve. Natural, semi, anti, and as-of
   joins, joins to subqueries, `LATERAL`/`APPLY`, and Oracle's `(+)` marker are
   rejected.
+- Aggregation: `GROUP BY` columns and positions, `HAVING`, and `COUNT(*)`,
+  `COUNT`, `COUNT(DISTINCT)`, `SUM`, `SUM(DISTINCT)`, `AVG`, `MIN`, `MAX`,
+  including aggregate expressions. `HAVING` on aggregates not in the `SELECT`
+  list uses helper columns that a final projection drops. Rejects columns that
+  are neither grouped nor aggregated, ambiguous alias references, Oracle and
+  T-SQL `GROUP BY` positions, and `ROLLUP`/`CUBE`/`GROUPING SETS`.
 - Equivalence testing for `LIMIT` without `ORDER BY` (row count plus
   sub-multiset of the unlimited result), and dialect scenarios checked against
   hand-written Spark SQL references.

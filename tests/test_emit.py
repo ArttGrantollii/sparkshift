@@ -516,3 +516,76 @@ def test_table_variable_numbering_skips_taken_names() -> None:
     )
 
     assert list(table_variables(plan).values()) == ["b_x_2", "b_x", "b_x_3"]
+
+
+# --- Aggregation -------------------------------------------------------------
+
+COUNT_ROWS = ir.AggregateCall(ir.AggregateFunction.COUNT)
+
+
+@pytest.mark.parametrize(
+    ("call", "expected"),
+    [
+        (COUNT_ROWS, "F.count(F.lit(1))"),
+        (ir.AggregateCall(ir.AggregateFunction.COUNT, (A,)), 'F.count(F.col("a"))'),
+        (
+            ir.AggregateCall(ir.AggregateFunction.COUNT, (A, B), True),
+            'F.count_distinct(F.col("a"), F.col("b"))',
+        ),
+        (ir.AggregateCall(ir.AggregateFunction.SUM, (A,)), 'F.sum(F.col("a"))'),
+        (
+            ir.AggregateCall(ir.AggregateFunction.SUM, (A,), True),
+            'F.sum_distinct(F.col("a"))',
+        ),
+        (ir.AggregateCall(ir.AggregateFunction.AVG, (A,)), 'F.avg(F.col("a"))'),
+        (ir.AggregateCall(ir.AggregateFunction.MIN, (A,)), 'F.min(F.col("a"))'),
+        (ir.AggregateCall(ir.AggregateFunction.MAX, (A,)), 'F.max(F.col("a"))'),
+    ],
+)
+def test_aggregate_call_code(call: ir.AggregateCall, expected: str) -> None:
+    assert emit_expression(call) == expected
+
+
+def test_aggregate_expression_parenthesizes_as_a_unit() -> None:
+    doubled = BinaryOp(BinaryOperator.MULTIPLY, COUNT_ROWS, Literal(2))
+
+    expected = '(F.count(F.lit(1)) * F.lit(2)).alias("x")'
+    assert emit_expression(Alias(doubled, "x")) == expected
+
+
+def test_grouped_aggregation_golden_output() -> None:
+    plan = ir.Aggregate(
+        TableScan(("orders",)),
+        (Column(("status",)),),
+        (Alias(COUNT_ROWS, "n"), ir.AggregateCall(ir.AggregateFunction.SUM, (A,))),
+    )
+
+    assert emit(plan) == (
+        "from pyspark.sql import functions as F\n"
+        "\n"
+        "result = (\n"
+        '    spark.table("orders")\n'
+        '    .groupBy(F.col("status"))\n'
+        "    .agg(\n"
+        '        F.count(F.lit(1)).alias("n"),\n'
+        '        F.sum(F.col("a")),\n'
+        "    )\n"
+        ")\n"
+    )
+
+
+def test_global_aggregation_has_no_group_by() -> None:
+    plan = ir.Aggregate(TableScan(("orders",)), (), (COUNT_ROWS,))
+
+    assert '    spark.table("orders")\n    .agg(F.count(F.lit(1)))\n' in emit(plan)
+
+
+def test_grouping_without_aggregates_selects_distinct_keys() -> None:
+    plan = ir.Aggregate(TableScan(("orders",)), (Column(("status",)),), ())
+
+    assert '    .select(F.col("status"))\n    .distinct()\n' in emit(plan)
+
+
+def test_aggregate_ir_needs_keys_or_aggregates() -> None:
+    with pytest.raises(ValueError, match="keys or aggregates"):
+        ir.Aggregate(TableScan(("t",)), (), ())

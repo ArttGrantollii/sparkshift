@@ -55,10 +55,9 @@ Queries SparkShift cannot translate safely raise `UnsupportedSQLError`, listing
 every unsupported construct:
 
 ```text
-UnsupportedSQLError: 3 unsupported constructs:
-  - function COUNT: COUNT(*)
-  - GROUP BY clause: GROUP BY country
-  - ORDER BY clause: ORDER BY n
+UnsupportedSQLError: 2 unsupported constructs:
+  - WINDOW expression: ROW_NUMBER() OVER (ORDER BY name)
+  - ORDER BY clause: ORDER BY name
 ```
 
 ## Supported SQL
@@ -75,8 +74,11 @@ UnsupportedSQLError: 3 unsupported constructs:
 | `WHERE` | Supported |
 | `DISTINCT` | Supported (`DISTINCT ON` is not) |
 | Row limits: `LIMIT n`, T-SQL `TOP n`, `FETCH FIRST n ROWS ONLY` | Supported, for a constant `n` |
+| Aggregates: `COUNT(*)`, `COUNT`, `COUNT(DISTINCT ...)`, `SUM`, `SUM(DISTINCT ...)`, `AVG`, `MIN`, `MAX` | Supported |
+| `GROUP BY` columns, positions (`GROUP BY 1`), and `HAVING` | Supported, with dialect exceptions below |
 | `NATURAL`, semi, anti, and as-of joins; joins to subqueries; `LATERAL` and `APPLY` | Unsupported — rejected with an error |
-| Everything else, including `GROUP BY`, `ORDER BY`, and functions | Unsupported — rejected with an error |
+| `GROUP BY` expressions, `ROLLUP`, `CUBE`, `GROUPING SETS`, `AVG(DISTINCT ...)` | Unsupported — rejected with an error |
+| Everything else, including `ORDER BY`, window functions, and scalar functions | Unsupported — rejected with an error |
 
 Support grows feature by feature; see the [roadmap](ROADMAP.md).
 
@@ -96,6 +98,9 @@ rejects it rather than guess:
 | `ROWNUM`, `ROWID` | Oracle | Pseudo-columns with no Spark equivalent; use `FETCH FIRST n ROWS ONLY`. |
 | `(+)` outer-join marker | Oracle | Ignoring it would turn an outer join into an inner join; use `LEFT`/`RIGHT JOIN`. |
 | `TOP n PERCENT`, `WITH TIES`, `OFFSET` | T-SQL, Oracle, others | Not equivalent to a plain row limit. |
+| `GROUP BY 1` | Oracle, T-SQL | Oracle groups by the constant 1; T-SQL does not allow positions. |
+| `GROUP BY` or `HAVING` naming a `SELECT` alias | All | Databases differ on whether a same-named column wins, and only the schema would tell. |
+| Selecting a column that is neither grouped nor aggregated | MySQL (relaxed mode) | MySQL returns an arbitrary value; Spark raises an error. |
 
 ### Known limitations
 
@@ -107,6 +112,8 @@ rejects it rather than guess:
 - Long expressions are not wrapped across lines yet.
 - A `JOIN` without `ON` or `USING` (accepted by MySQL) is translated as a cross
   join, because SQLGlot represents it exactly like the comma form `FROM a, b`.
+- When an aggregate query's `SELECT` order differs from the `GROUP BY` order,
+  or a key is not selected, unaliased aggregates must be given an alias.
 
 ## How correctness is verified
 

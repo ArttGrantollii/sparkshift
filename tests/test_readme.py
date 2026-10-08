@@ -19,7 +19,8 @@ def test_usage_example_output_matches_real_output() -> None:
 def test_unsupported_example_matches_real_error() -> None:
     with pytest.raises(sparkshift.UnsupportedSQLError) as caught:
         sparkshift.convert(
-            "SELECT country, COUNT(*) AS n FROM customers GROUP BY country ORDER BY n"
+            "SELECT name, ROW_NUMBER() OVER (ORDER BY name) AS rn FROM customers "
+            "ORDER BY name"
         )
 
     assert f"UnsupportedSQLError: {caught.value}" in README

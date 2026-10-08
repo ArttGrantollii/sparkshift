@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 import pytest
+from sqlglot import exp
 
 from sparkshift import ir
 from sparkshift.errors import SQLParseError, UnsupportedSQLError
@@ -241,27 +242,30 @@ def test_tsql_subtraction_is_supported() -> None:
 
 def test_all_unsupported_constructs_are_reported_together() -> None:
     issues = unsupported_issues(
-        "SELECT name FROM customers GROUP BY name ORDER BY name"
+        "WITH x AS (SELECT 1) SELECT name FROM customers ORDER BY name"
     )
 
     assert issues == [
-        ("GROUP BY clause", "GROUP BY name"),
+        ("WITH clause", "WITH x AS (SELECT 1)"),
         ("ORDER BY clause", "ORDER BY name"),
     ]
 
 
 def test_issues_inside_one_expression_are_all_reported() -> None:
-    issues = unsupported_issues("SELECT COUNT(a) + my_udf(b) AS x FROM t")
+    issues = unsupported_issues("SELECT my_udf(a) + other_udf(b) AS x FROM t")
 
-    assert issues == [("function COUNT", "COUNT(a)"), ("function MY_UDF", "MY_UDF(b)")]
+    assert issues == [
+        ("function MY_UDF", "MY_UDF(a)"),
+        ("function OTHER_UDF", "OTHER_UDF(b)"),
+    ]
 
 
 @pytest.mark.parametrize(
     ("sql", "dialect", "expected"),
     [
         ("SELECT -amount FROM t", None, ("negation without an alias", "-amount")),
-        ("SELECT -COUNT(a) AS x FROM t", None, ("function COUNT", "COUNT(a)")),
-        ("SELECT COUNT(t.*) AS n FROM t", None, ("function COUNT", "COUNT(t.*)")),
+        ("SELECT -my_udf(a) AS x FROM t", None, ("function MY_UDF", "MY_UDF(a)")),
+        ("SELECT COUNT(t.*) AS n FROM t", None, ("qualified star", "t.*")),
         (
             "SELECT CAST(a AS INT) AS x FROM t",
             None,
@@ -270,7 +274,7 @@ def test_issues_inside_one_expression_are_all_reported() -> None:
         ("SELECT a IS NULL AS x FROM t", None, ("IS expression", "a IS NULL")),
         ("SELECT a LIKE 'x%' AS x FROM t", None, ("LIKE expression", "a LIKE 'x%'")),
         ("SELECT a || b AS x FROM t", None, ("DPIPE expression", "a || b")),
-        ("SELECT * FROM t GROUP BY a", None, ("GROUP BY clause", "GROUP BY a")),
+        ("SELECT * FROM t GROUP BY a", None, ("SELECT * with aggregation", "*")),
         ("SELECT * FROM t LIMIT 5 OFFSET 2", None, ("OFFSET clause", "OFFSET 2")),
         ("SELECT AS STRUCT * FROM t", "bigquery", ("SELECT AS", "STRUCT")),
         (
@@ -421,7 +425,11 @@ def test_limit_zero_is_allowed() -> None:
             "snowflake",
             "WHERE reference to a SELECT alias",
         ),
-        ("SELECT * FROM t WHERE COUNT(a) > 1", None, "function COUNT"),
+        (
+            "SELECT * FROM t WHERE COUNT(a) > 1",
+            None,
+            "aggregate function COUNT in WHERE",
+        ),
     ],
 )
 def test_unsupported_filters_and_limits(
@@ -624,7 +632,11 @@ def test_join_then_where_then_select() -> None:
             "oracle",
             "Oracle (+) outer join marker",
         ),
-        ("SELECT * FROM a JOIN b ON a.id = COUNT(b.id)", None, "function COUNT"),
+        (
+            "SELECT * FROM a JOIN b ON a.id = COUNT(b.id)",
+            None,
+            "aggregate function COUNT in a JOIN condition",
+        ),
     ],
 )
 def test_unsupported_joins(sql: str, dialect: str | None, message: str) -> None:
@@ -666,3 +678,308 @@ def test_qualified_star_outside_the_select_list_is_rejected() -> None:
 
     assert translator.expression(star) is None
     assert [issue.message for issue in translator.issues] == ["qualified star"]
+
+
+# --- Aggregation -------------------------------------------------------------
+
+COUNT_ROWS = ir.AggregateCall(ir.AggregateFunction.COUNT)
+AMOUNT = Column(("amount",))
+STATUS = Column(("status",))
+
+
+def sum_of(expression: ir.Expression) -> ir.AggregateCall:
+    return ir.AggregateCall(ir.AggregateFunction.SUM, (expression,))
+
+
+@pytest.mark.parametrize(
+    ("sql_call", "expected"),
+    [
+        ("COUNT(*)", COUNT_ROWS),
+        ("COUNT(1)", ir.AggregateCall(ir.AggregateFunction.COUNT, (Literal(1),))),
+        ("COUNT(a)", ir.AggregateCall(ir.AggregateFunction.COUNT, (A,))),
+        ("COUNT(DISTINCT a)", ir.AggregateCall(ir.AggregateFunction.COUNT, (A,), True)),
+        (
+            "COUNT(DISTINCT a, b)",
+            ir.AggregateCall(ir.AggregateFunction.COUNT, (A, B), True),
+        ),
+        ("SUM(a)", sum_of(A)),
+        ("SUM(DISTINCT a)", ir.AggregateCall(ir.AggregateFunction.SUM, (A,), True)),
+        ("AVG(a)", ir.AggregateCall(ir.AggregateFunction.AVG, (A,))),
+        ("MIN(a)", ir.AggregateCall(ir.AggregateFunction.MIN, (A,))),
+        ("MAX(a)", ir.AggregateCall(ir.AggregateFunction.MAX, (A,))),
+    ],
+)
+def test_aggregate_functions(sql_call: str, expected: ir.AggregateCall) -> None:
+    plan = translate_sql(f"SELECT {sql_call} FROM t")
+
+    assert plan == ir.Aggregate(T, (), (expected,))
+
+
+def test_group_by_with_having_on_a_selected_aggregate() -> None:
+    plan = translate_sql(
+        "SELECT status, COUNT(*) AS n FROM orders GROUP BY status HAVING COUNT(*) > 1"
+    )
+
+    assert plan == ir.Filter(
+        ir.Aggregate(ORDERS, (STATUS,), (Alias(COUNT_ROWS, "n"),)),
+        BinaryOp(BinaryOperator.GREATER, Column(("n",)), Literal(1)),
+    )
+
+
+def test_having_on_an_unselected_aggregate_uses_a_dropped_helper_column() -> None:
+    plan = translate_sql(
+        "SELECT status FROM orders GROUP BY status HAVING SUM(amount) > 100"
+    )
+
+    assert plan == Project(
+        ir.Filter(
+            ir.Aggregate(ORDERS, (STATUS,), (Alias(sum_of(AMOUNT), "_having_1"),)),
+            BinaryOp(BinaryOperator.GREATER, Column(("_having_1",)), Literal(100)),
+        ),
+        (STATUS,),
+    )
+
+
+def test_having_reuses_a_helper_for_a_repeated_aggregate() -> None:
+    plan = translate_sql(
+        "SELECT status FROM orders GROUP BY status "
+        "HAVING SUM(amount) > 1 AND SUM(amount) < 9"
+    )
+
+    assert isinstance(plan, Project)
+    assert isinstance(plan.source, ir.Filter)
+    assert isinstance(plan.source.source, ir.Aggregate)
+    assert plan.source.source.aggregates == (Alias(sum_of(AMOUNT), "_having_1"),)
+
+
+def test_having_on_a_key_uses_its_output_name() -> None:
+    plan = translate_sql(
+        "SELECT status AS s, COUNT(*) AS n FROM orders GROUP BY status "
+        "HAVING status <> 'x'"
+    )
+
+    assert plan == ir.Filter(
+        ir.Aggregate(ORDERS, (Alias(STATUS, "s"),), (Alias(COUNT_ROWS, "n"),)),
+        BinaryOp(BinaryOperator.NOT_EQUAL, Column(("s",)), Literal("x")),
+    )
+
+
+def test_reordered_select_list_gets_a_final_projection() -> None:
+    plan = translate_sql("SELECT COUNT(*) AS n, status FROM orders GROUP BY status")
+
+    assert plan == Project(
+        ir.Aggregate(ORDERS, (STATUS,), (Alias(COUNT_ROWS, "n"),)),
+        (Column(("n",)), STATUS),
+    )
+
+
+def test_select_in_key_then_aggregate_order_needs_no_projection() -> None:
+    plan = translate_sql(
+        "SELECT c.country, COUNT(*) FROM customers c GROUP BY c.country"
+    )
+
+    assert plan == ir.Aggregate(CUSTOMERS_C, (Column(("c", "country")),), (COUNT_ROWS,))
+
+
+@pytest.mark.parametrize(
+    ("sql", "dialect"),
+    [
+        ("SELECT status, COUNT(*) FROM orders GROUP BY 1", None),
+        ("SELECT status, COUNT(*) FROM orders GROUP BY 1", "postgres"),
+        ("SELECT status AS status, COUNT(*) FROM orders GROUP BY status", None),
+        # T-SQL and Oracle always read a GROUP BY name as an input column.
+        ("SELECT status AS x, COUNT(*) FROM orders GROUP BY status", "tsql"),
+    ],
+)
+def test_group_by_positions_and_aliases(sql: str, dialect: str | None) -> None:
+    plan = translate_sql(sql, dialect)
+
+    assert isinstance(plan, ir.Aggregate)
+    assert plan.keys in ((STATUS,), (Alias(STATUS, "x"),))
+
+
+def test_grouping_without_aggregates() -> None:
+    plan = translate_sql("SELECT status FROM orders GROUP BY status, customer_id")
+
+    assert plan == Project(
+        ir.Aggregate(ORDERS, (STATUS, Column(("customer_id",))), ()),
+        (STATUS,),
+    )
+
+
+def test_aggregates_inside_window_functions_do_not_make_an_aggregation() -> None:
+    issues = unsupported_issues("SELECT COUNT(*) OVER () AS n FROM t")
+
+    assert issues == [("WINDOW expression", "COUNT(*) OVER ()")]
+
+
+@pytest.mark.parametrize(
+    ("sql", "dialect", "message"),
+    [
+        ("SELECT a, COUNT(*) FROM t GROUP BY 1", "oracle", "GROUP BY position"),
+        ("SELECT a, COUNT(*) FROM t GROUP BY 1", "tsql", "GROUP BY position"),
+        (
+            "SELECT a, COUNT(*) FROM t GROUP BY 3",
+            None,
+            "GROUP BY position out of range",
+        ),
+        (
+            "SELECT a + 1, COUNT(*) FROM t GROUP BY 1",
+            None,
+            "GROUP BY position of an expression",
+        ),
+        (
+            "SELECT a AS x, COUNT(*) FROM t GROUP BY x",
+            None,
+            "GROUP BY name that is also a SELECT alias",
+        ),
+        ("SELECT COUNT(*) FROM t GROUP BY a + 1", None, "GROUP BY expression"),
+        ("SELECT a, COUNT(*) FROM t GROUP BY ROLLUP (a)", None, "ROLLUP"),
+        ("SELECT a, COUNT(*) FROM t GROUP BY CUBE (a)", None, "CUBE"),
+        (
+            "SELECT a, COUNT(*) FROM t GROUP BY GROUPING SETS ((a), ())",
+            None,
+            "GROUPINGSETS",
+        ),
+        ("SELECT a, COUNT(*) FROM t GROUP BY a WITH ROLLUP", "mysql", "ROLLUP"),
+        ("SELECT a, COUNT(*) FROM t GROUP BY ALL", "snowflake", "GROUP BY ALL"),
+        (
+            "SELECT a, b, COUNT(*) FROM t GROUP BY a",
+            "mysql",
+            "column that is neither grouped nor aggregated",
+        ),
+        (
+            "SELECT b, COUNT(*) FROM t",
+            None,
+            "column that is neither grouped nor aggregated",
+        ),
+        (
+            "SELECT a FROM t GROUP BY a HAVING b > 1",
+            None,
+            "column that is neither grouped nor aggregated",
+        ),
+        (
+            "SELECT a, COUNT(*) AS n FROM t GROUP BY a HAVING n > 1",
+            None,
+            "HAVING reference to a SELECT alias",
+        ),
+        (
+            "SELECT COUNT(*), a FROM t GROUP BY a",
+            None,
+            "aggregate without an alias in a reordered SELECT list",
+        ),
+        ("SELECT AVG(DISTINCT a) AS x FROM t", None, "AVG(DISTINCT ...)"),
+        ("SELECT MIN(DISTINCT a) AS x FROM t", None, "MIN(DISTINCT ...)"),
+        (
+            "SELECT SUM(MAX(a)) AS x FROM t",
+            None,
+            "aggregate function MAX in another aggregate function",
+        ),
+        ("SELECT SUM(DISTINCT a, b) AS x FROM t", None, "SUM with 2 arguments"),
+        ("SELECT a FROM t GROUP BY a HAVING my_udf(a)", None, "function MY_UDF"),
+    ],
+)
+def test_unsupported_aggregation(sql: str, dialect: str | None, message: str) -> None:
+    messages = [issue for issue, _ in unsupported_issues(sql, dialect)]
+
+    assert message in messages
+
+
+def test_aggregate_in_where_suggests_having() -> None:
+    with pytest.raises(UnsupportedSQLError) as caught:
+        translate_sql("SELECT * FROM t WHERE SUM(a) > 1")
+
+    [issue] = caught.value.issues
+    assert issue.message == "aggregate function SUM in WHERE"
+    assert issue.hint == "Filter on aggregates with HAVING."
+
+
+def test_oracle_group_by_position_explains_the_difference() -> None:
+    with pytest.raises(UnsupportedSQLError) as caught:
+        translate_sql("SELECT a, COUNT(*) FROM t GROUP BY 1", "oracle")
+
+    [issue] = caught.value.issues
+    assert issue.hint is not None
+    assert "constant" in issue.hint
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected_keys"),
+    [
+        ("SELECT status AS x, COUNT(*) FROM orders GROUP BY 1", (Alias(STATUS, "x"),)),
+        # An unqualified key and a qualified column refer to the same key.
+        (
+            "SELECT o.status, COUNT(*) FROM orders o GROUP BY status",
+            (STATUS,),
+        ),
+    ],
+)
+def test_group_keys_resolve_positions_and_qualifiers(
+    sql: str, expected_keys: tuple[ir.Expression, ...]
+) -> None:
+    plan = translate_sql(sql)
+
+    assert isinstance(plan, ir.Aggregate)
+    assert plan.keys == expected_keys
+
+
+def test_key_selected_twice_is_also_computed_as_an_expression() -> None:
+    plan = translate_sql(
+        "SELECT status, status AS again, COUNT(*) AS n FROM orders GROUP BY status"
+    )
+
+    assert plan == ir.Aggregate(
+        ORDERS, (STATUS,), (Alias(STATUS, "again"), Alias(COUNT_ROWS, "n"))
+    )
+
+
+def test_having_with_not_and_two_different_helpers() -> None:
+    plan = translate_sql(
+        "SELECT status, COUNT(*) AS n FROM orders GROUP BY status "
+        "HAVING NOT (SUM(amount) > 1 AND MAX(amount) < 9)"
+    )
+
+    max_amount = ir.AggregateCall(ir.AggregateFunction.MAX, (AMOUNT,))
+    assert plan == Project(
+        ir.Filter(
+            ir.Aggregate(
+                ORDERS,
+                (STATUS,),
+                (
+                    Alias(COUNT_ROWS, "n"),
+                    Alias(sum_of(AMOUNT), "_having_1"),
+                    Alias(max_amount, "_having_2"),
+                ),
+            ),
+            UnaryOp(
+                UnaryOperator.NOT,
+                BinaryOp(
+                    BinaryOperator.AND,
+                    BinaryOp(
+                        BinaryOperator.GREATER, Column(("_having_1",)), Literal(1)
+                    ),
+                    BinaryOp(BinaryOperator.LESS, Column(("_having_2",)), Literal(9)),
+                ),
+            ),
+        ),
+        (STATUS, Column(("n",))),
+    )
+
+
+def test_unknown_parts_of_an_aggregate_call_are_rejected_not_ignored() -> None:
+    # No supported syntax produces this today; the allowlist must fail closed.
+    tree = parse_sql("SELECT COUNT(a) AS n FROM t")
+    tree.expressions[0].this.set("ignore_nulls", exp.true())
+
+    with pytest.raises(UnsupportedSQLError) as caught:
+        translate(tree)
+
+    assert [issue.message for issue in caught.value.issues] == [
+        "COUNT with IGNORE_NULLS"
+    ]
+
+
+def test_repeated_group_by_key_is_grouped_once() -> None:
+    plan = translate_sql("SELECT status, COUNT(*) FROM orders GROUP BY status, status")
+
+    assert plan == ir.Aggregate(ORDERS, (STATUS,), (COUNT_ROWS,))

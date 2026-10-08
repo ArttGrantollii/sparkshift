@@ -7,6 +7,7 @@ SQLGlot versions — so nothing is ever silently ignored. All unsupported parts
 are collected before failing, so users see them at once.
 """
 
+from collections.abc import Callable, Iterator
 from decimal import Decimal
 
 from sqlglot import exp
@@ -46,6 +47,35 @@ _OUTER_JOIN_KINDS = {
     "LEFT": ir.JoinKind.LEFT,
     "RIGHT": ir.JoinKind.RIGHT,
     "FULL": ir.JoinKind.FULL,
+}
+
+_AGGREGATE_FUNCTIONS: dict[type[exp.Expression], ir.AggregateFunction] = {
+    exp.Count: ir.AggregateFunction.COUNT,
+    exp.Sum: ir.AggregateFunction.SUM,
+    exp.Avg: ir.AggregateFunction.AVG,
+    exp.Min: ir.AggregateFunction.MIN,
+    exp.Max: ir.AggregateFunction.MAX,
+}
+
+_GROUP_PART_NAMES = {
+    "grouping_sets": "GROUPING SETS",
+    "cube": "CUBE",
+    "rollup": "ROLLUP",
+    "totals": "WITH TOTALS",
+    "all": "GROUP BY ALL",
+}
+
+# Grouping constructs SQLGlot keeps inside the GROUP BY expression list.
+_GROUPING_CONSTRUCTS = (exp.Rollup, exp.Cube, exp.GroupingSets)
+
+# In these dialects a GROUP BY name always means an input column, never a
+# SELECT alias.
+_NO_GROUP_BY_ALIAS_DIALECTS = frozenset({"tsql", "oracle"})
+
+# Dialects where GROUP BY 1 does not mean "the first SELECT item".
+_GROUP_BY_POSITION_HINTS = {
+    "oracle": "In Oracle, GROUP BY 1 groups by the constant 1, not by a column.",
+    "tsql": "T-SQL does not support GROUP BY positions.",
 }
 
 _ORACLE_OUTER_JOIN_HINT = (
@@ -100,6 +130,9 @@ class _Translator:
     def __init__(self, dialect: str | None) -> None:
         self.dialect = dialect
         self.issues: list[Diagnostic] = []
+        # Where aggregate functions are currently not allowed, for diagnostics
+        # (for example "WHERE"); None while translating where they are allowed.
+        self.no_aggregates_in: str | None = None
 
     def statement(self, tree: exp.Expression) -> ir.Relation:
         if not isinstance(tree, exp.Select):
@@ -125,16 +158,21 @@ class _Translator:
         source: ir.Relation | None = None
         items: tuple[ir.Expression, ...] | None = None
         condition: ir.Expression | None = None
+        group: exp.Group | None = None
+        having: exp.Having | None = None
         distinct = False
         limit: int | None = None
         failed = False
+        aggregating = _is_aggregate_query(select)
 
         # Walk the parts in SQLGlot's declared order so diagnostics are
         # deterministic.
         for part in exp.Select.arg_types:
             value = select.args.get(part)
             if part == "expressions":
+                self.no_aggregates_in = None if aggregating else "SELECT"
                 items = self.projection(value)
+                self.no_aggregates_in = None
             elif part == "from_":
                 source = self.from_(select)
             elif not value:
@@ -145,6 +183,10 @@ class _Translator:
             elif part == "where":
                 condition = self.where(value, select)
                 failed |= condition is None
+            elif part == "group":
+                group = value
+            elif part == "having":
+                having = value
             elif part == "distinct":
                 distinct = self.distinct(value)
                 failed |= not distinct
@@ -160,12 +202,17 @@ class _Translator:
             return None
 
         # Build the plan in SQL's logical evaluation order, not the order the
-        # clauses are written in: FROM, WHERE, SELECT, DISTINCT, LIMIT.
-        relation = source
+        # clauses are written in: FROM (and joins), WHERE, GROUP BY, HAVING,
+        # SELECT, DISTINCT, LIMIT.
+        relation: ir.Relation | None = source
         if condition is not None:
-            relation = ir.Filter(relation, condition)
-        if items != (ir.Star(),):
+            relation = ir.Filter(source, condition)
+        if aggregating:
+            relation = self.aggregation(select, relation, items, group, having)
+        elif items != (ir.Star(),):
             relation = ir.Project(relation, items)
+        if relation is None:
+            return None
         if distinct:
             relation = ir.Distinct(relation)
         if limit is not None:
@@ -176,7 +223,7 @@ class _Translator:
         issues_before = len(self.issues)
         if self.dialect == "snowflake":
             self.check_alias_references(where, select)
-        condition = self.expression(where.this)
+        condition = self.expression_without_aggregates(where.this, "WHERE")
         return None if len(self.issues) > issues_before else condition
 
     def check_alias_references(self, where: exp.Where, select: exp.Select) -> None:
@@ -295,7 +342,11 @@ class _Translator:
         kind = self.join_kind(node)
 
         on = node.args.get("on")
-        condition = self.expression(on) if on is not None else None
+        condition = (
+            self.expression_without_aggregates(on, "a JOIN condition")
+            if on is not None
+            else None
+        )
         using = tuple(identifier.name for identifier in node.args.get("using") or [])
 
         if left is None or right is None or kind is None:
@@ -383,7 +434,300 @@ class _Translator:
             return None
         return expression
 
+    # --- Aggregation -----------------------------------------------------
+
+    def aggregation(
+        self,
+        select: exp.Select,
+        source: ir.Relation,
+        items: tuple[ir.Expression, ...],
+        group: exp.Group | None,
+        having: exp.Having | None,
+    ) -> ir.Relation | None:
+        """Translate GROUP BY, aggregates, and HAVING.
+
+        PySpark's ``groupBy(...).agg(...)`` outputs the key columns first and
+        then the aggregates. SQL allows any order and may leave keys out, so a
+        final projection restores the SELECT list when the two shapes differ.
+        """
+        keys = self.group_keys(group, select)
+        if keys is None:
+            return None
+
+        key_names: dict[ir.Column, str] = {}
+        aggregates: list[ir.Expression] = []
+        aggregate_nodes: list[exp.Expression] = []
+        # Where each SELECT item comes from: ("key", n) or ("aggregate", n).
+        layout: list[tuple[str, int]] = []
+        failed = False
+        for item, node in zip(items, select.expressions, strict=True):
+            if isinstance(item, ir.Star):
+                self.unsupported("SELECT * with aggregation", node)
+                failed = True
+                continue
+            plain = _plain_column(item)
+            key = _matching_key(plain[0], keys) if plain else None
+            if plain and key is not None and key not in key_names:
+                key_names[key] = plain[1]
+                layout.append(("key", keys.index(key)))
+                continue
+            failed |= not self.check_grouped(item, keys)
+            layout.append(("aggregate", len(aggregates)))
+            aggregates.append(item)
+            aggregate_nodes.append(node)
+
+        def output_name(key: ir.Column) -> str:
+            return key_names.get(key, key.name_parts[-1])
+
+        helpers: list[ir.Expression] = []
+        condition = None
+        if having is not None:
+            condition = self.having(
+                having, select, keys, output_name, aggregates, helpers
+            )
+            failed |= condition is None
+        if failed:
+            return None
+
+        grouped_keys = tuple(
+            key
+            if output_name(key) == key.name_parts[-1]
+            else ir.Alias(key, output_name(key))
+            for key in keys
+        )
+        relation: ir.Relation = ir.Aggregate(
+            source, grouped_keys, (*aggregates, *helpers)
+        )
+        if condition is not None:
+            relation = ir.Filter(relation, condition)
+
+        natural = [("key", n) for n in range(len(keys))]
+        natural += [("aggregate", n) for n in range(len(aggregates))]
+        if layout == natural and not helpers:
+            return relation
+
+        columns: list[ir.Expression] = []
+        for kind, index in layout:
+            if kind == "key":
+                columns.append(ir.Column((output_name(keys[index]),)))
+            elif isinstance(aggregates[index], ir.Alias):
+                columns.append(ir.Column((aggregates[index].name,)))  # type: ignore[union-attr]
+            else:
+                self.unsupported(
+                    "aggregate without an alias in a reordered SELECT list",
+                    aggregate_nodes[index],
+                    hint="Add an alias, for example: COUNT(*) AS orders.",
+                )
+                failed = True
+        return None if failed else ir.Project(relation, tuple(columns))
+
+    def group_keys(
+        self, group: exp.Group | None, select: exp.Select
+    ) -> list[ir.Column] | None:
+        if group is None:
+            return []
+        failed = False
+        for part, value in group.args.items():
+            if value and part != "expressions":
+                self.unsupported(_GROUP_PART_NAMES.get(part, f"GROUP BY {part}"), group)
+                failed = True
+
+        keys: list[ir.Column] = []
+        for node in group.expressions:
+            key = self.group_key(node, select)
+            if key is None:
+                failed = True
+            elif key not in keys:
+                keys.append(key)
+        return None if failed else keys
+
+    def group_key(self, node: exp.Expression, select: exp.Select) -> ir.Column | None:
+        """Translate one GROUP BY entry: a column, a position, or an alias."""
+        if isinstance(node, exp.Literal) and not node.is_string and node.this.isdigit():
+            target = self.group_position(node, select)
+            if target is None:
+                return None
+            node = target
+
+        if isinstance(node, exp.Column) and not isinstance(node.this, exp.Star):
+            if self.dialect not in _NO_GROUP_BY_ALIAS_DIALECTS and not node.table:
+                node = self.group_alias(node, select)
+            return self.column(node) if node is not None else None
+
+        name = node.key.upper() if isinstance(node, _GROUPING_CONSTRUCTS) else None
+        self.unsupported(
+            name or "GROUP BY expression",
+            node,
+            hint=None if name else "Only columns can be grouped by so far.",
+        )
+        return None
+
+    def group_position(
+        self, node: exp.Literal, select: exp.Select
+    ) -> exp.Column | None:
+        """Resolve GROUP BY 1 to the first SELECT item, which must be a column."""
+        hint = _GROUP_BY_POSITION_HINTS.get(self.dialect or "")
+        if hint is not None:
+            self.unsupported("GROUP BY position", node, hint=hint)
+            return None
+        position = int(node.this)
+        if not 1 <= position <= len(select.expressions):
+            self.unsupported("GROUP BY position out of range", node)
+            return None
+        target = select.expressions[position - 1]
+        if isinstance(target, exp.Alias):
+            target = target.this
+        if not isinstance(target, exp.Column) or isinstance(target.this, exp.Star):
+            self.unsupported(
+                "GROUP BY position of an expression",
+                node,
+                hint="Only columns can be grouped by so far.",
+            )
+            return None
+        return target
+
+    def group_alias(self, node: exp.Column, select: exp.Select) -> exp.Column | None:
+        """Resolve a GROUP BY name that matches a SELECT alias.
+
+        Databases resolve such a name to a same-named input column if one
+        exists, and to the alias otherwise. Without the schema, SparkShift
+        cannot tell which applies, unless the alias names a column of the same
+        name, where both readings agree.
+        """
+        for item in select.expressions:
+            name = node.name.lower()
+            if not isinstance(item, exp.Alias) or item.alias.lower() != name:
+                continue
+            target = item.this
+            if isinstance(target, exp.Column) and target.name.lower() == name:
+                return target
+            self.unsupported(
+                "GROUP BY name that is also a SELECT alias",
+                node,
+                hint="Group by the expression itself, or rename the alias.",
+            )
+            return None
+        return node
+
+    def check_grouped(self, item: ir.Expression, keys: list[ir.Column]) -> bool:
+        """Report columns used outside an aggregate that are not GROUP BY keys."""
+        ok = True
+        for column in _free_columns(item):
+            if _matching_key(column, keys) is None:
+                self.issues.append(
+                    Diagnostic(
+                        "column that is neither grouped nor aggregated",
+                        ".".join(column.name_parts),
+                        "Add it to GROUP BY or wrap it in an aggregate such as MAX.",
+                    )
+                )
+                ok = False
+        return ok
+
+    def having(
+        self,
+        having: exp.Having,
+        select: exp.Select,
+        keys: list[ir.Column],
+        output_name: Callable[[ir.Column], str],
+        aggregates: list[ir.Expression],
+        helpers: list[ir.Expression],
+    ) -> ir.Expression | None:
+        """Translate HAVING into a filter on the aggregated result.
+
+        Aggregates already in the SELECT list are referred to by their alias;
+        others are computed as helper columns, which a final projection drops.
+        """
+        issues_before = len(self.issues)
+        condition = self.expression(having.this)
+        if condition is None or len(self.issues) > issues_before:
+            return None
+        aliases = {
+            node.alias.lower()
+            for node in select.expressions
+            if isinstance(node, exp.Alias)
+        }
+
+        def replace(expression: ir.Expression) -> ir.Expression | None:
+            if isinstance(expression, ir.AggregateCall):
+                for aggregate in aggregates:
+                    if (
+                        isinstance(aggregate, ir.Alias)
+                        and aggregate.expression == expression
+                    ):
+                        return ir.Column((aggregate.name,))
+                for helper in helpers:
+                    assert isinstance(helper, ir.Alias)
+                    if helper.expression == expression:
+                        return ir.Column((helper.name,))
+                helpers.append(ir.Alias(expression, f"_having_{len(helpers) + 1}"))
+                return ir.Column((helpers[-1].name,))  # type: ignore[union-attr]
+            if isinstance(expression, ir.Column):
+                key = _matching_key(expression, keys)
+                if key is not None:
+                    return ir.Column((output_name(key),))
+                name = ".".join(expression.name_parts)
+                if name.lower() in aliases:
+                    message = "HAVING reference to a SELECT alias"
+                    hint = "Repeat the aggregate expression in HAVING."
+                else:
+                    message = "column that is neither grouped nor aggregated"
+                    hint = "Add it to GROUP BY or wrap it in an aggregate such as MAX."
+                self.issues.append(Diagnostic(message, name, hint))
+                return expression
+            return None
+
+        rewritten = _rewrite(condition, replace)
+        return None if len(self.issues) > issues_before else rewritten
+
+    def aggregate_call(
+        self, node: exp.AggFunc, function: ir.AggregateFunction
+    ) -> ir.AggregateCall | None:
+        name = function.name
+        if self.no_aggregates_in is not None:
+            context = self.no_aggregates_in
+            hint = "Filter on aggregates with HAVING." if context == "WHERE" else None
+            self.unsupported(f"aggregate function {name} in {context}", node, hint)
+            return None
+        for part, value in node.args.items():
+            if value and part not in ("this", "big_int"):
+                self.unsupported(f"{name} with {part.upper()}", node)
+                return None
+
+        argument = node.this
+        distinct = isinstance(argument, exp.Distinct)
+        if distinct:
+            if function not in (ir.AggregateFunction.COUNT, ir.AggregateFunction.SUM):
+                self.unsupported(f"{name}(DISTINCT ...)", node)
+                return None
+            operands = list(argument.expressions)
+        elif isinstance(argument, exp.Star) and function is ir.AggregateFunction.COUNT:
+            operands = []  # COUNT(*) counts rows
+        else:
+            operands = [argument]
+        if function is not ir.AggregateFunction.COUNT and len(operands) != 1:
+            self.unsupported(f"{name} with {len(operands)} arguments", node)
+            return None
+
+        self.no_aggregates_in = "another aggregate function"
+        arguments = [self.expression(operand) for operand in operands]
+        self.no_aggregates_in = None
+        if any(argument is None for argument in arguments):
+            return None
+        return ir.AggregateCall(function, tuple(arguments), distinct)  # type: ignore[arg-type]
+
     # --- Expressions -----------------------------------------------------
+
+    def expression_without_aggregates(
+        self, node: exp.Expression, context: str
+    ) -> ir.Expression | None:
+        """Translate an expression in a place where aggregates are not allowed."""
+        previous = self.no_aggregates_in
+        self.no_aggregates_in = context
+        try:
+            return self.expression(node)
+        finally:
+            self.no_aggregates_in = previous
 
     def expression(self, node: exp.Expression) -> ir.Expression | None:
         """Translate one expression, recursing into its operands."""
@@ -405,6 +749,10 @@ class _Translator:
         operator = _BINARY_OPERATORS.get(type(node))
         if operator is not None:
             return self.binary(node, operator)
+
+        function = _AGGREGATE_FUNCTIONS.get(type(node))
+        if function is not None:
+            return self.aggregate_call(node, function)  # type: ignore[arg-type]
 
         if isinstance(node, exp.Func):
             name = node.name if isinstance(node, exp.Anonymous) else node.sql_name()
@@ -522,3 +870,69 @@ def _number(text: str) -> int | Decimal | float:
 
 _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
+
+
+def _is_aggregate_query(select: exp.Select) -> bool:
+    """A query aggregates if it groups, filters groups, or selects an aggregate."""
+    if select.args.get("group") or select.args.get("having"):
+        return True
+    for node in select.expressions:
+        for aggregate in node.find_all(exp.AggFunc):
+            # Aggregates inside a window function or a subquery do not make
+            # this query an aggregation.
+            if aggregate.find_ancestor(exp.Window, exp.Select) is select:
+                return True
+    return False
+
+
+def _plain_column(item: ir.Expression) -> tuple[ir.Column, str] | None:
+    """Return the column and output name of ``col`` or ``col AS name``."""
+    if isinstance(item, ir.Column):
+        return item, item.name_parts[-1]
+    if isinstance(item, ir.Alias) and isinstance(item.expression, ir.Column):
+        return item.expression, item.name
+    return None
+
+
+def _matching_key(column: ir.Column, keys: list[ir.Column]) -> ir.Column | None:
+    """Find the GROUP BY key a column refers to.
+
+    ``country`` and ``c.country`` refer to the same key when one of them is
+    unqualified, as SQL name resolution allows.
+    """
+    for key in keys:
+        if column.name_parts == key.name_parts:
+            return key
+        unqualified = len(column.name_parts) == 1 or len(key.name_parts) == 1
+        if unqualified and column.name_parts[-1] == key.name_parts[-1]:
+            return key
+    return None
+
+
+def _free_columns(expression: ir.Expression) -> Iterator[ir.Column]:
+    """Yield the columns an expression uses outside of aggregate calls."""
+    match expression:
+        case ir.Column():
+            yield expression
+        case ir.BinaryOp(left=left, right=right):
+            yield from _free_columns(left)
+            yield from _free_columns(right)
+        case ir.UnaryOp(operand=operand) | ir.Alias(expression=operand):
+            yield from _free_columns(operand)
+
+
+def _rewrite(
+    expression: ir.Expression,
+    replace: Callable[[ir.Expression], ir.Expression | None],
+) -> ir.Expression:
+    """Rebuild an expression, substituting nodes for which ``replace`` returns
+    a value; its children are not visited."""
+    replacement = replace(expression)
+    if replacement is not None:
+        return replacement
+    match expression:
+        case ir.BinaryOp(op=op, left=left, right=right):
+            return ir.BinaryOp(op, _rewrite(left, replace), _rewrite(right, replace))
+        case ir.UnaryOp(op=op, operand=operand):
+            return ir.UnaryOp(op, _rewrite(operand, replace))
+    return expression

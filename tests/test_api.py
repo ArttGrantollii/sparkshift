@@ -5,7 +5,7 @@ import pytest
 import sparkshift
 
 UNSUPPORTED_EXAMPLE = (
-    "SELECT country, COUNT(*) AS n FROM customers GROUP BY country ORDER BY n"
+    "SELECT name, ROW_NUMBER() OVER (ORDER BY name) AS rn FROM customers ORDER BY name"
 )
 
 
@@ -39,10 +39,9 @@ def test_unsupported_query_lists_every_issue() -> None:
         sparkshift.convert(UNSUPPORTED_EXAMPLE)
 
     assert str(caught.value) == (
-        "3 unsupported constructs:\n"
-        "  - function COUNT: COUNT(*)\n"
-        "  - GROUP BY clause: GROUP BY country\n"
-        "  - ORDER BY clause: ORDER BY n"
+        "2 unsupported constructs:\n"
+        "  - WINDOW expression: ROW_NUMBER() OVER (ORDER BY name)\n"
+        "  - ORDER BY clause: ORDER BY name"
     )
 
 
