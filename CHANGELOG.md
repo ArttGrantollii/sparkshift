@@ -51,6 +51,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   list uses helper columns that a final projection drops. Rejects columns that
   are neither grouped nor aggregated, ambiguous alias references, Oracle and
   T-SQL `GROUP BY` positions, and `ROLLUP`/`CUBE`/`GROUPING SETS`.
+- Predicates and conditionals: `IN` lists, `BETWEEN`, `LIKE`/`ILIKE` with
+  constant patterns, `IS [NOT] NULL`, NULL-safe equality, searched and simple
+  `CASE`, `IF`/`IIF`, `COALESCE`/`IFNULL`/`NVL`, `NULLIF`, and
+  `CAST`/`TRY_CAST`/`::` to an allowlist of types with the same meaning in
+  every supported dialect. Rejects T-SQL `ISNULL`, T-SQL `VARCHAR` casts
+  without a length, `FLOAT`/`REAL` casts, T-SQL `LIKE` character classes, and
+  backslashes in `LIKE` patterns.
+- Generic IR child traversal, so checks such as "column is neither grouped nor
+  aggregated" see inside every expression type.
 - Equivalence testing for `LIMIT` without `ORDER BY` (row count plus
   sub-multiset of the unlimited result), and dialect scenarios checked against
   hand-written Spark SQL references.

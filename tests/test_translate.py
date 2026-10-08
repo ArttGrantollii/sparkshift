@@ -267,12 +267,16 @@ def test_issues_inside_one_expression_are_all_reported() -> None:
         ("SELECT -my_udf(a) AS x FROM t", None, ("function MY_UDF", "MY_UDF(a)")),
         ("SELECT COUNT(t.*) AS n FROM t", None, ("qualified star", "t.*")),
         (
-            "SELECT CAST(a AS INT) AS x FROM t",
+            "SELECT CAST(a AS FLOAT) AS x FROM t",
             None,
-            ("function CAST", "CAST(a AS INT)"),
+            ("CAST to FLOAT", "CAST(a AS FLOAT)"),
         ),
-        ("SELECT a IS NULL AS x FROM t", None, ("IS expression", "a IS NULL")),
-        ("SELECT a LIKE 'x%' AS x FROM t", None, ("LIKE expression", "a LIKE 'x%'")),
+        ("SELECT a IS TRUE AS x FROM t", None, ("IS TRUE", "a IS TRUE")),
+        (
+            "SELECT a LIKE 'x!%' ESCAPE '!' AS x FROM t",
+            None,
+            ("LIKE with ESCAPE", "a LIKE 'x!%' ESCAPE '!'"),
+        ),
         ("SELECT a || b AS x FROM t", None, ("DPIPE expression", "a || b")),
         ("SELECT * FROM t GROUP BY a", None, ("SELECT * with aggregation", "*")),
         ("SELECT * FROM t LIMIT 5 OFFSET 2", None, ("OFFSET clause", "OFFSET 2")),
@@ -983,3 +987,291 @@ def test_repeated_group_by_key_is_grouped_once() -> None:
     plan = translate_sql("SELECT status, COUNT(*) FROM orders GROUP BY status, status")
 
     assert plan == ir.Aggregate(ORDERS, (STATUS,), (COUNT_ROWS,))
+
+
+# --- Predicates, conditionals, and casts -------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("sql_expression", "expected"),
+    [
+        ("a IN (1, 2)", ir.InList(A, (Literal(1), Literal(2)))),
+        (
+            "a NOT IN (1, NULL)",
+            UnaryOp(UnaryOperator.NOT, ir.InList(A, (Literal(1), Literal(None)))),
+        ),
+        ("a BETWEEN 1 AND b", ir.Between(A, Literal(1), B)),
+        (
+            "a NOT BETWEEN 1 AND 2",
+            UnaryOp(UnaryOperator.NOT, ir.Between(A, Literal(1), Literal(2))),
+        ),
+        ("a LIKE 'x%'", ir.Like(A, "x%")),
+        ("a NOT LIKE 'x_'", UnaryOp(UnaryOperator.NOT, ir.Like(A, "x_"))),
+        ("a IS NULL", ir.IsNull(A)),
+        ("a IS NOT NULL", ir.IsNull(A, negated=True)),
+        ("NOT a IS NULL", ir.IsNull(A, negated=True)),
+        ("a IS NOT DISTINCT FROM b", ir.NullSafeEqual(A, B)),
+        ("a IS DISTINCT FROM b", UnaryOp(UnaryOperator.NOT, ir.NullSafeEqual(A, B))),
+        ("COALESCE(a, b, 0)", ir.FunctionCall("coalesce", (A, B, Literal(0)))),
+        ("NULLIF(a, 0)", ir.FunctionCall("nullif", (A, Literal(0)))),
+        ("CAST(a AS INT)", ir.Cast(A, "int")),
+        ("CAST(a AS BIGINT)", ir.Cast(A, "bigint")),
+        ("CAST(a AS DECIMAL(10, 2))", ir.Cast(A, "decimal(10,2)")),
+        ("CAST(a AS NUMERIC(12))", ir.Cast(A, "decimal(12,0)")),
+        ("CAST(a AS DOUBLE PRECISION)", ir.Cast(A, "double")),
+        ("CAST(a AS VARCHAR)", ir.Cast(A, "string")),
+        ("CAST(a AS TEXT)", ir.Cast(A, "string")),
+        ("CAST(a AS DATE)", ir.Cast(A, "date")),
+        ("CAST(a AS BOOLEAN)", ir.Cast(A, "boolean")),
+        ("TRY_CAST(a AS INT)", ir.Cast(A, "int", safe=True)),
+    ],
+)
+def test_predicates_and_conversions(
+    sql_expression: str, expected: ir.Expression
+) -> None:
+    assert only_item(f"SELECT {sql_expression} AS x FROM t") == Alias(expected, "x")
+
+
+def test_searched_case() -> None:
+    item = only_item(
+        "SELECT CASE WHEN a > 1 THEN 'big' WHEN a > 0 THEN 'small' "
+        "ELSE 'none' END AS x FROM t"
+    )
+
+    assert item == Alias(
+        ir.Case(
+            (
+                (BinaryOp(BinaryOperator.GREATER, A, Literal(1)), Literal("big")),
+                (BinaryOp(BinaryOperator.GREATER, A, Literal(0)), Literal("small")),
+            ),
+            Literal("none"),
+        ),
+        "x",
+    )
+
+
+def test_simple_case_compares_with_equality() -> None:
+    item = only_item("SELECT CASE a WHEN 1 THEN 'one' END AS x FROM t")
+
+    assert item == Alias(
+        ir.Case(((BinaryOp(BinaryOperator.EQUAL, A, Literal(1)), Literal("one")),)),
+        "x",
+    )
+
+
+@pytest.mark.parametrize(
+    ("sql", "dialect"),
+    [
+        ("SELECT IF(a > 1, 'x', 'y') AS x FROM t", "mysql"),
+        ("SELECT IIF(a > 1, 'x', 'y') AS x FROM t", "tsql"),
+    ],
+)
+def test_if_and_iif_become_case(sql: str, dialect: str) -> None:
+    assert only_item(sql, dialect) == Alias(
+        ir.Case(
+            ((BinaryOp(BinaryOperator.GREATER, A, Literal(1)), Literal("x")),),
+            Literal("y"),
+        ),
+        "x",
+    )
+
+
+@pytest.mark.parametrize(
+    ("sql", "dialect", "expected"),
+    [
+        (
+            "SELECT IFNULL(a, 0) AS x FROM t",
+            "mysql",
+            ir.FunctionCall("coalesce", (A, Literal(0))),
+        ),
+        (
+            "SELECT NVL(a, 0) AS x FROM t",
+            "oracle",
+            ir.FunctionCall("coalesce", (A, Literal(0))),
+        ),
+        (
+            "SELECT a ILIKE 'x%' AS x FROM t",
+            "postgres",
+            ir.Like(A, "x%", case_insensitive=True),
+        ),
+        ("SELECT a <=> b AS x FROM t", "mysql", ir.NullSafeEqual(A, B)),
+        (
+            "SELECT a::numeric(10, 2) AS x FROM t",
+            "postgres",
+            ir.Cast(A, "decimal(10,2)"),
+        ),
+        (
+            "SELECT CAST(a AS NUMERIC) AS x FROM t",
+            "snowflake",
+            ir.Cast(A, "decimal(38,0)"),
+        ),
+        ("SELECT CAST(a AS SIGNED) AS x FROM t", "mysql", ir.Cast(A, "bigint")),
+        ("SELECT CAST(a AS VARCHAR) AS x FROM t", "postgres", ir.Cast(A, "string")),
+    ],
+)
+def test_dialect_spellings(sql: str, dialect: str, expected: ir.Expression) -> None:
+    assert only_item(sql, dialect) == Alias(expected, "x")
+
+
+def test_predicates_work_in_where_and_inside_aggregates() -> None:
+    plan = translate_sql(
+        "SELECT SUM(CASE WHEN a IN (1, 2) THEN 1 ELSE 0 END) AS n FROM t "
+        "WHERE b IS NOT NULL"
+    )
+
+    case = ir.Case(((ir.InList(A, (Literal(1), Literal(2))), Literal(1)),), Literal(0))
+    assert plan == ir.Aggregate(
+        ir.Filter(T, ir.IsNull(B, negated=True)),
+        (),
+        (Alias(ir.AggregateCall(ir.AggregateFunction.SUM, (case,)), "n"),),
+    )
+
+
+def test_grouping_check_sees_columns_inside_case() -> None:
+    # Before the generic child visitor, a column hidden in CASE escaped the check.
+    issues = unsupported_issues(
+        "SELECT a, CASE WHEN b > 1 THEN 1 END AS x, COUNT(*) AS n FROM t GROUP BY a"
+    )
+
+    assert issues == [("column that is neither grouped nor aggregated", "b")]
+
+
+@pytest.mark.parametrize(
+    ("sql", "dialect", "message"),
+    [
+        ("SELECT a FROM t WHERE a IN (SELECT b FROM u)", None, "IN with a subquery"),
+        (
+            "SELECT a FROM t WHERE a LIKE b",
+            None,
+            "LIKE with a pattern that is not a constant",
+        ),
+        ("SELECT a FROM t WHERE a LIKE 'x\\_y'", None, "LIKE pattern with a backslash"),
+        ("SELECT a FROM t WHERE a LIKE '[a-c]%'", "tsql", "LIKE pattern with [ ]"),
+        ("SELECT a FROM t WHERE a IS TRUE", None, "IS TRUE"),
+        ("SELECT ISNULL(a, 1.5) AS x FROM t", "tsql", "ISNULL"),
+        ("SELECT CAST(a AS FLOAT) AS x FROM t", "tsql", "CAST to FLOAT"),
+        ("SELECT CAST(a AS REAL) AS x FROM t", None, "CAST to FLOAT"),
+        ("SELECT CAST(a AS VARCHAR(10)) AS x FROM t", None, "CAST to VARCHAR(10)"),
+        ("SELECT CAST(a AS CHAR(3)) AS x FROM t", None, "CAST to CHAR(3)"),
+        ("SELECT CAST(a AS DECIMAL) AS x FROM t", None, "CAST to DECIMAL"),
+        ("SELECT CAST(a AS TINYINT) AS x FROM t", "tsql", "CAST to TINYINT"),
+        ("SELECT CAST(a AS TIMESTAMP) AS x FROM t", None, "CAST to TIMESTAMP"),
+        (
+            "SELECT CAST(a AS VARCHAR) AS x FROM t",
+            "tsql",
+            "CAST to VARCHAR without a length",
+        ),
+        ("SELECT a BETWEEN 1 AND 2 FROM t", None, "BETWEEN without an alias"),
+        ("SELECT NOT a BETWEEN 1 AND 2 FROM t", None, "BETWEEN without an alias"),
+        ("SELECT IF(a, 1, 2) FROM t", "mysql", "IF without an alias"),
+        ("SELECT CONVERT(INT, a) AS x FROM t", "tsql", "function CONVERT"),
+    ],
+)
+def test_unsupported_predicates_and_casts(
+    sql: str, dialect: str | None, message: str
+) -> None:
+    messages = [issue for issue, _ in unsupported_issues(sql, dialect)]
+
+    assert message in messages
+
+
+@pytest.mark.parametrize(
+    ("sql", "dialect", "hint_fragment"),
+    [
+        ("SELECT ISNULL(a, 1.5) AS x FROM t", "tsql", "first argument's type"),
+        ("SELECT CAST(a AS VARCHAR) AS x FROM t", "tsql", "VARCHAR(30)"),
+        ("SELECT CAST(a AS FLOAT) AS x FROM t", "tsql", "8 bytes"),
+        ("SELECT a FROM t WHERE a LIKE '[a-c]%'", "tsql", "character class"),
+    ],
+)
+def test_dialect_landmines_explain_themselves(
+    sql: str, dialect: str, hint_fragment: str
+) -> None:
+    with pytest.raises(UnsupportedSQLError) as caught:
+        translate_sql(sql, dialect)
+
+    [issue] = caught.value.issues
+    assert issue.hint is not None
+    assert hint_fragment in issue.hint
+
+
+def test_case_reports_issues_in_every_part() -> None:
+    issues = unsupported_issues(
+        "SELECT CASE f(a) WHEN g(b) THEN h(c) ELSE k(d) END AS x FROM t"
+    )
+
+    assert [message for message, _ in issues] == [
+        "function F",
+        "function G",
+        "function H",
+        "function K",
+    ]
+
+
+def test_unknown_parts_of_predicates_are_rejected_not_ignored() -> None:
+    tree = parse_sql("SELECT a FROM t WHERE a BETWEEN 1 AND 2")
+    tree.args["where"].this.set("symmetric", exp.true())
+
+    with pytest.raises(UnsupportedSQLError) as caught:
+        translate(tree)
+
+    assert [issue.message for issue in caught.value.issues] == [
+        "BETWEEN with SYMMETRIC"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("sql_expression", "dialect"),
+    [
+        ("NOT f(a)", None),
+        ("f(a) IS NULL", None),
+        ("f(a) IS NOT NULL", None),
+        ("f(a) IN (1, 2)", None),
+        ("f(a) BETWEEN 1 AND 2", None),
+        ("f(a) LIKE 'x%'", None),
+        ("f(a) <=> b", "mysql"),
+        ("IF(f(a), 1, 2)", "mysql"),
+        ("COALESCE(f(a), 1)", None),
+        ("NULLIF(f(a), 1)", None),
+        ("CAST(f(a) AS INT)", None),
+    ],
+)
+def test_issues_inside_predicates_are_reported(
+    sql_expression: str, dialect: str | None
+) -> None:
+    issues = unsupported_issues(f"SELECT {sql_expression} AS x FROM t", dialect)
+
+    assert issues == [("function F", "F(a)")]
+
+
+@pytest.mark.parametrize("precision", ["DECIMAL(40, 2)", "DECIMAL(5, 6)"])
+def test_out_of_range_decimal_casts_are_rejected(precision: str) -> None:
+    messages = [
+        m for m, _ in unsupported_issues(f"SELECT CAST(a AS {precision}) AS x FROM t")
+    ]
+
+    assert messages == [f"CAST to {precision}"]
+
+
+@pytest.mark.parametrize(
+    ("sql_expression", "dialect", "node_type", "name"),
+    [
+        ("a LIKE 'x%'", None, exp.Like, "LIKE"),
+        ("CASE WHEN a THEN 1 END", None, exp.Case, "CASE"),
+        ("IF(a, 1, 2)", "mysql", exp.If, "IF"),
+        ("COALESCE(a, 1)", None, exp.Coalesce, "COALESCE"),
+        ("NULLIF(a, 1)", None, exp.Nullif, "NULLIF"),
+        ("CAST(a AS INT)", None, exp.Cast, "CAST"),
+    ],
+)
+def test_unknown_parts_of_conditionals_are_rejected_not_ignored(
+    sql_expression: str, dialect: str | None, node_type: type, name: str
+) -> None:
+    # Simulates a slot a future SQLGlot version might add: fail closed.
+    tree = parse_sql(f"SELECT {sql_expression} AS x FROM t", dialect)
+    tree.find(node_type).set("extra", exp.true())
+
+    with pytest.raises(UnsupportedSQLError) as caught:
+        translate(tree, dialect)
+
+    assert [issue.message for issue in caught.value.issues] == [f"{name} with EXTRA"]

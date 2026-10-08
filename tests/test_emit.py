@@ -589,3 +589,75 @@ def test_grouping_without_aggregates_selects_distinct_keys() -> None:
 def test_aggregate_ir_needs_keys_or_aggregates() -> None:
     with pytest.raises(ValueError, match="keys or aggregates"):
         ir.Aggregate(TableScan(("t",)), (), ())
+
+
+# --- Predicates, conditionals, and casts -------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        (
+            ir.InList(A, (Literal(1), Literal(None))),
+            'F.col("a").isin(F.lit(1), F.lit(None))',
+        ),
+        (
+            UnaryOp(UnaryOperator.NOT, ir.InList(A, (Literal(1),))),
+            '~F.col("a").isin(F.lit(1))',
+        ),
+        (ir.Between(A, Literal(1), B), 'F.col("a").between(F.lit(1), F.col("b"))'),
+        (ir.Like(A, 'x"%'), 'F.col("a").like("x\\"%")'),
+        (ir.Like(A, "x%", case_insensitive=True), 'F.col("a").ilike("x%")'),
+        (ir.IsNull(A), 'F.col("a").isNull()'),
+        (ir.IsNull(A, negated=True), 'F.col("a").isNotNull()'),
+        (ir.NullSafeEqual(A, B), 'F.col("a").eqNullSafe(F.col("b"))'),
+        (
+            ir.FunctionCall("coalesce", (A, Literal(0))),
+            'F.coalesce(F.col("a"), F.lit(0))',
+        ),
+        (ir.Cast(A, "decimal(10,2)"), 'F.col("a").cast("decimal(10,2)")'),
+        (ir.Cast(A, "int", safe=True), 'F.col("a").try_cast("int")'),
+        (
+            # A compound receiver is parenthesized before the method call.
+            ir.Cast(BinaryOp(BinaryOperator.ADD, A, B), "int"),
+            '(F.col("a") + F.col("b")).cast("int")',
+        ),
+        (
+            ir.Case(((A, Literal(1)), (B, Literal(2))), Literal(0)),
+            'F.when(F.col("a"), F.lit(1))'
+            '.when(F.col("b"), F.lit(2))'
+            ".otherwise(F.lit(0))",
+        ),
+        (ir.Case(((A, Literal(1)),)), 'F.when(F.col("a"), F.lit(1))'),
+    ],
+)
+def test_predicate_and_conversion_code(
+    expression: ir.Expression, expected: str
+) -> None:
+    assert emit_expression(expression) == expected
+
+
+def test_method_results_combine_with_python_operators() -> None:
+    expression = BinaryOp(
+        BinaryOperator.AND,
+        UnaryOp(UnaryOperator.NOT, ir.InList(A, (Literal(1),))),
+        ir.IsNull(B, negated=True),
+    )
+
+    code = emit_expression(expression)
+
+    assert code == '~F.col("a").isin(F.lit(1)) & F.col("b").isNotNull()'
+    # Python reads "~x.isin(...)" as "~(x.isin(...))", as intended.
+    ast.parse(code, mode="eval")
+
+
+def test_case_needs_a_branch() -> None:
+    with pytest.raises(ValueError, match="at least one branch"):
+        ir.Case(())
+
+
+def test_generic_children_cover_every_expression_field() -> None:
+    case = ir.Case(((A, Literal(1)),), B)
+
+    assert ir.children(case) == [A, Literal(1), B]
+    assert ir.map_children(case, lambda child: C) == ir.Case(((C, C),), C)

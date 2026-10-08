@@ -9,6 +9,7 @@ are collected before failing, so users see them at once.
 
 from collections.abc import Callable, Iterator
 from decimal import Decimal
+from typing import ClassVar
 
 from sqlglot import exp
 
@@ -77,6 +78,64 @@ _GROUP_BY_POSITION_HINTS = {
     "oracle": "In Oracle, GROUP BY 1 groups by the constant 1, not by a column.",
     "tsql": "T-SQL does not support GROUP BY positions.",
 }
+
+# Readable names for parts of predicates and casts in diagnostics.
+_PART_LABELS = {"query": "a subquery", "symmetric": "SYMMETRIC", "format": "FORMAT"}
+
+_BACKSLASH_HINT = (
+    "Whether backslash escapes LIKE wildcards differs between databases and Spark."
+)
+_TSQL_BRACKETS_HINT = (
+    "T-SQL treats [ ] as a character class in LIKE patterns; Spark does not."
+)
+_TSQL_ISNULL_HINT = (
+    "T-SQL's ISNULL returns the first argument's type, so ISNULL(int_col, 1.5) "
+    "is 1, while COALESCE returns 1.5. Use COALESCE if that is intended."
+)
+
+# Cast targets whose meaning is the same in every supported dialect.
+_SIMPLE_CAST_TYPES = {
+    exp.DataType.Type.INT: "int",
+    exp.DataType.Type.BIGINT: "bigint",
+    exp.DataType.Type.SMALLINT: "smallint",
+    exp.DataType.Type.TINYINT: "tinyint",
+    exp.DataType.Type.DOUBLE: "double",
+    exp.DataType.Type.DATE: "date",
+    exp.DataType.Type.BOOLEAN: "boolean",
+}
+_STRING_CAST_TYPES = frozenset(
+    {exp.DataType.Type.VARCHAR, exp.DataType.Type.NVARCHAR, exp.DataType.Type.TEXT}
+)
+_CAST_HINTS = {
+    exp.DataType.Type.FLOAT: (
+        "FLOAT and REAL have different sizes in different databases (T-SQL "
+        "FLOAT is 8 bytes, Spark FLOAT is 4); cast to DOUBLE or DECIMAL(p, s)."
+    ),
+    exp.DataType.Type.VARCHAR: (
+        "Length-limited strings truncate or pad differently across databases; "
+        "cast to VARCHAR without a length."
+    ),
+    exp.DataType.Type.NVARCHAR: (
+        "Length-limited strings truncate or pad differently across databases; "
+        "cast to VARCHAR without a length."
+    ),
+    exp.DataType.Type.CHAR: (
+        "CHAR(n) pads with spaces differently across databases; "
+        "cast to VARCHAR without a length."
+    ),
+    exp.DataType.Type.UTINYINT: (
+        "This TINYINT is unsigned (0 to 255) and overflows differently from "
+        "Spark's signed TINYINT; cast to SMALLINT."
+    ),
+}
+_TSQL_VARCHAR_HINT = (
+    "In T-SQL, CAST to VARCHAR without a length means VARCHAR(30) and "
+    "truncates longer values; Spark strings are unbounded."
+)
+_DECIMAL_DEFAULT_HINT = (
+    "DECIMAL without a precision has a different default in each database; "
+    "write DECIMAL(p, s)."
+)
 
 _ORACLE_OUTER_JOIN_HINT = (
     "Rewrite the (+) marker as an explicit LEFT or RIGHT JOIN ... ON; "
@@ -432,6 +491,15 @@ class _Translator:
                 hint="Add an alias, for example: -amount AS negative_amount.",
             )
             return None
+        unnamed = _differently_named(node)
+        if expression is not None and unnamed is not None:
+            # Spark SQL and PySpark generate different names for this column.
+            self.unsupported(
+                f"{unnamed} without an alias",
+                node,
+                hint="Add an alias, for example: ... AS flag.",
+            )
+            return None
         return expression
 
     # --- Aggregation -----------------------------------------------------
@@ -741,10 +809,10 @@ class _Translator:
         if isinstance(node, exp.Neg):
             return self.negation(node)
         if isinstance(node, exp.Not):
-            operand = self.expression(node.this)
-            return (
-                None if operand is None else ir.UnaryOp(ir.UnaryOperator.NOT, operand)
-            )
+            return self.not_(node)
+        handler = self._PREDICATES_AND_CONDITIONALS.get(type(node))
+        if handler is not None:
+            return handler(self, node)
 
         operator = _BINARY_OPERATORS.get(type(node))
         if operator is not None:
@@ -760,6 +828,208 @@ class _Translator:
         else:
             self.unsupported(f"{node.key.upper()} expression", node)
         return None
+
+    # --- Predicates, conditionals, and casts ------------------------------
+
+    def not_(self, node: exp.Not) -> ir.Expression | None:
+        inner = node.this.unnest()
+        if isinstance(inner, exp.Is) and isinstance(inner.expression, exp.Null):
+            # "x IS NOT NULL": isNotNull() gets the same column name as SQL.
+            operand = self.expression(inner.this)
+            return None if operand is None else ir.IsNull(operand, negated=True)
+        operand = self.expression(node.this)
+        return None if operand is None else ir.UnaryOp(ir.UnaryOperator.NOT, operand)
+
+    def check_parts(self, node: exp.Expression, allowed: set[str], name: str) -> bool:
+        """Reject any part of ``node`` outside ``allowed`` (fail closed)."""
+        ok = True
+        for part, value in node.args.items():
+            if value and part not in allowed:
+                label = _PART_LABELS.get(part, part.upper())
+                self.unsupported(f"{name} with {label}", node)
+                ok = False
+        return ok
+
+    def translate_all(
+        self, nodes: list[exp.Expression]
+    ) -> tuple[ir.Expression, ...] | None:
+        """Translate every node, reporting all issues; None if any failed."""
+        translated = [self.expression(node) for node in nodes]
+        if any(item is None for item in translated):
+            return None
+        return tuple(item for item in translated if item is not None)
+
+    def in_list(self, node: exp.In) -> ir.Expression | None:
+        if not self.check_parts(node, {"this", "expressions"}, "IN"):
+            return None
+        operands = self.translate_all([node.this, *node.expressions])
+        if operands is None:
+            return None
+        return ir.InList(operands[0], operands[1:])
+
+    def between(self, node: exp.Between) -> ir.Expression | None:
+        if not self.check_parts(node, {"this", "low", "high"}, "BETWEEN"):
+            return None
+        operands = self.translate_all([node.this, node.args["low"], node.args["high"]])
+        return None if operands is None else ir.Between(*operands)
+
+    def like(self, node: exp.Like | exp.ILike) -> ir.Expression | None:
+        name = "ILIKE" if isinstance(node, exp.ILike) else "LIKE"
+        if not self.check_parts(node, {"this", "expression", "negate"}, name):
+            return None
+        pattern = node.expression
+        if not isinstance(pattern, exp.Literal) or not pattern.is_string:
+            self.unsupported(f"{name} with a pattern that is not a constant", node)
+            return None
+        text = pattern.this
+        if "\\" in text:
+            self.unsupported(f"{name} pattern with a backslash", node, _BACKSLASH_HINT)
+            return None
+        if self.dialect == "tsql" and "[" in text:
+            self.unsupported(f"{name} pattern with [ ]", node, _TSQL_BRACKETS_HINT)
+            return None
+        operand = self.expression(node.this)
+        if operand is None:
+            return None
+        match = ir.Like(operand, text, case_insensitive=name == "ILIKE")
+        if node.args.get("negate"):
+            return ir.UnaryOp(ir.UnaryOperator.NOT, match)
+        return match
+
+    def escape(self, node: exp.Escape) -> None:
+        self.unsupported("LIKE with ESCAPE", node, _BACKSLASH_HINT)
+
+    def is_(self, node: exp.Is) -> ir.Expression | None:
+        if not isinstance(node.expression, exp.Null):
+            self.unsupported(f"IS {node.expression.sql(dialect=self.dialect)}", node)
+            return None
+        operand = self.expression(node.this)
+        return None if operand is None else ir.IsNull(operand)
+
+    def null_safe_equal(
+        self, node: exp.NullSafeEQ | exp.NullSafeNEQ
+    ) -> ir.Expression | None:
+        operands = self.translate_all([node.this, node.expression])
+        if operands is None:
+            return None
+        equal = ir.NullSafeEqual(*operands)
+        if isinstance(node, exp.NullSafeNEQ):
+            return ir.UnaryOp(ir.UnaryOperator.NOT, equal)
+        return equal
+
+    def case(self, node: exp.Case) -> ir.Expression | None:
+        if not self.check_parts(node, {"this", "ifs", "default"}, "CASE"):
+            return None
+        subject_node = node.args.get("this")
+        subject = self.expression(subject_node) if subject_node is not None else None
+        failed = subject_node is not None and subject is None
+
+        branches: list[tuple[ir.Expression, ir.Expression]] = []
+        for branch in node.args["ifs"]:
+            when, then = (
+                self.expression(branch.this),
+                self.expression(branch.args["true"]),
+            )
+            if when is None or then is None:
+                failed = True
+                continue
+            if subject is not None:
+                # Simple CASE compares with "=", so a NULL subject or a NULL
+                # WHEN value never matches.
+                when = ir.BinaryOp(ir.BinaryOperator.EQUAL, subject, when)
+            branches.append((when, then))
+
+        default_node = node.args.get("default")
+        default = self.expression(default_node) if default_node is not None else None
+        failed |= default_node is not None and default is None
+        return None if failed else ir.Case(tuple(branches), default)
+
+    def if_(self, node: exp.If) -> ir.Expression | None:
+        """IF(condition, a, b) and T-SQL's IIF are a two-way CASE."""
+        if not self.check_parts(node, {"this", "true", "false"}, "IF"):
+            return None
+        otherwise = node.args.get("false")
+        operands = self.translate_all(
+            [node.this, node.args["true"], *([otherwise] if otherwise else [])]
+        )
+        if operands is None:
+            return None
+        default = operands[2] if len(operands) == 3 else None
+        return ir.Case(((operands[0], operands[1]),), default)
+
+    def coalesce(self, node: exp.Coalesce) -> ir.Expression | None:
+        if node.args.get("is_null"):
+            self.unsupported("ISNULL", node, _TSQL_ISNULL_HINT)
+            return None
+        if not self.check_parts(node, {"this", "expressions", "is_nvl"}, "COALESCE"):
+            return None
+        operands = self.translate_all([node.this, *node.expressions])
+        return None if operands is None else ir.FunctionCall("coalesce", operands)
+
+    def nullif(self, node: exp.Nullif) -> ir.Expression | None:
+        if not self.check_parts(node, {"this", "expression"}, "NULLIF"):
+            return None
+        operands = self.translate_all([node.this, node.expression])
+        return None if operands is None else ir.FunctionCall("nullif", operands)
+
+    def cast(self, node: exp.Cast) -> ir.Expression | None:
+        safe = isinstance(node, exp.TryCast) or bool(node.args.get("safe"))
+        name = "TRY_CAST" if safe else "CAST"
+        if not self.check_parts(node, {"this", "to", "safe"}, name):
+            return None
+        data_type = self.spark_type(node.to, node, name)
+        operand = self.expression(node.this)
+        if data_type is None or operand is None:
+            return None
+        return ir.Cast(operand, data_type, safe)
+
+    def spark_type(
+        self, data_type: exp.DataType, node: exp.Expression, name: str
+    ) -> str | None:
+        """Map a SQL type to a Spark type, for types whose meaning SparkShift
+        knows to be the same in every supported dialect."""
+        kind = data_type.this
+        parameters = data_type.expressions
+        if kind in _SIMPLE_CAST_TYPES and not parameters:
+            return _SIMPLE_CAST_TYPES[kind]
+        if kind in _STRING_CAST_TYPES and not parameters:
+            if self.dialect == "tsql" and kind is not exp.DataType.Type.TEXT:
+                self.unsupported(
+                    f"{name} to {data_type.sql(dialect=self.dialect)} without a length",
+                    node,
+                    _TSQL_VARCHAR_HINT,
+                )
+                return None
+            return "string"
+        if kind is exp.DataType.Type.DECIMAL and parameters:
+            precision = int(parameters[0].name)
+            scale = int(parameters[1].name) if len(parameters) > 1 else 0
+            if 1 <= precision <= 38 and 0 <= scale <= precision:
+                return f"decimal({precision},{scale})"
+        hint = _CAST_HINTS.get(kind)
+        if kind is exp.DataType.Type.DECIMAL and not parameters:
+            hint = _DECIMAL_DEFAULT_HINT
+        self.unsupported(f"{name} to {data_type.sql(dialect=self.dialect)}", node, hint)
+        return None
+
+    _PREDICATES_AND_CONDITIONALS: ClassVar[
+        dict[type[exp.Expression], Callable[..., ir.Expression | None]]
+    ] = {
+        exp.In: in_list,
+        exp.Between: between,
+        exp.Like: like,
+        exp.ILike: like,
+        exp.Escape: escape,
+        exp.Is: is_,
+        exp.NullSafeEQ: null_safe_equal,
+        exp.NullSafeNEQ: null_safe_equal,
+        exp.Case: case,
+        exp.If: if_,
+        exp.Coalesce: coalesce,
+        exp.Nullif: nullif,
+        exp.Cast: cast,
+        exp.TryCast: cast,
+    }
 
     def column(self, node: exp.Column) -> ir.Column | None:
         if isinstance(node.this, exp.Star):
@@ -885,6 +1155,20 @@ def _is_aggregate_query(select: exp.Select) -> bool:
     return False
 
 
+def _differently_named(node: exp.Expression) -> str | None:
+    """Name constructs whose unaliased output column Spark SQL and PySpark
+    name differently: SQL says ``between(a, 1, 5)``, PySpark
+    ``((a >= 1) AND (a <= 5))``."""
+    inner = node.unnest()
+    if isinstance(inner, exp.Not):
+        inner = inner.this.unnest()
+    if isinstance(inner, exp.Between):
+        return "BETWEEN"
+    if isinstance(inner, exp.If):
+        return "IF"
+    return None
+
+
 def _plain_column(item: ir.Expression) -> tuple[ir.Column, str] | None:
     """Return the column and output name of ``col`` or ``col AS name``."""
     if isinstance(item, ir.Column):
@@ -911,14 +1195,11 @@ def _matching_key(column: ir.Column, keys: list[ir.Column]) -> ir.Column | None:
 
 def _free_columns(expression: ir.Expression) -> Iterator[ir.Column]:
     """Yield the columns an expression uses outside of aggregate calls."""
-    match expression:
-        case ir.Column():
-            yield expression
-        case ir.BinaryOp(left=left, right=right):
-            yield from _free_columns(left)
-            yield from _free_columns(right)
-        case ir.UnaryOp(operand=operand) | ir.Alias(expression=operand):
-            yield from _free_columns(operand)
+    if isinstance(expression, ir.Column):
+        yield expression
+    elif not isinstance(expression, ir.AggregateCall):
+        for child in ir.children(expression):
+            yield from _free_columns(child)
 
 
 def _rewrite(
@@ -926,13 +1207,8 @@ def _rewrite(
     replace: Callable[[ir.Expression], ir.Expression | None],
 ) -> ir.Expression:
     """Rebuild an expression, substituting nodes for which ``replace`` returns
-    a value; its children are not visited."""
+    a value; the children of a substituted node are not visited."""
     replacement = replace(expression)
     if replacement is not None:
         return replacement
-    match expression:
-        case ir.BinaryOp(op=op, left=left, right=right):
-            return ir.BinaryOp(op, _rewrite(left, replace), _rewrite(right, replace))
-        case ir.UnaryOp(op=op, operand=operand):
-            return ir.UnaryOp(op, _rewrite(operand, replace))
-    return expression
+    return ir.map_children(expression, lambda child: _rewrite(child, replace))

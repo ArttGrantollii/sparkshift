@@ -222,6 +222,39 @@ class _Emitter:
                     name = f"{name}_distinct"
                 code = ", ".join(self.expression(argument) for argument in arguments)
                 return f"F.{name}({code})", _ATOM
+            case ir.InList(expression=inner, values=values):
+                code = ", ".join(self.expression(value) for value in values)
+                return self.method(inner, "isin", code), _ATOM
+            case ir.Between(expression=inner, low=low, high=high):
+                bounds = f"{self.expression(low)}, {self.expression(high)}"
+                return self.method(inner, "between", bounds), _ATOM
+            case ir.Like(
+                expression=inner, pattern=pattern, case_insensitive=insensitive
+            ):
+                name = "ilike" if insensitive else "like"
+                return self.method(inner, name, python_string(pattern)), _ATOM
+            case ir.IsNull(expression=inner, negated=negated):
+                name = "isNotNull" if negated else "isNull"
+                return self.method(inner, name, ""), _ATOM
+            case ir.NullSafeEqual(left=left, right=right):
+                return self.method(left, "eqNullSafe", self.expression(right)), _ATOM
+            case ir.Case(branches=branches, default=default):
+                self.uses_functions = True
+                (first_when, first_then), *rest = branches
+                when_code = self.expression(first_when)
+                code = f"F.when({when_code}, {self.expression(first_then)})"
+                for when, then in rest:
+                    code += f".when({self.expression(when)}, {self.expression(then)})"
+                if default is not None:
+                    code += f".otherwise({self.expression(default)})"
+                return code, _ATOM
+            case ir.FunctionCall(name=name, arguments=arguments):
+                self.uses_functions = True
+                code = ", ".join(self.expression(argument) for argument in arguments)
+                return f"F.{name}({code})", _ATOM
+            case ir.Cast(expression=inner, data_type=data_type, safe=safe):
+                name = "try_cast" if safe else "cast"
+                return self.method(inner, name, python_string(data_type)), _ATOM
             case ir.BinaryOp(op=op, left=left, right=right):
                 precedence = _PRECEDENCE[op]
                 if op is ir.BinaryOperator.OR:
@@ -241,6 +274,10 @@ class _Emitter:
                 right_code = self.operand(right, right_min)
                 return f"{left_code} {op.value} {right_code}", precedence
         assert_never(expression)
+
+    def method(self, receiver: ir.Expression, name: str, arguments: str) -> str:
+        """Render a Column method call, such as ``F.col("a").isin(...)``."""
+        return f"{self.operand(receiver, _ATOM)}.{name}({arguments})"
 
     def operand(self, expression: ir.Expression, minimum: int) -> str:
         """Render an operand, parenthesized if it binds looser than ``minimum``."""

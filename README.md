@@ -76,8 +76,12 @@ UnsupportedSQLError: 2 unsupported constructs:
 | Row limits: `LIMIT n`, T-SQL `TOP n`, `FETCH FIRST n ROWS ONLY` | Supported, for a constant `n` |
 | Aggregates: `COUNT(*)`, `COUNT`, `COUNT(DISTINCT ...)`, `SUM`, `SUM(DISTINCT ...)`, `AVG`, `MIN`, `MAX` | Supported |
 | `GROUP BY` columns, positions (`GROUP BY 1`), and `HAVING` | Supported, with dialect exceptions below |
+| `IN (...)`, `BETWEEN`, `LIKE`, `ILIKE`, `IS [NOT] NULL`, `IS [NOT] DISTINCT FROM`, `<=>` | Supported (constant `LIKE` patterns) |
+| `CASE` (searched and simple), `IF`, `IIF`, `COALESCE`, `IFNULL`, `NVL`, `NULLIF` | Supported |
+| `CAST`, `TRY_CAST`, `::` to integer types, `DECIMAL(p, s)`, `DOUBLE`, `VARCHAR`/`TEXT`/`STRING`, `DATE`, `BOOLEAN` | Supported |
 | `NATURAL`, semi, anti, and as-of joins; joins to subqueries; `LATERAL` and `APPLY` | Unsupported — rejected with an error |
 | `GROUP BY` expressions, `ROLLUP`, `CUBE`, `GROUPING SETS`, `AVG(DISTINCT ...)` | Unsupported — rejected with an error |
+| `IN (subquery)`, `LIKE ... ESCAPE`, `IS TRUE`/`IS FALSE`, casts to `FLOAT`/`REAL`, `CHAR(n)`/`VARCHAR(n)`, unparameterized `DECIMAL`, and timestamps | Unsupported — rejected with an error |
 | Everything else, including `ORDER BY`, window functions, and scalar functions | Unsupported — rejected with an error |
 
 Support grows feature by feature; see the [roadmap](ROADMAP.md).
@@ -101,14 +105,23 @@ rejects it rather than guess:
 | `GROUP BY 1` | Oracle, T-SQL | Oracle groups by the constant 1; T-SQL does not allow positions. |
 | `GROUP BY` or `HAVING` naming a `SELECT` alias | All | Databases differ on whether a same-named column wins, and only the schema would tell. |
 | Selecting a column that is neither grouped nor aggregated | MySQL (relaxed mode) | MySQL returns an arbitrary value; Spark raises an error. |
+| `ISNULL(a, b)` | T-SQL | Returns the first argument's type (`ISNULL(int_col, 1.5)` is 1); `COALESCE` returns 1.5. |
+| `CAST(x AS VARCHAR)` without a length | T-SQL | Means `VARCHAR(30)` and truncates longer values. |
+| `CAST(x AS FLOAT)` / `REAL` | All | Sizes differ: T-SQL `FLOAT` is 8 bytes, Spark `FLOAT` is 4. |
+| `LIKE '[a-c]%'` | T-SQL | `[ ]` is a character class in T-SQL; Spark matches it literally. |
+| `LIKE` patterns containing `\` | All | Whether backslash escapes wildcards differs between databases and Spark. |
 
 ### Known limitations
 
 - Database-specific string collation is not emulated. For example, MySQL and
-  SQL Server often compare strings case-insensitively; Spark compares them
-  case-sensitively.
-- An unaliased negation such as `SELECT -amount` must be given an alias, because
-  Spark SQL and PySpark name that output column differently.
+  SQL Server often compare strings, including in `LIKE`, case-insensitively;
+  Spark compares them case-sensitively.
+- `CAST` failures follow Spark's ANSI behavior: an invalid value raises an
+  error (use `TRY_CAST` for NULL instead), where some databases, such as MySQL,
+  return a default value.
+- An unaliased negation, `BETWEEN`, or `IF` in the `SELECT` list must be given
+  an alias, because Spark SQL and PySpark name those output columns
+  differently.
 - Long expressions are not wrapped across lines yet.
 - A `JOIN` without `ON` or `USING` (accepted by MySQL) is translated as a cross
   join, because SQLGlot represents it exactly like the comma form `FROM a, b`.

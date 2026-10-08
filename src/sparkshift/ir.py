@@ -10,10 +10,11 @@ the syntax of any source language.
 This module must not import SQLGlot or PySpark.
 """
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, fields, replace
 from decimal import Decimal
 from enum import Enum
-from typing import TypeAlias
+from typing import TypeAlias, get_args
 
 # --- Expressions -------------------------------------------------------------
 
@@ -110,9 +111,132 @@ class Star:
     qualifier: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class InList:
+    """``expression IN (values...)``: NULL unless a value matches, when the
+    list contains NULL."""
+
+    expression: "Expression"
+    values: tuple["Expression", ...]
+
+
+@dataclass(frozen=True)
+class Between:
+    """``expression BETWEEN low AND high``, inclusive at both ends."""
+
+    expression: "Expression"
+    low: "Expression"
+    high: "Expression"
+
+
+@dataclass(frozen=True)
+class Like:
+    """A SQL ``LIKE`` match against a constant pattern using ``%`` and ``_``."""
+
+    expression: "Expression"
+    pattern: str
+    case_insensitive: bool = False
+
+
+@dataclass(frozen=True)
+class IsNull:
+    expression: "Expression"
+    negated: bool = False
+
+
+@dataclass(frozen=True)
+class NullSafeEqual:
+    """Equality that treats two NULLs as equal and never returns NULL, as in
+    ``IS NOT DISTINCT FROM`` or ``<=>``."""
+
+    left: "Expression"
+    right: "Expression"
+
+
+@dataclass(frozen=True)
+class Case:
+    """``CASE WHEN condition THEN value ... ELSE default END``.
+
+    The first branch whose condition is true wins; with no match and no
+    default, the result is NULL.
+    """
+
+    branches: tuple[tuple["Expression", "Expression"], ...]
+    default: "Expression | None" = None
+
+    def __post_init__(self) -> None:
+        if not self.branches:
+            raise ValueError("Case needs at least one branch")
+
+
+@dataclass(frozen=True)
+class FunctionCall:
+    """A call to a PySpark function in ``pyspark.sql.functions``, by name."""
+
+    name: str
+    arguments: tuple["Expression", ...]
+
+
+@dataclass(frozen=True)
+class Cast:
+    """Convert to a Spark type, such as ``"int"`` or ``"decimal(10,2)"``.
+
+    A safe cast returns NULL for values that cannot be converted, instead of
+    raising an error.
+    """
+
+    expression: "Expression"
+    data_type: str
+    safe: bool = False
+
+
 Expression: TypeAlias = (
-    Column | Literal | BinaryOp | UnaryOp | Alias | Star | AggregateCall
+    Column
+    | Literal
+    | BinaryOp
+    | UnaryOp
+    | Alias
+    | Star
+    | AggregateCall
+    | InList
+    | Between
+    | Like
+    | IsNull
+    | NullSafeEqual
+    | Case
+    | FunctionCall
+    | Cast
 )
+
+_EXPRESSION_TYPES = get_args(Expression)
+
+
+def children(expression: Expression) -> list[Expression]:
+    """Return an expression's direct sub-expressions, in field order."""
+    found: list[Expression] = []
+    map_children(expression, lambda child: found.append(child) or child)
+    return found
+
+
+def map_children(
+    expression: Expression, function: Callable[[Expression], Expression]
+) -> Expression:
+    """Rebuild an expression with ``function`` applied to each direct
+    sub-expression. Works for every expression type, including ones added
+    later, because it inspects the dataclass fields."""
+    changes = {
+        field.name: _map_value(getattr(expression, field.name), function)
+        for field in fields(expression)
+    }
+    return replace(expression, **changes)
+
+
+def _map_value(value: object, function: Callable[[Expression], Expression]) -> object:
+    if isinstance(value, _EXPRESSION_TYPES):
+        return function(value)  # type: ignore[arg-type]
+    if isinstance(value, tuple):
+        return tuple(_map_value(item, function) for item in value)
+    return value
 
 
 # --- Relations ---------------------------------------------------------------
