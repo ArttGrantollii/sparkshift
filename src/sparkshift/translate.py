@@ -112,6 +112,10 @@ class _Translator:
     def select(self, select: exp.Select) -> ir.Relation | None:
         source: ir.Relation | None = None
         items: tuple[ir.Expression, ...] | None = None
+        condition: ir.Expression | None = None
+        distinct = False
+        limit: int | None = None
+        failed = False
 
         # Walk the parts in SQLGlot's declared order so diagnostics are
         # deterministic.
@@ -121,16 +125,110 @@ class _Translator:
                 items = self.projection(value)
             elif part == "from_":
                 source = self.from_(select)
-            elif value:
+            elif not value:
+                continue
+            elif part == "where":
+                condition = self.where(value, select)
+                failed |= condition is None
+            elif part == "distinct":
+                distinct = self.distinct(value)
+                failed |= not distinct
+            elif part == "limit":
+                limit = self.limit(value)
+                failed |= limit is None
+            else:
                 name = _SELECT_PART_NAMES.get(part, f"{part.strip('_').upper()} clause")
                 for node in value if isinstance(value, list) else [value]:
                     self.unsupported(name, node)
 
-        if source is None or items is None:
+        if source is None or items is None or failed:
             return None
-        if items == (ir.Star(),):
-            return source
-        return ir.Project(source, items)
+
+        # Build the plan in SQL's logical evaluation order, not the order the
+        # clauses are written in: FROM, WHERE, SELECT, DISTINCT, LIMIT.
+        relation = source
+        if condition is not None:
+            relation = ir.Filter(relation, condition)
+        if items != (ir.Star(),):
+            relation = ir.Project(relation, items)
+        if distinct:
+            relation = ir.Distinct(relation)
+        if limit is not None:
+            relation = ir.Limit(relation, limit)
+        return relation
+
+    def where(self, where: exp.Where, select: exp.Select) -> ir.Expression | None:
+        issues_before = len(self.issues)
+        if self.dialect == "snowflake":
+            self.check_alias_references(where, select)
+        condition = self.expression(where.this)
+        return None if len(self.issues) > issues_before else condition
+
+    def check_alias_references(self, where: exp.Where, select: exp.Select) -> None:
+        """Reject WHERE references to SELECT-list aliases.
+
+        Snowflake lets WHERE refer to an alias defined in the SELECT list; Spark
+        does not. Without the table schema, SparkShift cannot tell whether a
+        name means the alias or a real column, so it does not guess.
+        """
+        aliases = {
+            node.alias.lower()
+            for node in select.expressions
+            if isinstance(node, exp.Alias)
+        }
+        for column in where.find_all(exp.Column):
+            if not column.table and column.name.lower() in aliases:
+                self.unsupported(
+                    "WHERE reference to a SELECT alias",
+                    column,
+                    hint="Repeat the aliased expression in the WHERE clause.",
+                )
+
+    def distinct(self, node: exp.Distinct) -> bool:
+        if node.args.get("on"):
+            self.unsupported("DISTINCT ON", node)
+            return False
+        return True
+
+    def limit(self, node: exp.Expression) -> int | None:
+        """Translate LIMIT n, T-SQL's TOP n, or FETCH FIRST n ROWS ONLY."""
+        if isinstance(node, exp.Fetch):
+            count, allowed = (
+                node.args.get("count"),
+                {"direction", "count", "limit_options"},
+            )
+        else:
+            count, allowed = (
+                node.args.get("expression"),
+                {"expression", "limit_options"},
+            )
+
+        supported = True
+        options = node.args.get("limit_options")
+        if options is not None and options.args.get("percent"):
+            self.unsupported("row limit in PERCENT", node)
+            supported = False
+        if options is not None and options.args.get("with_ties"):
+            self.unsupported("row limit WITH TIES", node)
+            supported = False
+        for part, value in node.args.items():
+            if value and part not in allowed:
+                self.unsupported(f"row limit {part.upper()}", node)
+                supported = False
+
+        is_count = (
+            isinstance(count, exp.Literal)
+            and not count.is_string
+            and count.this.isdigit()
+        )
+        if not is_count:
+            self.unsupported(
+                "row limit that is not a non-negative integer",
+                node,
+                hint="Use a constant number of rows.",
+            )
+            return None
+        return int(count.this) if supported else None
 
     def from_(self, select: exp.Select) -> ir.TableScan | None:
         from_ = select.args.get("from_")
@@ -218,7 +316,25 @@ class _Translator:
         if isinstance(node.this, exp.Star):
             self.unsupported("qualified star", node)
             return None
+        if self.dialect == "oracle" and self.is_oracle_pseudo_column(node):
+            # SQLGlot parses ROWNUM as an ordinary column; Spark has no such column.
+            self.unsupported(
+                f"{node.name.upper()} pseudo-column",
+                node,
+                hint="Use FETCH FIRST n ROWS ONLY to limit rows.",
+            )
+            return None
         return ir.Column(tuple(identifier.name for identifier in node.parts))
+
+    @staticmethod
+    def is_oracle_pseudo_column(node: exp.Column) -> bool:
+        identifier = node.this
+        return (
+            not node.table
+            and isinstance(identifier, exp.Identifier)
+            and not identifier.quoted
+            and identifier.name.upper() in {"ROWNUM", "ROWID"}
+        )
 
     def literal(self, node: exp.Literal | exp.Boolean | exp.Null) -> ir.Literal:
         if isinstance(node, exp.Null):

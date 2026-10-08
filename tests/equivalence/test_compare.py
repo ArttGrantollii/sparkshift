@@ -8,7 +8,7 @@ These run on plain Python data and need no Spark.
 from decimal import Decimal
 
 import pytest
-from compare import Snapshot, differences, values_equal
+from compare import Snapshot, differences, limited_differences, values_equal
 
 COLUMNS = (("id", "int"), ("value", "string"))
 
@@ -133,3 +133,47 @@ def test_long_differences_are_truncated() -> None:
 
     assert problem.startswith("Rows missing from the generated result (15):")
     assert problem.endswith("... and 5 more")
+
+
+# --- LIMIT without ORDER BY: count + sub-multiset ----------------------------
+
+UNLIMITED = snap((1, "a"), (1, "a"), (2, "b"), (3, None))
+
+
+@pytest.mark.parametrize(
+    "actual",
+    [
+        snap((3, None), (1, "a")),  # any rows, any order
+        snap((1, "a"), (1, "a")),  # a duplicate, used as often as it occurs
+        snap(),
+    ],
+)
+def test_limited_result_from_the_unlimited_rows_matches(actual: Snapshot) -> None:
+    assert limited_differences(UNLIMITED, actual, len(actual.rows)) == []
+
+
+def test_limited_result_with_the_wrong_count_is_detected() -> None:
+    problems = limited_differences(UNLIMITED, snap((1, "a")), expected_count=2)
+
+    assert problems == ["Expected 2 rows, got 1"]
+
+
+def test_limited_row_not_in_the_unlimited_result_is_detected() -> None:
+    problems = limited_differences(UNLIMITED, snap((1, "a"), (9, "z")), 2)
+
+    assert problems == ["Rows not in the unlimited result (1):\n  (9, 'z')"]
+
+
+def test_limited_duplicate_used_too_often_is_detected() -> None:
+    # (2, "b") occurs once in the unlimited result, so it can appear at most once.
+    problems = limited_differences(UNLIMITED, snap((2, "b"), (2, "b")), 2)
+
+    assert problems == ["Rows not in the unlimited result (1):\n  (2, 'b')"]
+
+
+def test_limited_result_with_different_columns_is_detected() -> None:
+    actual = snap((1,), columns=(("id", "int"),))
+
+    [problem] = limited_differences(UNLIMITED, actual, 1)
+
+    assert problem.startswith("Columns differ")

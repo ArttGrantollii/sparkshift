@@ -47,18 +47,27 @@ in `tests/equivalence/compare.py` applies these rules:
 | 4 | **Nullability flags are ignored** | Spark derives "may contain NULL" metadata differently depending on the code path. Actual NULL values are still compared. |
 | 5 | **NULL matches NULL** | In SQL, `NULL = NULL` is not true, but when comparing results, NULL in both means they agree. |
 | 6 | **Floats match within a tolerance; everything else exactly** | Floating-point addition is not associative, so a different evaluation order can change the last digits. Decimals, strings, dates, and timestamps must match exactly. |
+| 7 | **`LIMIT` without `ORDER BY`: count plus sub-multiset** | Such a query may return *any* `n` rows, so two correct runs can return different rows. The harness removes the `LIMIT` to build the unlimited reference, then checks that the row count matches and that every returned row exists in the unlimited result, duplicates included. |
 
 Ordered comparison (for queries with `ORDER BY`) must also account for ties,
 where rows with equal sort keys may appear in any order. It will be added
 together with `ORDER BY` support.
+
+### Dialect scenarios
+
+The reference result comes from running the SQL with `spark.sql`, so it must be
+valid Spark SQL. For dialect syntax Spark cannot run, such as T-SQL `TOP` or
+Oracle `FETCH FIRST`, a scenario supplies a hand-written Spark SQL reference
+(`reference_sql`) that expresses the same query.
 
 ### Testing the comparator
 
 A comparator that always reports "equal" would make every equivalence test
 pass and prove nothing. `tests/equivalence/test_compare.py` therefore includes
 cases that must fail: a missing duplicate, NULL vs empty string, NULL vs zero,
-`int` vs `bigint`, reordered columns, unequal decimals, and floats outside the
-tolerance.
+`int` vs `bigint`, reordered columns, unequal decimals, floats outside the
+tolerance, and — for `LIMIT` — a wrong row count, a row not in the unlimited
+result, and a duplicate returned more often than it exists.
 
 ## Test data
 

@@ -305,3 +305,52 @@ def test_python_string_round_trips(value: str) -> None:
 
     assert literal.startswith('"')
     assert ast.literal_eval(literal) == value
+
+
+# --- Chains ------------------------------------------------------------------
+
+
+def test_full_chain_golden_output() -> None:
+    plan = ir.Limit(
+        ir.Distinct(
+            Project(
+                ir.Filter(
+                    TableScan(("customers",)),
+                    BinaryOp(
+                        BinaryOperator.AND,
+                        Column(("is_active",)),
+                        BinaryOp(
+                            BinaryOperator.GREATER, Column(("score",)), Literal(2)
+                        ),
+                    ),
+                ),
+                (Column(("country",)),),
+            )
+        ),
+        10,
+    )
+
+    assert emit(plan) == (
+        "from pyspark.sql import functions as F\n"
+        "\n"
+        "result = (\n"
+        '    spark.table("customers")\n'
+        '    .where(F.col("is_active") & (F.col("score") > F.lit(2)))\n'
+        '    .select(F.col("country"))\n'
+        "    .distinct()\n"
+        "    .limit(10)\n"
+        ")\n"
+    )
+
+
+def test_chain_without_column_expressions_needs_no_import() -> None:
+    plan = ir.Limit(ir.Distinct(TableScan(("t",))), 5)
+
+    assert emit(plan) == (
+        'result = (\n    spark.table("t")\n    .distinct()\n    .limit(5)\n)\n'
+    )
+
+
+def test_negative_limit_is_rejected_by_the_ir() -> None:
+    with pytest.raises(ValueError, match="must not be negative"):
+        ir.Limit(TableScan(("t",)), -1)

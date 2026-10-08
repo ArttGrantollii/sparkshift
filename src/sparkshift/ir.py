@@ -103,6 +103,17 @@ class TableScan:
 
 
 @dataclass(frozen=True)
+class Filter:
+    """Keep only the rows for which ``condition`` is true.
+
+    Rows where the condition is false or NULL are dropped, as in SQL's WHERE.
+    """
+
+    source: "Relation"
+    condition: Expression
+
+
+@dataclass(frozen=True)
 class Project:
     """Compute output columns from the source, as in a SELECT list."""
 
@@ -110,5 +121,24 @@ class Project:
     items: tuple[Expression, ...]
 
 
+@dataclass(frozen=True)
+class Distinct:
+    """Remove duplicate rows; NULLs compare as equal, as in SQL's DISTINCT."""
+
+    source: "Relation"
+
+
+@dataclass(frozen=True)
+class Limit:
+    """Keep at most ``count`` rows."""
+
+    source: "Relation"
+    count: int
+
+    def __post_init__(self) -> None:
+        if self.count < 0:
+            raise ValueError("Limit count must not be negative")
+
+
 # Any IR node that produces a DataFrame.
-Relation: TypeAlias = TableScan | Project
+Relation: TypeAlias = TableScan | Filter | Project | Distinct | Limit

@@ -2,7 +2,9 @@
 
 from typing import TYPE_CHECKING
 
-from compare import differences, snapshot
+import sqlglot
+from compare import differences, limited_differences, snapshot
+from sqlglot import exp
 
 import sparkshift
 
@@ -30,18 +32,48 @@ def run_generated(spark: "SparkSession", code: str) -> "DataFrame":
 
 
 def assert_equivalent(
-    spark: "SparkSession", sql: str, dialect: str | None = None
+    spark: "SparkSession",
+    sql: str,
+    dialect: str | None = None,
+    reference_sql: str | None = None,
 ) -> None:
-    """Assert that the generated PySpark returns the same result as spark.sql(sql).
+    """Assert that the generated PySpark returns the same result as the SQL.
 
-    ``sql`` must also be valid Spark SQL, since it is executed directly as the
-    reference result.
+    The reference result comes from running ``reference_sql`` (default:
+    ``sql`` itself) with spark.sql, so it must be valid Spark SQL. Pass it
+    explicitly when ``sql`` is in a dialect Spark cannot run, such as T-SQL.
     """
-    expected = snapshot(spark.sql(sql))
+    reference = reference_sql or sql
     code = sparkshift.convert(sql, dialect=dialect).code
     actual = snapshot(run_generated(spark, code))
 
-    problems = differences(expected, actual)
-    assert not problems, "\n\n".join(
-        [f"SQL:\n{sql}", f"Generated code:\n{code}", *problems]
-    )
+    unlimited = without_limit(reference)
+    if unlimited is None:
+        problems = differences(snapshot(spark.sql(reference)), actual)
+    else:
+        expected_count = spark.sql(reference).count()
+        problems = limited_differences(
+            snapshot(spark.sql(unlimited)), actual, expected_count
+        )
+
+    context = [f"SQL:\n{sql}"]
+    if reference != sql:
+        context.append(f"Reference SQL:\n{reference}")
+    context.append(f"Generated code:\n{code}")
+    assert not problems, "\n\n".join([*context, *problems])
+
+
+def without_limit(spark_sql: str) -> str | None:
+    """Return the query without its LIMIT if it limits rows without ORDER BY.
+
+    Such a query may return any rows, so it is checked against the unlimited
+    result instead (see ``limited_differences``). Returns None otherwise.
+    """
+    tree = sqlglot.parse_one(spark_sql, read="spark")
+    if not isinstance(tree, exp.Select) or tree.args.get("order"):
+        return None
+    if tree.args.get("limit") is None:
+        return None
+    unlimited = tree.copy()
+    unlimited.set("limit", None)
+    return unlimited.sql(dialect="spark")

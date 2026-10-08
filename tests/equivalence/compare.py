@@ -10,6 +10,8 @@ The rules, and why each exists, are documented in docs/testing.md:
 5. NULL matches NULL.
 6. Floating-point values match within a tolerance; all other values match
    exactly.
+7. A LIMIT without ORDER BY may return any rows: the row count must match, and
+   every returned row must exist in the unlimited result (a sub-multiset).
 
 The comparison itself works on plain Python data (``Snapshot``), so it can be
 tested without starting Spark.
@@ -48,11 +50,7 @@ def snapshot(df: "DataFrame") -> Snapshot:
 def differences(expected: Snapshot, actual: Snapshot) -> list[str]:
     """Return human-readable differences; an empty list means equivalent."""
     if expected.columns != actual.columns:
-        return [
-            "Columns differ:\n"
-            f"  expected: {_format_columns(expected.columns)}\n"
-            f"  actual:   {_format_columns(actual.columns)}"
-        ]
+        return [_column_difference(expected, actual)]
 
     missing, unexpected = _unmatched_rows(expected.rows, actual.rows)
     problems = []
@@ -65,6 +63,37 @@ def differences(expected: Snapshot, actual: Snapshot) -> list[str]:
             _describe_rows("Unexpected rows in the generated result", unexpected)
         )
     return problems
+
+
+def limited_differences(
+    unlimited: Snapshot, actual: Snapshot, expected_count: int
+) -> list[str]:
+    """Compare the result of a LIMIT query that has no ORDER BY.
+
+    Such a query may legitimately return any ``expected_count`` rows of the
+    unlimited result. Instead of exact rows, check the count and that every
+    returned row exists in the unlimited result, duplicates included.
+    """
+    if unlimited.columns != actual.columns:
+        return [_column_difference(unlimited, actual)]
+
+    problems = []
+    if len(actual.rows) != expected_count:
+        problems.append(f"Expected {expected_count} rows, got {len(actual.rows)}")
+    not_in_reference, _ = _unmatched_rows(actual.rows, unlimited.rows)
+    if not_in_reference:
+        problems.append(
+            _describe_rows("Rows not in the unlimited result", not_in_reference)
+        )
+    return problems
+
+
+def _column_difference(expected: Snapshot, actual: Snapshot) -> str:
+    return (
+        "Columns differ:\n"
+        f"  expected: {_format_columns(expected.columns)}\n"
+        f"  actual:   {_format_columns(actual.columns)}"
+    )
 
 
 def _unmatched_rows(

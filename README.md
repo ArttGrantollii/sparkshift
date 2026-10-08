@@ -6,8 +6,9 @@
 Convert SQL into readable, idiomatic, tested PySpark DataFrame code.
 
 > **Status: early development.** SparkShift converts single-table `SELECT`
-> queries with column expressions (see below). Everything else is rejected
-> with a clear error. See [ROADMAP.md](ROADMAP.md) for planned scope.
+> queries with column expressions, `WHERE`, `DISTINCT`, and row limits (see
+> below). Everything else is rejected with a clear error. See
+> [ROADMAP.md](ROADMAP.md) for planned scope.
 
 ## Goal
 
@@ -54,9 +55,10 @@ Queries SparkShift cannot translate safely raise `UnsupportedSQLError`, listing
 every unsupported construct:
 
 ```text
-UnsupportedSQLError: 2 unsupported constructs:
-  - WHERE clause: WHERE age > 30
-  - ORDER BY clause: ORDER BY name
+UnsupportedSQLError: 3 unsupported constructs:
+  - function COUNT: COUNT(*)
+  - GROUP BY clause: GROUP BY country
+  - ORDER BY clause: ORDER BY n
 ```
 
 ## Supported SQL
@@ -69,22 +71,28 @@ UnsupportedSQLError: 2 unsupported constructs:
 | Arithmetic: `+ - * / %` and unary `-` | Supported, with dialect exceptions below |
 | Comparisons: `= <> != < <= > >=` | Supported |
 | Logic: `AND OR NOT` (SQL three-valued logic with NULL) | Supported |
-| Everything else, including `WHERE`, joins, and functions | Unsupported — rejected with an error |
+| `WHERE` | Supported |
+| `DISTINCT` | Supported (`DISTINCT ON` is not) |
+| Row limits: `LIMIT n`, T-SQL `TOP n`, `FETCH FIRST n ROWS ONLY` | Supported, for a constant `n` |
+| Everything else, including joins, `GROUP BY`, `ORDER BY`, and functions | Unsupported — rejected with an error |
 
 Support grows feature by feature; see the [roadmap](ROADMAP.md).
 
 ### Dialect differences
 
-SparkShift generates code with Spark semantics. Where a source dialect's
-operator means something different and SparkShift cannot tell which meaning
-applies without knowing column types, it rejects the construct rather than
-guess:
+SparkShift generates code with Spark semantics. Where a construct in the
+source dialect means something different in Spark, has no Spark equivalent, or
+could mean two things that only the table schema would distinguish, SparkShift
+rejects it rather than guess:
 
 | Construct | Dialects | Why it is rejected |
 |---|---|---|
 | `/` | T-SQL, PostgreSQL | Dividing two integers discards the remainder; Spark returns a fraction. |
 | `/` | MySQL | Division by zero returns NULL; Spark raises an error. |
 | `+` | T-SQL | `+` also concatenates strings. |
+| `WHERE` referring to a `SELECT` alias | Snowflake | Spark does not allow it, and the name could also be a real column. |
+| `ROWNUM`, `ROWID` | Oracle | Pseudo-columns with no Spark equivalent; use `FETCH FIRST n ROWS ONLY`. |
+| `TOP n PERCENT`, `WITH TIES`, `OFFSET` | T-SQL, Oracle, others | Not equivalent to a plain row limit. |
 
 ### Known limitations
 

@@ -85,18 +85,27 @@ class _Emitter:
         match plan:
             case ir.TableScan(name_parts=parts):
                 return f"spark.table({python_string(spark_identifier(parts))})", []
+            case ir.Filter(source=source, condition=condition):
+                start, calls = self.chain(source)
+                return start, [*calls, self.call("where", [self.expression(condition)])]
             case ir.Project(source=source, items=items):
                 start, calls = self.chain(source)
                 arguments = [self.expression(item) for item in items]
                 return start, [*calls, self.call("select", arguments)]
+            case ir.Distinct(source=source):
+                start, calls = self.chain(source)
+                return start, [*calls, self.call("distinct", [])]
+            case ir.Limit(source=source, count=count):
+                start, calls = self.chain(source)
+                return start, [*calls, self.call("limit", [str(count)])]
         assert_never(plan)
 
     def call(self, method: str, arguments: list[str]) -> str:
-        """Render a method call: inline if it is short and has one argument,
-        otherwise with one argument per line."""
+        """Render a method call: inline if it is short and has at most one
+        argument, otherwise with one argument per line."""
         inline = f".{method}({', '.join(arguments)})"
         fits = len(_INDENT + inline) <= _MAX_LINE_LENGTH
-        if len(arguments) == 1 and fits and "\n" not in inline:
+        if len(arguments) <= 1 and fits and "\n" not in inline:
             return inline
         body = "".join(_indent(f"{argument},") + "\n" for argument in arguments)
         return f".{method}(\n{body})"

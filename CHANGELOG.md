@@ -35,3 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operators whose meaning differs from Spark in the source dialect (integer
   division in T-SQL/PostgreSQL, NULL-on-zero division in MySQL, `+` in T-SQL)
   are rejected with an explanation.
+- `WHERE`, `DISTINCT`, and row limits (`LIMIT n`, T-SQL `TOP n`,
+  `FETCH FIRST n ROWS ONLY`), emitted in SQL's logical evaluation order.
+  `DISTINCT ON`, `PERCENT`, `WITH TIES`, `OFFSET`, Oracle `ROWNUM`/`ROWID`, and
+  Snowflake `WHERE` references to `SELECT` aliases are rejected.
+- Equivalence testing for `LIMIT` without `ORDER BY` (row count plus
+  sub-multiset of the unlimited result), and dialect scenarios checked against
+  hand-written Spark SQL references.

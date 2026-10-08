@@ -241,11 +241,11 @@ def test_tsql_subtraction_is_supported() -> None:
 
 def test_all_unsupported_constructs_are_reported_together() -> None:
     issues = unsupported_issues(
-        "SELECT name FROM customers WHERE age > 30 ORDER BY name"
+        "SELECT name FROM customers GROUP BY name ORDER BY name"
     )
 
     assert issues == [
-        ("WHERE clause", "WHERE age > 30"),
+        ("GROUP BY clause", "GROUP BY name"),
         ("ORDER BY clause", "ORDER BY name"),
     ]
 
@@ -270,12 +270,8 @@ def test_issues_inside_one_expression_are_all_reported() -> None:
         ("SELECT a IS NULL AS x FROM t", None, ("IS expression", "a IS NULL")),
         ("SELECT a LIKE 'x%' AS x FROM t", None, ("LIKE expression", "a LIKE 'x%'")),
         ("SELECT a || b AS x FROM t", None, ("DPIPE expression", "a || b")),
-        ("SELECT DISTINCT * FROM t", None, ("DISTINCT", "DISTINCT")),
         ("SELECT * FROM t GROUP BY a", None, ("GROUP BY clause", "GROUP BY a")),
-        ("SELECT * FROM t LIMIT 5", None, ("LIMIT clause", "LIMIT 5")),
-        # Fragments are regenerated from the AST, not copied from the input, so
-        # they show SQLGlot's normalized form: TOP 5 is stored as a Limit node.
-        ("SELECT TOP 5 * FROM t", "tsql", ("LIMIT clause", "LIMIT 5")),
+        ("SELECT * FROM t LIMIT 5 OFFSET 2", None, ("OFFSET clause", "OFFSET 2")),
         ("SELECT AS STRUCT * FROM t", "bigquery", ("SELECT AS", "STRUCT")),
         (
             "WITH x AS (SELECT 1) SELECT * FROM x",
@@ -348,3 +344,126 @@ def test_select_without_columns_is_a_parse_error() -> None:
     # The parser accepts this (see test_parsing); the translator must not.
     with pytest.raises(SQLParseError, match="SELECT has no columns"):
         translate_sql("SELECT FROM t")
+
+
+# --- WHERE, DISTINCT, LIMIT --------------------------------------------------
+
+T = TableScan(("t",))
+
+
+def test_clauses_are_built_in_evaluation_order() -> None:
+    # Written SELECT ... WHERE ... LIMIT, but evaluated FROM, WHERE, SELECT,
+    # DISTINCT, LIMIT.
+    plan = translate_sql("SELECT DISTINCT a FROM t WHERE b > 1 LIMIT 3")
+
+    assert plan == ir.Limit(
+        ir.Distinct(
+            Project(
+                ir.Filter(T, BinaryOp(BinaryOperator.GREATER, B, Literal(1))),
+                (A,),
+            )
+        ),
+        3,
+    )
+
+
+def test_where_with_select_star_filters_without_projecting() -> None:
+    assert translate_sql("SELECT * FROM t WHERE a") == ir.Filter(T, A)
+
+
+def test_select_all_is_not_distinct() -> None:
+    assert translate_sql("SELECT ALL a FROM t") == Project(T, (A,))
+
+
+@pytest.mark.parametrize(
+    ("sql", "dialect"),
+    [
+        ("SELECT * FROM t LIMIT 5", None),
+        ("SELECT TOP 5 * FROM t", "tsql"),
+        ("SELECT TOP (5) * FROM t", "tsql"),
+        ("SELECT * FROM t FETCH FIRST 5 ROWS ONLY", "oracle"),
+    ],
+)
+def test_row_limits_in_every_dialect_spelling(sql: str, dialect: str | None) -> None:
+    assert translate_sql(sql, dialect) == ir.Limit(T, 5)
+
+
+def test_limit_zero_is_allowed() -> None:
+    assert translate_sql("SELECT * FROM t LIMIT 0") == ir.Limit(T, 0)
+
+
+@pytest.mark.parametrize(
+    ("sql", "dialect", "message"),
+    [
+        ("SELECT TOP 5 PERCENT * FROM t", "tsql", "row limit in PERCENT"),
+        ("SELECT TOP 5 WITH TIES * FROM t ORDER BY a", "tsql", "row limit WITH TIES"),
+        (
+            "SELECT * FROM t FETCH FIRST 5 PERCENT ROWS ONLY",
+            "oracle",
+            "row limit in PERCENT",
+        ),
+        (
+            "SELECT * FROM t LIMIT a",
+            None,
+            "row limit that is not a non-negative integer",
+        ),
+        (
+            "SELECT * FROM t LIMIT -1",
+            None,
+            "row limit that is not a non-negative integer",
+        ),
+        (
+            "SELECT * FROM t LIMIT 2 + 3",
+            None,
+            "row limit that is not a non-negative integer",
+        ),
+        ("SELECT DISTINCT ON (a) a, b FROM t", "postgres", "DISTINCT ON"),
+        ("SELECT * FROM t WHERE ROWNUM <= 5", "oracle", "ROWNUM pseudo-column"),
+        ("SELECT ROWID AS r FROM t", "oracle", "ROWID pseudo-column"),
+        (
+            "SELECT amount * 2 AS doubled FROM t WHERE doubled > 100",
+            "snowflake",
+            "WHERE reference to a SELECT alias",
+        ),
+        ("SELECT * FROM t WHERE COUNT(a) > 1", None, "function COUNT"),
+    ],
+)
+def test_unsupported_filters_and_limits(
+    sql: str, dialect: str | None, message: str
+) -> None:
+    messages = [issue for issue, _ in unsupported_issues(sql, dialect)]
+
+    assert message in messages
+
+
+def test_rownum_is_an_ordinary_column_outside_oracle() -> None:
+    assert translate_sql("SELECT rownum FROM t") == Project(T, (Column(("rownum",)),))
+
+
+def test_snowflake_where_may_use_a_qualified_column_named_like_an_alias() -> None:
+    plan = translate_sql("SELECT a AS b FROM t WHERE t.b > 1", "snowflake")
+
+    assert isinstance(plan, Project)
+    assert plan.source == ir.Filter(
+        T, BinaryOp(BinaryOperator.GREATER, Column(("t", "b")), Literal(1))
+    )
+
+
+def test_mysql_offset_comma_form_is_rejected() -> None:
+    assert ("OFFSET clause", "OFFSET 2") in unsupported_issues(
+        "SELECT * FROM t LIMIT 2, 5", "mysql"
+    )
+
+
+def test_unknown_parts_of_a_row_limit_are_rejected_not_ignored() -> None:
+    # Simulates a slot that none of our dialects produce today, such as one a
+    # future SQLGlot version might add: the allowlist must fail closed.
+    from sqlglot import exp
+
+    tree = parse_sql("SELECT * FROM t LIMIT 5")
+    tree.args["limit"].set("offset", exp.Literal.number(2))
+
+    with pytest.raises(UnsupportedSQLError) as caught:
+        translate(tree)
+
+    assert [issue.message for issue in caught.value.issues] == ["row limit OFFSET"]

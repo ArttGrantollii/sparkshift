@@ -4,6 +4,10 @@ import pytest
 
 import sparkshift
 
+UNSUPPORTED_EXAMPLE = (
+    "SELECT country, COUNT(*) AS n FROM customers GROUP BY country ORDER BY n"
+)
+
 
 def test_convert_returns_code_and_no_warnings() -> None:
     result = sparkshift.convert("SELECT * FROM customers")
@@ -32,12 +36,13 @@ def test_convert_honors_the_dialect(sql: str, dialect: str, expected_code: str) 
 
 def test_unsupported_query_lists_every_issue() -> None:
     with pytest.raises(sparkshift.UnsupportedSQLError) as caught:
-        sparkshift.convert("SELECT name FROM customers WHERE age > 30 ORDER BY name")
+        sparkshift.convert(UNSUPPORTED_EXAMPLE)
 
     assert str(caught.value) == (
-        "2 unsupported constructs:\n"
-        "  - WHERE clause: WHERE age > 30\n"
-        "  - ORDER BY clause: ORDER BY name"
+        "3 unsupported constructs:\n"
+        "  - function COUNT: COUNT(*)\n"
+        "  - GROUP BY clause: GROUP BY country\n"
+        "  - ORDER BY clause: ORDER BY n"
     )
 
 
