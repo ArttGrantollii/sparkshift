@@ -261,7 +261,7 @@ def test_issues_inside_one_expression_are_all_reported() -> None:
     [
         ("SELECT -amount FROM t", None, ("negation without an alias", "-amount")),
         ("SELECT -COUNT(a) AS x FROM t", None, ("function COUNT", "COUNT(a)")),
-        ("SELECT t.* FROM t", None, ("qualified star", "t.*")),
+        ("SELECT COUNT(t.*) AS n FROM t", None, ("function COUNT", "COUNT(t.*)")),
         (
             "SELECT CAST(a AS INT) AS x FROM t",
             None,
@@ -278,8 +278,6 @@ def test_issues_inside_one_expression_are_all_reported() -> None:
             None,
             ("WITH clause", "WITH x AS (SELECT 1)"),
         ),
-        ("SELECT * FROM t1, t2", None, ("JOIN", ", t2")),
-        ("SELECT * FROM customers c", None, ("table alias", "customers AS c")),
         ("SELECT * FROM t WITH (NOLOCK)", "tsql", ("table hint", "t WITH (NOLOCK)")),
         (
             "SELECT * FROM t TABLESAMPLE (10 PERCENT)",
@@ -310,14 +308,12 @@ def test_unsupported_construct_is_reported(
     assert expected in unsupported_issues(sql, dialect)
 
 
-def test_each_join_is_reported_separately() -> None:
-    issues = unsupported_issues(
-        "SELECT * FROM a JOIN b ON a.id = b.id LEFT JOIN c ON c.id = a.id"
-    )
+def test_each_unsupported_join_is_reported_separately() -> None:
+    issues = unsupported_issues("SELECT * FROM a NATURAL JOIN b NATURAL JOIN c")
 
     assert issues == [
-        ("JOIN", "JOIN b ON a.id = b.id"),
-        ("JOIN", "LEFT JOIN c ON c.id = a.id"),
+        ("NATURAL JOIN", "NATURAL JOIN b"),
+        ("NATURAL JOIN", "NATURAL JOIN c"),
     ]
 
 
@@ -467,3 +463,206 @@ def test_unknown_parts_of_a_row_limit_are_rejected_not_ignored() -> None:
         translate(tree)
 
     assert [issue.message for issue in caught.value.issues] == ["row limit OFFSET"]
+
+
+# --- Table aliases and joins -------------------------------------------------
+
+CUSTOMERS = TableScan(("customers",))
+ORDERS = TableScan(("orders",))
+CUSTOMERS_C = ir.RelationAlias(CUSTOMERS, "c")
+ORDERS_O = ir.RelationAlias(ORDERS, "o")
+KEYS_MATCH = BinaryOp(
+    BinaryOperator.EQUAL, Column(("c", "customer_id")), Column(("o", "customer_id"))
+)
+
+
+def test_single_table_alias() -> None:
+    plan = translate_sql("SELECT c.name FROM customers c")
+
+    assert plan == Project(CUSTOMERS_C, (Column(("c", "name")),))
+
+
+def test_qualified_star() -> None:
+    assert select_items("SELECT c.*, o.amount FROM customers c, orders o") == (
+        Star(("c",)),
+        Column(("o", "amount")),
+    )
+
+
+@pytest.mark.parametrize(
+    ("join_sql", "kind"),
+    [
+        ("JOIN", ir.JoinKind.INNER),
+        ("INNER JOIN", ir.JoinKind.INNER),
+        ("LEFT JOIN", ir.JoinKind.LEFT),
+        ("LEFT OUTER JOIN", ir.JoinKind.LEFT),
+        ("RIGHT JOIN", ir.JoinKind.RIGHT),
+        ("RIGHT OUTER JOIN", ir.JoinKind.RIGHT),
+        ("FULL JOIN", ir.JoinKind.FULL),
+        ("FULL OUTER JOIN", ir.JoinKind.FULL),
+    ],
+)
+def test_join_kinds(join_sql: str, kind: ir.JoinKind) -> None:
+    plan = translate_sql(
+        f"SELECT * FROM customers c {join_sql} orders o "
+        "ON c.customer_id = o.customer_id"
+    )
+
+    assert plan == ir.Join(CUSTOMERS_C, ORDERS_O, kind, KEYS_MATCH)
+
+
+@pytest.mark.parametrize(
+    ("sql", "dialect"),
+    [
+        ("SELECT * FROM customers c CROSS JOIN orders o", None),
+        ("SELECT * FROM customers c, orders o", None),
+        # MySQL treats a JOIN without ON as a cross join; SQLGlot represents it
+        # exactly like the comma form.
+        ("SELECT * FROM customers c JOIN orders o", "mysql"),
+    ],
+)
+def test_cross_joins(sql: str, dialect: str | None) -> None:
+    assert translate_sql(sql, dialect) == ir.Join(
+        CUSTOMERS_C, ORDERS_O, ir.JoinKind.CROSS
+    )
+
+
+def test_join_using() -> None:
+    plan = translate_sql("SELECT * FROM customers JOIN orders USING (customer_id, x)")
+
+    assert plan == ir.Join(
+        ir.RelationAlias(CUSTOMERS, "customers"),
+        ir.RelationAlias(ORDERS, "orders"),
+        ir.JoinKind.INNER,
+        using=("customer_id", "x"),
+    )
+
+
+def test_joined_tables_without_aliases_are_named_after_the_table() -> None:
+    plan = translate_sql(
+        "SELECT * FROM sales.customers JOIN orders ON customers.id = orders.id"
+    )
+
+    assert isinstance(plan, ir.Join)
+    assert plan.left == ir.RelationAlias(TableScan(("sales", "customers")), "customers")
+    assert plan.right == ir.RelationAlias(ORDERS, "orders")
+
+
+def test_joins_associate_left_to_right() -> None:
+    plan = translate_sql(
+        "SELECT * FROM a JOIN b ON a.id = b.id LEFT JOIN c ON b.id = c.id"
+    )
+
+    assert isinstance(plan, ir.Join)
+    assert plan.kind is ir.JoinKind.LEFT
+    assert isinstance(plan.left, ir.Join)
+    assert plan.left.kind is ir.JoinKind.INNER
+
+
+def test_join_then_where_then_select() -> None:
+    plan = translate_sql(
+        "SELECT o.amount FROM customers c "
+        "JOIN orders o ON c.customer_id = o.customer_id WHERE o.amount > 0"
+    )
+
+    assert plan == Project(
+        ir.Filter(
+            ir.Join(CUSTOMERS_C, ORDERS_O, ir.JoinKind.INNER, KEYS_MATCH),
+            BinaryOp(BinaryOperator.GREATER, Column(("o", "amount")), Literal(0)),
+        ),
+        (Column(("o", "amount")),),
+    )
+
+
+@pytest.mark.parametrize(
+    ("sql", "dialect", "message"),
+    [
+        ("SELECT * FROM a NATURAL JOIN b", None, "NATURAL JOIN"),
+        (
+            "SELECT * FROM a ASOF JOIN b MATCH_CONDITION(a.t >= b.t) ON a.id = b.id",
+            "snowflake",
+            "ASOF JOIN",
+        ),
+        # SQLGlot accepts these in every supported dialect, so they must be rejected.
+        ("SELECT * FROM a LEFT SEMI JOIN b ON a.id = b.id", None, "LEFT SEMI JOIN"),
+        ("SELECT * FROM a LEFT ANTI JOIN b ON a.id = b.id", "tsql", "LEFT ANTI JOIN"),
+        (
+            "SELECT * FROM a CROSS APPLY f(a.id)",
+            "tsql",
+            "JOIN source other than a table",
+        ),
+        (
+            "SELECT * FROM a JOIN LATERAL (SELECT 1) s ON TRUE",
+            "postgres",
+            "JOIN source other than a table",
+        ),
+        (
+            "SELECT * FROM a JOIN (SELECT * FROM b) s ON a.id = s.id",
+            None,
+            "JOIN source other than a table",
+        ),
+        (
+            "SELECT * FROM a JOIN (b JOIN c ON b.id = c.id) ON a.id = b.id",
+            None,
+            "JOIN source other than a table",
+        ),
+        ("SELECT * FROM a INNER JOIN b", None, "INNER JOIN without ON or USING"),
+        ("SELECT * FROM a LEFT JOIN b", None, "LEFT JOIN without ON or USING"),
+        (
+            "SELECT * FROM a CROSS JOIN b ON a.id = b.id",
+            None,
+            "CROSS JOIN with a condition",
+        ),
+        (
+            "SELECT * FROM a c(x, y) JOIN b ON c.x = b.id",
+            None,
+            "table alias with column names",
+        ),
+        ("SELECT * FROM a JOIN b WITH (NOLOCK) ON a.id = b.id", "tsql", "table hint"),
+        (
+            "SELECT * FROM t1, t2 WHERE t1.id = t2.id(+)",
+            "oracle",
+            "Oracle (+) outer join marker",
+        ),
+        ("SELECT * FROM a JOIN b ON a.id = COUNT(b.id)", None, "function COUNT"),
+    ],
+)
+def test_unsupported_joins(sql: str, dialect: str | None, message: str) -> None:
+    messages = [issue for issue, _ in unsupported_issues(sql, dialect)]
+
+    assert message in messages
+
+
+def test_oracle_outer_join_marker_explains_the_risk() -> None:
+    with pytest.raises(UnsupportedSQLError) as caught:
+        translate_sql("SELECT * FROM t1, t2 WHERE t1.id = t2.id(+)", "oracle")
+
+    [issue] = caught.value.issues
+    assert issue.hint is not None
+    assert "inner join" in issue.hint
+
+
+def test_unknown_join_shape_is_rejected_not_guessed() -> None:
+    # No supported dialect produces "LEFT INNER JOIN"; the translator must fail
+    # closed on any side/kind combination it does not recognize.
+    tree = parse_sql("SELECT * FROM a LEFT JOIN b ON a.id = b.id")
+    tree.args["joins"][0].set("kind", "INNER")
+
+    with pytest.raises(UnsupportedSQLError) as caught:
+        translate(tree)
+
+    assert [issue.message for issue in caught.value.issues] == ["LEFT INNER JOIN"]
+
+
+def test_qualified_star_outside_the_select_list_is_rejected() -> None:
+    # Only valid directly in the SELECT list; anywhere else it is an error even
+    # once functions such as COUNT translate their arguments.
+    from sqlglot import exp
+
+    from sparkshift.translate import _Translator
+
+    translator = _Translator(None)
+    star = exp.Column(this=exp.Star(), table=exp.to_identifier("t"))
+
+    assert translator.expression(star) is None
+    assert [issue.message for issue in translator.issues] == ["qualified star"]

@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FETCH FIRST n ROWS ONLY`), emitted in SQL's logical evaluation order.
   `DISTINCT ON`, `PERCENT`, `WITH TIES`, `OFFSET`, Oracle `ROWNUM`/`ROWID`, and
   Snowflake `WHERE` references to `SELECT` aliases are rejected.
+- Joins: inner, left, right, full, and cross joins (including comma joins),
+  with `ON` conditions or `USING` columns; table aliases, self-joins, chained
+  joins, and `t.*`. Generated code declares each source table once and aliases
+  joined tables so qualified columns resolve. Natural, semi, anti, and as-of
+  joins, joins to subqueries, `LATERAL`/`APPLY`, and Oracle's `(+)` marker are
+  rejected.
 - Equivalence testing for `LIMIT` without `ORDER BY` (row count plus
   sub-multiset of the unlimited result), and dialect scenarios checked against
   hand-written Spark SQL references.

@@ -19,7 +19,6 @@ _SELECT_PART_NAMES = {
     "with_": "WITH clause",
     "kind": "SELECT AS",
     "distinct": "DISTINCT",
-    "joins": "JOIN",
     "laterals": "LATERAL",
     "pivots": "PIVOT",
     "where": "WHERE clause",
@@ -33,13 +32,26 @@ _SELECT_PART_NAMES = {
 }
 
 _TABLE_PART_NAMES = {
-    "alias": "table alias",
     "hints": "table hint",
     "sample": "TABLESAMPLE",
 }
 
-# Parts of a table reference that make up its name.
-_TABLE_NAME_PARTS = frozenset({"this", "db", "catalog"})
+# Parts of a table reference SparkShift handles: its name and an alias.
+_TABLE_SUPPORTED_PARTS = frozenset({"this", "db", "catalog", "alias"})
+
+# Parts of a join SparkShift handles; anything else present is rejected.
+_JOIN_SUPPORTED_PARTS = frozenset({"this", "on", "side", "kind", "using"})
+
+_OUTER_JOIN_KINDS = {
+    "LEFT": ir.JoinKind.LEFT,
+    "RIGHT": ir.JoinKind.RIGHT,
+    "FULL": ir.JoinKind.FULL,
+}
+
+_ORACLE_OUTER_JOIN_HINT = (
+    "Rewrite the (+) marker as an explicit LEFT or RIGHT JOIN ... ON; "
+    "ignoring it would turn the outer join into an inner join."
+)
 
 _BINARY_OPERATORS: dict[type[exp.Expression], ir.BinaryOperator] = {
     exp.Add: ir.BinaryOperator.ADD,
@@ -127,6 +139,9 @@ class _Translator:
                 source = self.from_(select)
             elif not value:
                 continue
+            elif part == "joins":
+                source = self.joins(source, value)
+                failed |= source is None
             elif part == "where":
                 condition = self.where(value, select)
                 failed |= condition is None
@@ -230,27 +245,105 @@ class _Translator:
             return None
         return int(count.this) if supported else None
 
-    def from_(self, select: exp.Select) -> ir.TableScan | None:
+    def from_(self, select: exp.Select) -> ir.Relation | None:
         from_ = select.args.get("from_")
         if from_ is None:
             self.unsupported("SELECT without FROM", select)
             return None
+        # A joined table always gets a name, so qualified columns resolve.
+        has_joins = bool(select.args.get("joins"))
+        return self.table(from_.this, "FROM", always_alias=has_joins)
 
-        table = from_.this
-        if not isinstance(table, exp.Table) or not isinstance(
-            table.this, exp.Identifier
-        ):
-            self.unsupported("FROM source other than a table", table)
+    def table(
+        self, node: exp.Expression, clause: str, *, always_alias: bool
+    ) -> ir.Relation | None:
+        """Translate a table reference, with its alias if it has one."""
+        if not isinstance(node, exp.Table) or not isinstance(node.this, exp.Identifier):
+            self.unsupported(f"{clause} source other than a table", node)
             return None
 
         supported = True
         for part in exp.Table.arg_types:
-            if part not in _TABLE_NAME_PARTS and table.args.get(part):
-                self.unsupported(_TABLE_PART_NAMES.get(part, f"table {part}"), table)
+            if part not in _TABLE_SUPPORTED_PARTS and node.args.get(part):
+                self.unsupported(_TABLE_PART_NAMES.get(part, f"table {part}"), node)
                 supported = False
+        alias = node.args.get("alias")
+        if alias is not None and alias.args.get("columns"):
+            self.unsupported("table alias with column names", node)
+            supported = False
         if not supported:
             return None
-        return ir.TableScan(tuple(identifier.name for identifier in table.parts))
+
+        scan = ir.TableScan(tuple(identifier.name for identifier in node.parts))
+        if node.alias:
+            return ir.RelationAlias(scan, node.alias)
+        if always_alias:
+            return ir.RelationAlias(scan, node.name)
+        return scan
+
+    def joins(
+        self, left: ir.Relation | None, joins: list[exp.Join]
+    ) -> ir.Relation | None:
+        # SQL joins associate left to right: a JOIN b JOIN c is (a JOIN b) JOIN c.
+        for join in joins:
+            left = self.join(left, join)
+        return left
+
+    def join(self, left: ir.Relation | None, node: exp.Join) -> ir.Relation | None:
+        issues_before = len(self.issues)
+        right = self.table(node.this, "JOIN", always_alias=True)
+        kind = self.join_kind(node)
+
+        on = node.args.get("on")
+        condition = self.expression(on) if on is not None else None
+        using = tuple(identifier.name for identifier in node.args.get("using") or [])
+
+        if left is None or right is None or kind is None:
+            return None
+        if len(self.issues) > issues_before:
+            return None
+        return ir.Join(left, right, kind, condition, using)
+
+    def join_kind(self, node: exp.Join) -> ir.JoinKind | None:
+        """Map SQLGlot's side and kind of a join to a JoinKind, or report why
+        it is unsupported."""
+        for part, value in node.args.items():
+            if value and part not in _JOIN_SUPPORTED_PARTS:
+                name = f"{node.method} JOIN" if part == "method" else f"JOIN {part}"
+                self.unsupported(name, node)
+                return None
+
+        side, kind = node.side.upper(), node.kind.upper()
+        # ON and USING together is a parse error, so at most one is present.
+        has_condition = bool(node.args.get("on") or node.args.get("using"))
+        if kind in ("SEMI", "ANTI"):
+            self.unsupported(f"{side} {kind} JOIN".strip(), node)
+            return None
+        if kind == "CROSS":
+            if has_condition:
+                self.unsupported("CROSS JOIN with a condition", node)
+                return None
+            return ir.JoinKind.CROSS
+        if side in _OUTER_JOIN_KINDS and kind in ("", "OUTER"):
+            if not has_condition:
+                self.unsupported(f"{side} JOIN without ON or USING", node)
+                return None
+            return _OUTER_JOIN_KINDS[side]
+        if not side and kind in ("", "INNER"):
+            if has_condition:
+                return ir.JoinKind.INNER
+            if not kind:
+                # "FROM a, b" — and MySQL's "a JOIN b" without ON, which SQLGlot
+                # represents identically — is a cross join.
+                return ir.JoinKind.CROSS
+            self.unsupported(
+                "INNER JOIN without ON or USING",
+                node,
+                hint="Write CROSS JOIN for a Cartesian product.",
+            )
+            return None
+        self.unsupported(f"{side} {kind} JOIN".strip(), node)
+        return None
 
     def projection(
         self, expressions: list[exp.Expression]
@@ -263,6 +356,14 @@ class _Translator:
     def projection_item(self, node: exp.Expression) -> ir.Expression | None:
         if isinstance(node, exp.Star):
             return ir.Star()
+        if isinstance(node, exp.Column) and isinstance(node.this, exp.Star):
+            # "c.*": every column of one input table.
+            qualifier = tuple(
+                node.args[part].name
+                for part in ("catalog", "db", "table")
+                if node.args.get(part)
+            )
+            return ir.Star(qualifier)
         if isinstance(node, exp.Alias):
             expression = self.expression(node.this)
             return None if expression is None else ir.Alias(expression, node.alias)
@@ -314,7 +415,15 @@ class _Translator:
 
     def column(self, node: exp.Column) -> ir.Column | None:
         if isinstance(node.this, exp.Star):
+            # Only valid directly in the SELECT list, handled there.
             self.unsupported("qualified star", node)
+            return None
+        if node.args.get("join_mark"):
+            # Oracle's "t2.id(+)" makes the join an outer join. SQLGlot keeps it
+            # only as a flag on the column, so it must be checked explicitly.
+            self.unsupported(
+                "Oracle (+) outer join marker", node, hint=_ORACLE_OUTER_JOIN_HINT
+            )
             return None
         if self.dialect == "oracle" and self.is_oracle_pseudo_column(node):
             # SQLGlot parses ROWNUM as an ordinary column; Spark has no such column.

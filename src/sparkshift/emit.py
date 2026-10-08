@@ -6,13 +6,19 @@ import SQLGlot or PySpark.
 Generated code is deterministic: the same IR always produces the same text.
 """
 
+import keyword
 import re
+from collections import Counter
+from collections.abc import Iterator
 from decimal import Decimal
 from typing import assert_never
 
 from sparkshift import ir
 
 RESULT_VARIABLE = "result"
+
+# Names the generated code already uses; table variables must not shadow them.
+_RESERVED_NAMES = frozenset({RESULT_VARIABLE, "spark", "F", "Decimal"})
 
 _INDENT = "    "
 _MAX_LINE_LENGTH = 88
@@ -59,16 +65,33 @@ class _Emitter:
     def __init__(self) -> None:
         self.uses_functions = False
         self.uses_decimal = False
+        self.table_variables: dict[tuple[str, ...], str] = {}
+        self.table_uses: Counter[tuple[str, ...]] = Counter()
 
     def program(self, plan: ir.Relation) -> str:
+        self.table_uses = Counter(
+            node.name_parts for node in _walk(plan) if isinstance(node, ir.TableScan)
+        )
+        # Queries that combine tables declare each source table once, up front.
+        if any(isinstance(node, ir.Join) for node in _walk(plan)):
+            self.table_variables = table_variables(plan)
+
         statement = f"{RESULT_VARIABLE} = {self.relation(plan)}\n"
-        imports = []
+        sections = []
         if self.uses_decimal:
-            imports.append("from decimal import Decimal")
+            sections.append("from decimal import Decimal")
         if self.uses_functions:
-            imports.append("from pyspark.sql import functions as F")
-        # Standard-library and third-party imports form separate groups.
-        return "\n\n".join([*imports, statement])
+            sections.append("from pyspark.sql import functions as F")
+        if self.table_variables:
+            sections.append(
+                "\n".join(
+                    f"{name} = {_spark_table(parts)}"
+                    for parts, name in self.table_variables.items()
+                )
+            )
+        # Standard-library imports, third-party imports, table variables, and
+        # the result are separated by blank lines.
+        return "\n\n".join([*sections, statement])
 
     # --- Relations -------------------------------------------------------
 
@@ -82,9 +105,29 @@ class _Emitter:
         return f"(\n{body})"
 
     def chain(self, plan: ir.Relation) -> tuple[str, list[str]]:
+        """Return a relation as its starting expression and its method calls."""
         match plan:
             case ir.TableScan(name_parts=parts):
-                return f"spark.table({python_string(spark_identifier(parts))})", []
+                return self.table_variables.get(parts, _spark_table(parts)), []
+            case ir.RelationAlias(source=source, name=name):
+                if self.is_redundant_alias(source, name):
+                    return self.chain(source)
+                start, calls = self.chain(source)
+                alias = f".alias({python_string(name)})"
+                if not calls:
+                    return start + alias, []
+                return start, [*calls, alias]
+            case ir.Join(left=left, right=right, kind=kind):
+                start, calls = self.chain(left)
+                other = self.inline_relation(right)
+                if kind is ir.JoinKind.CROSS:
+                    return start, [*calls, self.call("crossJoin", [other])]
+                if plan.condition is not None:
+                    on = self.expression(plan.condition)
+                else:
+                    on = "[" + ", ".join(python_string(c) for c in plan.using) + "]"
+                arguments = [other, on, python_string(kind.value)]
+                return start, [*calls, self.call("join", arguments)]
             case ir.Filter(source=source, condition=condition):
                 start, calls = self.chain(source)
                 return start, [*calls, self.call("where", [self.expression(condition)])]
@@ -99,6 +142,21 @@ class _Emitter:
                 start, calls = self.chain(source)
                 return start, [*calls, self.call("limit", [str(count)])]
         assert_never(plan)
+
+    def is_redundant_alias(self, source: ir.Relation, name: str) -> bool:
+        """A table used once can already be referred to by its own simple name,
+        so aliasing it to that name adds nothing. Self-joins and schema-
+        qualified tables keep an explicit alias."""
+        return (
+            isinstance(source, ir.TableScan)
+            and source.name_parts == (name,)
+            and self.table_uses[source.name_parts] == 1
+        )
+
+    def inline_relation(self, plan: ir.Relation) -> str:
+        """Render a relation used as an argument, such as the right side of a join."""
+        start, calls = self.chain(plan)
+        return start + "".join(calls)
 
     def call(self, method: str, arguments: list[str]) -> str:
         """Render a method call: inline if it is short and has at most one
@@ -118,8 +176,12 @@ class _Emitter:
     def render(self, expression: ir.Expression) -> tuple[str, int]:
         """Return the code for an expression and its Python precedence."""
         match expression:
-            case ir.Star():
+            case ir.Star(qualifier=()):
                 return '"*"', _ATOM
+            case ir.Star(qualifier=qualifier):
+                self.uses_functions = True
+                name = f"{spark_identifier(qualifier)}.*"
+                return f"F.col({python_string(name)})", _ATOM
             case ir.Column(name_parts=parts):
                 self.uses_functions = True
                 return f"F.col({python_string(spark_identifier(parts))})", _ATOM
@@ -196,3 +258,61 @@ def python_string(value: str) -> str:
 
 def _indent(text: str) -> str:
     return "\n".join(_INDENT + line if line else line for line in text.split("\n"))
+
+
+def table_variables(plan: ir.Relation) -> dict[tuple[str, ...], str]:
+    """Choose a Python variable name for each distinct table, in the order the
+    tables appear.
+
+    Names come from the table name (``sales.customers`` becomes ``customers``),
+    made into valid identifiers that do not shadow names the generated code
+    uses. Different tables that would get the same name use their full name.
+    """
+    tables: list[tuple[str, ...]] = []
+    for node in _walk(plan):
+        if isinstance(node, ir.TableScan) and node.name_parts not in tables:
+            tables.append(node.name_parts)
+
+    names: dict[tuple[str, ...], str] = {}
+    for parts in tables:
+        candidates = [_python_name(parts[-1]), _python_name("_".join(parts))]
+        name = next((c for c in candidates if c not in names.values()), None)
+        if name is None:
+            suffix = 2
+            while f"{candidates[-1]}_{suffix}" in names.values():
+                suffix += 1
+            name = f"{candidates[-1]}_{suffix}"
+        names[parts] = name
+    return names
+
+
+def _python_name(text: str) -> str:
+    name = re.sub(r"\W", "_", text)
+    if not name or name[0].isdigit():
+        name = f"t_{name}"
+    if keyword.iskeyword(name) or name in _RESERVED_NAMES:
+        name = f"{name}_df"
+    return name
+
+
+def _walk(plan: ir.Relation) -> Iterator[ir.Relation]:
+    """Yield every relation in the plan, left side before right side."""
+    yield plan
+    match plan:
+        case ir.TableScan():
+            return
+        case ir.Join(left=left, right=right):
+            yield from _walk(left)
+            yield from _walk(right)
+        case (
+            ir.RelationAlias(source=source)
+            | ir.Filter(source=source)
+            | ir.Project(source=source)
+            | ir.Distinct(source=source)
+            | ir.Limit(source=source)
+        ):
+            yield from _walk(source)
+
+
+def _spark_table(parts: tuple[str, ...]) -> str:
+    return f"spark.table({python_string(spark_identifier(parts))})"

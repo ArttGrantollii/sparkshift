@@ -82,7 +82,10 @@ class Alias:
 
 @dataclass(frozen=True)
 class Star:
-    """All columns of the input, as in ``SELECT *``."""
+    """All columns of the input, as in ``SELECT *``, or of one input table when
+    ``qualifier`` is set, as in ``SELECT c.*``."""
+
+    qualifier: tuple[str, ...] = ()
 
 
 Expression: TypeAlias = Column | Literal | BinaryOp | UnaryOp | Alias | Star
@@ -100,6 +103,47 @@ class TableScan:
     def __post_init__(self) -> None:
         if not self.name_parts:
             raise ValueError("TableScan needs at least one name part")
+
+
+@dataclass(frozen=True)
+class RelationAlias:
+    """Give a relation a name that qualified columns can refer to, as in
+    ``FROM customers c`` followed by ``c.name``."""
+
+    source: "Relation"
+    name: str
+
+
+class JoinKind(Enum):
+    INNER = "inner"
+    LEFT = "left"
+    RIGHT = "right"
+    FULL = "full"
+    CROSS = "cross"
+
+
+@dataclass(frozen=True)
+class Join:
+    """Combine two relations.
+
+    A cross join has neither ``condition`` nor ``using``. Every other kind has
+    exactly one: a join condition, or the names of columns that must be equal
+    on both sides (SQL's ``USING``), which appear once in the output.
+    """
+
+    left: "Relation"
+    right: "Relation"
+    kind: JoinKind
+    condition: Expression | None = None
+    using: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        has_condition = self.condition is not None
+        has_using = bool(self.using)
+        if self.kind is JoinKind.CROSS and (has_condition or has_using):
+            raise ValueError("A cross join takes no condition or USING columns")
+        if self.kind is not JoinKind.CROSS and has_condition == has_using:
+            raise ValueError("A join needs either a condition or USING columns")
 
 
 @dataclass(frozen=True)
@@ -141,4 +185,6 @@ class Limit:
 
 
 # Any IR node that produces a DataFrame.
-Relation: TypeAlias = TableScan | Filter | Project | Distinct | Limit
+Relation: TypeAlias = (
+    TableScan | RelationAlias | Join | Filter | Project | Distinct | Limit
+)

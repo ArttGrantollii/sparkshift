@@ -54,7 +54,10 @@ anything the user should review.
 
 Generated code imports what it uses, assigns the final DataFrame to a variable
 named `result`, and expects a SparkSession named `spark` to exist, as in a
-Databricks notebook. Parentheses follow Python's operator precedence, not
+Databricks notebook. Queries that join tables declare each source table once as
+a variable named after the table; joined tables are aliased (with their SQL
+alias, or their own name when needed) so qualified columns such as `c.name`
+resolve exactly as in SQL, including in self-joins. Parentheses follow Python's operator precedence, not
 SQL's, because PySpark expressions are built from Python operators (`&` and `|`
 bind more tightly than `==`).
 

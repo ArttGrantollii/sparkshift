@@ -5,7 +5,13 @@ from decimal import Decimal
 import pytest
 
 from sparkshift import ir
-from sparkshift.emit import emit, emit_expression, python_string, spark_identifier
+from sparkshift.emit import (
+    emit,
+    emit_expression,
+    python_string,
+    spark_identifier,
+    table_variables,
+)
 from sparkshift.ir import (
     Alias,
     BinaryOp,
@@ -354,3 +360,159 @@ def test_chain_without_column_expressions_needs_no_import() -> None:
 def test_negative_limit_is_rejected_by_the_ir() -> None:
     with pytest.raises(ValueError, match="must not be negative"):
         ir.Limit(TableScan(("t",)), -1)
+
+
+# --- Joins -------------------------------------------------------------------
+
+CUSTOMERS = TableScan(("customers",))
+ORDERS = TableScan(("orders",))
+KEYS_MATCH = BinaryOp(
+    BinaryOperator.EQUAL, Column(("c", "customer_id")), Column(("o", "customer_id"))
+)
+
+
+def test_join_golden_output() -> None:
+    plan = Project(
+        ir.Join(
+            ir.RelationAlias(CUSTOMERS, "c"),
+            ir.RelationAlias(ORDERS, "o"),
+            ir.JoinKind.INNER,
+            KEYS_MATCH,
+        ),
+        (Column(("c", "country")),),
+    )
+
+    assert emit(plan) == (
+        "from pyspark.sql import functions as F\n"
+        "\n"
+        'customers = spark.table("customers")\n'
+        'orders = spark.table("orders")\n'
+        "\n"
+        "result = (\n"
+        '    customers.alias("c")\n'
+        "    .join(\n"
+        '        orders.alias("o"),\n'
+        '        F.col("c.customer_id") == F.col("o.customer_id"),\n'
+        '        "inner",\n'
+        "    )\n"
+        '    .select(F.col("c.country"))\n'
+        ")\n"
+    )
+
+
+def test_self_join_declares_the_table_once() -> None:
+    plan = ir.Join(
+        ir.RelationAlias(ORDERS, "o1"),
+        ir.RelationAlias(ORDERS, "o2"),
+        ir.JoinKind.CROSS,
+    )
+
+    code = emit(plan)
+
+    assert code.count('spark.table("orders")') == 1
+    assert '    orders.alias("o1")\n    .crossJoin(orders.alias("o2"))\n' in code
+
+
+def test_using_join_and_redundant_aliases() -> None:
+    # A table used once, aliased to its own simple name, needs no .alias().
+    plan = ir.Join(
+        ir.RelationAlias(CUSTOMERS, "customers"),
+        ir.RelationAlias(ORDERS, "orders"),
+        ir.JoinKind.FULL,
+        using=("customer_id",),
+    )
+
+    assert emit(plan) == (
+        'customers = spark.table("customers")\n'
+        'orders = spark.table("orders")\n'
+        "\n"
+        "result = (\n"
+        "    customers\n"
+        "    .join(\n"
+        "        orders,\n"
+        '        ["customer_id"],\n'
+        '        "full",\n'
+        "    )\n"
+        ")\n"
+    )
+
+
+def test_schema_qualified_table_keeps_its_alias() -> None:
+    plan = ir.Join(
+        ir.RelationAlias(TableScan(("sales", "customers")), "customers"),
+        ir.RelationAlias(ORDERS, "orders"),
+        ir.JoinKind.CROSS,
+    )
+
+    assert '    customers.alias("customers")\n' in emit(plan)
+
+
+def test_single_table_alias_stays_inline() -> None:
+    plan = Project(ir.RelationAlias(CUSTOMERS, "c"), (Column(("c", "name")),))
+
+    assert '    spark.table("customers").alias("c")\n' in emit(plan)
+
+
+def test_qualified_star_code() -> None:
+    assert emit_expression(Star(("c",))) == 'F.col("c.*")'
+    assert emit_expression(Star(("my table",))) == 'F.col("`my table`.*")'
+
+
+@pytest.mark.parametrize(
+    ("tables", "expected"),
+    [
+        ([("customers",), ("orders",)], ["customers", "orders"]),
+        (
+            [("sales", "customers"), ("crm", "customers")],
+            ["customers", "crm_customers"],
+        ),
+        ([("2024_orders",), ("order-items",)], ["t_2024_orders", "order_items"]),
+        ([("class",), ("result",), ("spark",)], ["class_df", "result_df", "spark_df"]),
+        ([("a", "x"), ("b", "x"), ("a_x",)], ["x", "b_x", "a_x"]),
+        ([("a", "x"), ("a_x",), ("b", "x"), ("b_x",)], ["x", "a_x", "b_x", "b_x_2"]),
+    ],
+)
+def test_table_variable_names(
+    tables: list[tuple[str, ...]], expected: list[str]
+) -> None:
+    plan: ir.Relation = TableScan(tables[0])
+    for parts in tables[1:]:
+        plan = ir.Join(plan, TableScan(parts), ir.JoinKind.CROSS)
+
+    names = table_variables(plan)
+
+    assert list(names.values()) == expected
+    for name in names.values():
+        assert name.isidentifier()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"kind": ir.JoinKind.CROSS, "condition": KEYS_MATCH},
+        {"kind": ir.JoinKind.CROSS, "using": ("id",)},
+        {"kind": ir.JoinKind.INNER},
+        {"kind": ir.JoinKind.LEFT, "condition": KEYS_MATCH, "using": ("id",)},
+    ],
+)
+def test_join_ir_rejects_inconsistent_conditions(arguments: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        ir.Join(CUSTOMERS, ORDERS, **arguments)  # type: ignore[arg-type]
+
+
+def test_alias_after_other_operations_is_a_chain_step() -> None:
+    plan = ir.RelationAlias(ir.Distinct(TableScan(("t",))), "d")
+
+    assert emit(plan) == (
+        'result = (\n    spark.table("t")\n    .distinct()\n    .alias("d")\n)\n'
+    )
+
+
+def test_table_variable_numbering_skips_taken_names() -> None:
+    plan = ir.Join(
+        ir.Join(TableScan(("b_x_2",)), TableScan(("a", "b_x")), ir.JoinKind.CROSS),
+        TableScan(("b_x",)),
+        ir.JoinKind.CROSS,
+    )
+
+    assert list(table_variables(plan).values()) == ["b_x_2", "b_x", "b_x_3"]

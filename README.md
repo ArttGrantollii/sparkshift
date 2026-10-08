@@ -5,10 +5,10 @@
 
 Convert SQL into readable, idiomatic, tested PySpark DataFrame code.
 
-> **Status: early development.** SparkShift converts single-table `SELECT`
-> queries with column expressions, `WHERE`, `DISTINCT`, and row limits (see
-> below). Everything else is rejected with a clear error. See
-> [ROADMAP.md](ROADMAP.md) for planned scope.
+> **Status: early development.** SparkShift converts `SELECT` queries with
+> joins, column expressions, `WHERE`, `DISTINCT`, and row limits (see below).
+> Everything else is rejected with a clear error. See [ROADMAP.md](ROADMAP.md)
+> for planned scope.
 
 ## Goal
 
@@ -65,8 +65,9 @@ UnsupportedSQLError: 3 unsupported constructs:
 
 | Construct | Status |
 |---|---|
-| `SELECT ... FROM table` (including `schema.table` and quoted names) | Supported |
-| Columns, qualified columns (`table.column`), `*`, and `AS` aliases | Supported |
+| `SELECT ... FROM table` (including `schema.table`, quoted names, and table aliases) | Supported |
+| Columns, qualified columns (`t.column`), `*`, `t.*`, and `AS` aliases | Supported |
+| Joins: `[INNER] JOIN`, `LEFT`/`RIGHT`/`FULL [OUTER] JOIN`, `CROSS JOIN`, comma joins | Supported, with `ON` or `USING` |
 | Literals: integers, decimals, doubles (`1.5e0`), strings, `TRUE`/`FALSE`, `NULL` | Supported |
 | Arithmetic: `+ - * / %` and unary `-` | Supported, with dialect exceptions below |
 | Comparisons: `= <> != < <= > >=` | Supported |
@@ -74,7 +75,8 @@ UnsupportedSQLError: 3 unsupported constructs:
 | `WHERE` | Supported |
 | `DISTINCT` | Supported (`DISTINCT ON` is not) |
 | Row limits: `LIMIT n`, T-SQL `TOP n`, `FETCH FIRST n ROWS ONLY` | Supported, for a constant `n` |
-| Everything else, including joins, `GROUP BY`, `ORDER BY`, and functions | Unsupported — rejected with an error |
+| `NATURAL`, semi, anti, and as-of joins; joins to subqueries; `LATERAL` and `APPLY` | Unsupported — rejected with an error |
+| Everything else, including `GROUP BY`, `ORDER BY`, and functions | Unsupported — rejected with an error |
 
 Support grows feature by feature; see the [roadmap](ROADMAP.md).
 
@@ -92,6 +94,7 @@ rejects it rather than guess:
 | `+` | T-SQL | `+` also concatenates strings. |
 | `WHERE` referring to a `SELECT` alias | Snowflake | Spark does not allow it, and the name could also be a real column. |
 | `ROWNUM`, `ROWID` | Oracle | Pseudo-columns with no Spark equivalent; use `FETCH FIRST n ROWS ONLY`. |
+| `(+)` outer-join marker | Oracle | Ignoring it would turn an outer join into an inner join; use `LEFT`/`RIGHT JOIN`. |
 | `TOP n PERCENT`, `WITH TIES`, `OFFSET` | T-SQL, Oracle, others | Not equivalent to a plain row limit. |
 
 ### Known limitations
@@ -102,6 +105,8 @@ rejects it rather than guess:
 - An unaliased negation such as `SELECT -amount` must be given an alias, because
   Spark SQL and PySpark name that output column differently.
 - Long expressions are not wrapped across lines yet.
+- A `JOIN` without `ON` or `USING` (accepted by MySQL) is translated as a cross
+  join, because SQLGlot represents it exactly like the comma form `FROM a, b`.
 
 ## How correctness is verified
 
