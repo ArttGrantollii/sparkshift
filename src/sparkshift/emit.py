@@ -26,6 +26,16 @@ _MAX_LINE_LENGTH = 88
 # Identifier parts Spark accepts without backtick quoting.
 _PLAIN_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
+# Parameters that PySpark functions take as plain Python values rather than
+# Columns, by position: F.round(col, 2), F.substring(col, 2, 3),
+# F.concat_ws("", ...), F.log(10.0, col).
+_PLAIN_VALUE_PARAMETERS = {
+    "round": frozenset({1}),
+    "substring": frozenset({1, 2}),
+    "concat_ws": frozenset({0}),
+    "log": frozenset({0}),
+}
+
 # Python operator precedence, from loosest to tightest binding. PySpark builds
 # expressions with Python operators, so Python's rules decide where parentheses
 # are needed — not SQL's. Notably, & and | bind tighter than ==.
@@ -250,7 +260,13 @@ class _Emitter:
                 return code, _ATOM
             case ir.FunctionCall(name=name, arguments=arguments):
                 self.uses_functions = True
-                code = ", ".join(self.expression(argument) for argument in arguments)
+                plain = _PLAIN_VALUE_PARAMETERS.get(name, frozenset())
+                code = ", ".join(
+                    self.python_value(argument.value)
+                    if position in plain and isinstance(argument, ir.Literal)
+                    else self.expression(argument)
+                    for position, argument in enumerate(arguments)
+                )
                 return f"F.{name}({code})", _ATOM
             case ir.Cast(expression=inner, data_type=data_type, safe=safe):
                 name = "try_cast" if safe else "cast"

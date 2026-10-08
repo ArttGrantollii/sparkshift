@@ -47,3 +47,35 @@ def test_order_amounts_include_zero_negative_and_null() -> None:
     assert None in amounts
     assert any(amount is not None and amount == 0 for amount in amounts)
     assert any(amount is not None and amount < 0 for amount in amounts)
+
+
+def test_product_names_cover_whitespace_and_text_edge_cases() -> None:
+    from datasets import PRODUCTS
+
+    names = [row[1] for row in PRODUCTS]
+
+    assert any(n and n != n.lstrip() and n != n.rstrip() for n in names)  # both sides
+    assert any(
+        n and n == n.lstrip() and n != n.rstrip() for n in names
+    )  # trailing only
+    assert any(n and len(n.encode()) > len(n) for n in names)  # multi-byte characters
+    assert "" in names
+    assert None in names
+
+
+def test_product_numbers_cover_rounding_boundaries() -> None:
+    from decimal import Decimal
+
+    from datasets import PRODUCTS
+
+    prices = [row[3] for row in PRODUCTS]
+    weights = [row[4] for row in PRODUCTS]
+
+    assert Decimal("2.500") in prices
+    assert Decimal("-2.500") in prices
+    assert 2.5 in weights
+    assert -2.5 in weights
+    assert None in prices
+    assert any(
+        stock is not None and stock < 0 for stock in (row[5] for row in PRODUCTS)
+    )

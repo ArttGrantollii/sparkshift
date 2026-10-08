@@ -128,6 +128,52 @@ _CAST_HINTS = {
         "Spark's signed TINYINT; cast to SMALLINT."
     ),
 }
+# One-argument functions with the same meaning in every supported dialect,
+# mapped to their pyspark.sql.functions names.
+_SIMPLE_FUNCTIONS = {
+    exp.Upper: "upper",
+    exp.Lower: "lower",
+    exp.Abs: "abs",
+    exp.Ceil: "ceil",
+    exp.Floor: "floor",
+    exp.Sqrt: "sqrt",
+    exp.Exp: "exp",
+    exp.Ln: "ln",
+    exp.Sign: "sign",
+}
+_TRIM_FUNCTIONS = {"BOTH": "trim", "LEADING": "ltrim", "TRAILING": "rtrim"}
+
+# Dialects that round floating-point halves to even (ROUND(2.5::float) = 2)
+# but exact numbers away from zero. Spark always rounds halves away from zero,
+# and SparkShift cannot see whether a column is floating-point.
+_HALF_EVEN_FLOAT_ROUND_DIALECTS = frozenset({"postgres", "mysql", "oracle"})
+
+_ROUND_HINT = (
+    "This dialect rounds floating-point halves to even but exact numbers away "
+    "from zero; Spark always rounds away from zero, and SparkShift cannot see "
+    "the column type."
+)
+_LOG_HINT = (
+    "LOG(x) is the natural logarithm in some databases and base 10 in others; "
+    "write LN(x) or LOG(base, x)."
+)
+_GREATEST_HINT = (
+    "In this dialect it returns NULL when any argument is NULL; Spark ignores "
+    "NULL arguments."
+)
+_BIGQUERY_TRIM_HINT = (
+    "BigQuery's TRIM removes all Unicode whitespace, including tabs and "
+    "newlines; Spark's removes only spaces."
+)
+_CONSTANT_HINT = (
+    "Only constant values are supported, because negative and computed "
+    "positions behave differently across databases."
+)
+_FUNCTION_ALIAS_HINT = (
+    "Spark names this column after the exact function spelling (for example "
+    "CEIL or CEILING), which SparkShift cannot reproduce; add an alias."
+)
+
 _TSQL_VARCHAR_HINT = (
     "In T-SQL, CAST to VARCHAR without a length means VARCHAR(30) and "
     "truncates longer values; Spark strings are unbounded."
@@ -491,6 +537,11 @@ class _Translator:
                 hint="Add an alias, for example: -amount AS negative_amount.",
             )
             return None
+        if expression is not None and _calls_function(expression):
+            self.unsupported(
+                "function result without an alias", node, _FUNCTION_ALIAS_HINT
+            )
+            return None
         unnamed = _differently_named(node)
         if expression is not None and unnamed is not None:
             # Spark SQL and PySpark generate different names for this column.
@@ -811,6 +862,7 @@ class _Translator:
         if isinstance(node, exp.Not):
             return self.not_(node)
         handler = self._PREDICATES_AND_CONDITIONALS.get(type(node))
+        handler = handler or self._FUNCTIONS.get(type(node))
         if handler is not None:
             return handler(self, node)
 
@@ -1001,6 +1053,8 @@ class _Translator:
                 )
                 return None
             return "string"
+        if kind in _STRING_CAST_TYPES and _is_max_length(parameters):
+            return "string"  # VARCHAR(MAX) is unbounded, like a Spark string
         if kind is exp.DataType.Type.DECIMAL and parameters:
             precision = int(parameters[0].name)
             scale = int(parameters[1].name) if len(parameters) > 1 else 0
@@ -1029,6 +1083,199 @@ class _Translator:
         exp.Nullif: nullif,
         exp.Cast: cast,
         exp.TryCast: cast,
+    }
+
+    # --- String and numeric functions --------------------------------------
+
+    def simple_function(self, node: exp.Func) -> ir.Expression | None:
+        """Functions with one argument and the same meaning in every dialect."""
+        name = _SIMPLE_FUNCTIONS[type(node)]
+        if not self.check_parts(node, {"this"}, node.sql_name()):
+            return None
+        operand = self.expression(node.this)
+        return None if operand is None else ir.FunctionCall(name, (operand,))
+
+    def length(self, node: exp.Length) -> ir.Expression | None:
+        if not self.check_parts(node, {"this", "binary"}, "LENGTH"):
+            return None
+        operand = self.expression(_without_implicit_string_cast(node.this))
+        if operand is None:
+            return None
+        if self.dialect == "tsql":
+            # T-SQL's LEN ignores trailing spaces: LEN('a  ') is 1.
+            trimmed = ir.FunctionCall("rtrim", (operand,))
+            return ir.FunctionCall("length", (trimmed,))
+        if self.dialect == "mysql" and node.args.get("binary"):
+            # MySQL's LENGTH counts bytes; CHAR_LENGTH counts characters.
+            return ir.FunctionCall("octet_length", (operand,))
+        return ir.FunctionCall("length", (operand,))
+
+    def trim(self, node: exp.Trim) -> ir.Expression | None:
+        if not self.check_parts(node, {"this", "position"}, "TRIM"):
+            return None
+        if self.dialect == "bigquery":
+            self.unsupported("TRIM", node, _BIGQUERY_TRIM_HINT)
+            return None
+        operand = self.expression(node.this)
+        if operand is None:
+            return None
+        name = _TRIM_FUNCTIONS[node.args.get("position") or "BOTH"]
+        return ir.FunctionCall(name, (operand,))
+
+    def substring(self, node: exp.Substring) -> ir.Expression | None:
+        allowed = {"this", "start", "length", "zero_start"}
+        if not self.check_parts(node, allowed, "SUBSTRING"):
+            return None
+        start = self.constant_int(node.args.get("start"), node, "SUBSTRING start", 1)
+        length_node = node.args.get("length")
+        length = None
+        if length_node is not None:
+            length = self.constant_int(length_node, node, "SUBSTRING length", 0)
+        operand = self.expression(node.this)
+        if operand is None or start is None:
+            return None
+        if length_node is None:
+            return ir.FunctionCall("substr", (operand, ir.Literal(start)))
+        if length is None:
+            return None
+        arguments = (operand, ir.Literal(start), ir.Literal(length))
+        return ir.FunctionCall("substring", arguments)
+
+    def left_or_right(self, node: exp.Left | exp.Right) -> ir.Expression | None:
+        name = "left" if isinstance(node, exp.Left) else "right"
+        allowed = {"this", "expression", "negative_length_returns_empty"}
+        if not self.check_parts(node, allowed, name.upper()):
+            return None
+        count = self.constant_int(node.expression, node, f"{name.upper()} length", 0)
+        operand = self.expression(_without_implicit_string_cast(node.this))
+        if operand is None or count is None:
+            return None
+        return ir.FunctionCall(name, (operand, ir.Literal(count)))
+
+    def concat(self, node: exp.Concat | exp.DPipe) -> ir.Expression | None:
+        if isinstance(node, exp.DPipe):
+            allowed, parts = {"this", "expression", "safe"}, _flatten_dpipe(node)
+        else:
+            allowed = {"expressions", "safe", "coalesce"}
+            parts = list(node.expressions)
+        if not self.check_parts(node, allowed, "CONCAT"):
+            return None
+        operands = self.translate_all(parts)
+        if operands is None:
+            return None
+        if node.args.get("coalesce") or self.dialect == "oracle":
+            # PostgreSQL's and T-SQL's CONCAT, and Oracle's || and CONCAT, skip
+            # NULL inputs; so does concat_ws. Spark's concat returns NULL.
+            return ir.FunctionCall("concat_ws", (ir.Literal(""), *operands))
+        return ir.FunctionCall("concat", operands)
+
+    def replace_(self, node: exp.Replace) -> ir.Expression | None:
+        if not self.check_parts(node, {"this", "expression", "replacement"}, "REPLACE"):
+            return None
+        operands = self.translate_all(
+            [node.this, node.expression, node.args["replacement"]]
+        )
+        return None if operands is None else ir.FunctionCall("replace", operands)
+
+    def round_(self, node: exp.Round) -> ir.Expression | None:
+        allowed = {"this", "decimals", "truncate", "casts_non_integer_decimals"}
+        if not self.check_parts(node, allowed, "ROUND"):
+            return None
+        if node.args.get("truncate"):
+            self.unsupported("ROUND with a truncation argument", node)
+            return None
+        if self.dialect in _HALF_EVEN_FLOAT_ROUND_DIALECTS:
+            self.unsupported("ROUND", node, _ROUND_HINT)
+            return None
+        decimals_node = node.args.get("decimals")
+        decimals = None
+        if decimals_node is not None:
+            decimals = self.constant_int(decimals_node, node, "ROUND scale", None)
+        operand = self.expression(node.this)
+        if operand is None:
+            return None
+        if decimals_node is None:
+            return ir.FunctionCall("round", (operand,))
+        if decimals is None:
+            return None
+        return ir.FunctionCall("round", (operand, ir.Literal(decimals)))
+
+    def pow_(self, node: exp.Pow) -> ir.Expression | None:
+        if not self.check_parts(node, {"this", "expression"}, "POWER"):
+            return None
+        operands = self.translate_all([node.this, node.expression])
+        return None if operands is None else ir.FunctionCall("pow", operands)
+
+    def log(self, node: exp.Log) -> ir.Expression | None:
+        if not self.check_parts(node, {"this", "expression"}, "LOG"):
+            return None
+        if node.expression is None:
+            self.unsupported("LOG with one argument", node, _LOG_HINT)
+            return None
+        base = _number_literal(node.this)
+        if base is None or base <= 0:
+            self.unsupported("LOG with a base that is not a positive constant", node)
+            return None
+        operand = self.expression(node.expression)
+        if operand is None:
+            return None
+        return ir.FunctionCall("log", (ir.Literal(float(base)), operand))
+
+    def greatest_or_least(self, node: exp.Greatest | exp.Least) -> ir.Expression | None:
+        name = "greatest" if isinstance(node, exp.Greatest) else "least"
+        allowed = {"this", "expressions", "ignore_nulls"}
+        if not self.check_parts(node, allowed, name.upper()):
+            return None
+        if not node.args.get("ignore_nulls") or self.dialect == "oracle":
+            self.unsupported(name.upper(), node, _GREATEST_HINT)
+            return None
+        operands = self.translate_all([node.this, *node.expressions])
+        return None if operands is None else ir.FunctionCall(name, operands)
+
+    def constant_int(
+        self,
+        node: exp.Expression | None,
+        owner: exp.Expression,
+        what: str,
+        minimum: int | None,
+    ) -> int | None:
+        """Read a constant integer argument, such as a SUBSTRING position."""
+        value = _integer_literal(node)
+        if value is None or (minimum is not None and value < minimum):
+            requirement = (
+                "a constant integer"
+                if minimum is None
+                else f"a constant integer of at least {minimum}"
+            )
+            self.unsupported(f"{what} that is not {requirement}", owner, _CONSTANT_HINT)
+            return None
+        return value
+
+    _FUNCTIONS: ClassVar[
+        dict[type[exp.Expression], Callable[..., ir.Expression | None]]
+    ] = {
+        exp.Upper: simple_function,
+        exp.Lower: simple_function,
+        exp.Abs: simple_function,
+        exp.Ceil: simple_function,
+        exp.Floor: simple_function,
+        exp.Sqrt: simple_function,
+        exp.Exp: simple_function,
+        exp.Ln: simple_function,
+        exp.Sign: simple_function,
+        exp.Length: length,
+        exp.Trim: trim,
+        exp.Substring: substring,
+        exp.Left: left_or_right,
+        exp.Right: left_or_right,
+        exp.Concat: concat,
+        exp.DPipe: concat,
+        exp.Replace: replace_,
+        exp.Round: round_,
+        exp.Pow: pow_,
+        exp.Log: log,
+        exp.Greatest: greatest_or_least,
+        exp.Least: greatest_or_least,
     }
 
     def column(self, node: exp.Column) -> ir.Column | None:
@@ -1153,6 +1400,52 @@ def _is_aggregate_query(select: exp.Select) -> bool:
             if aggregate.find_ancestor(exp.Window, exp.Select) is select:
                 return True
     return False
+
+
+def _calls_function(expression: ir.Expression) -> bool:
+    """Whether a scalar function call appears anywhere in an expression."""
+    if isinstance(expression, ir.FunctionCall):
+        return True
+    return any(_calls_function(child) for child in ir.children(expression))
+
+
+def _is_max_length(parameters: list[exp.Expression]) -> bool:
+    return len(parameters) == 1 and parameters[0].name.upper() == "MAX"
+
+
+def _without_implicit_string_cast(node: exp.Expression) -> exp.Expression:
+    """Remove the cast to an unbounded string that SQLGlot inserts around T-SQL
+    string function arguments (it represents VARCHAR(MAX) as TEXT); Spark
+    converts those arguments to strings itself."""
+    if (
+        isinstance(node, exp.Cast)
+        and node.to.this in _STRING_CAST_TYPES
+        and (not node.to.expressions or _is_max_length(node.to.expressions))
+    ):
+        return node.this
+    return node
+
+
+def _flatten_dpipe(node: exp.Expression) -> list[exp.Expression]:
+    """Turn a || b || c into [a, b, c]."""
+    if isinstance(node, exp.DPipe):
+        return [*_flatten_dpipe(node.this), *_flatten_dpipe(node.expression)]
+    return [node]
+
+
+def _integer_literal(node: exp.Expression | None) -> int | None:
+    if isinstance(node, exp.Neg):
+        value = _integer_literal(node.this)
+        return None if value is None else -value
+    if isinstance(node, exp.Literal) and not node.is_string and node.this.isdigit():
+        return int(node.this)
+    return None
+
+
+def _number_literal(node: exp.Expression | None) -> float | None:
+    if isinstance(node, exp.Literal) and not node.is_string:
+        return float(node.this)
+    return None
 
 
 def _differently_named(node: exp.Expression) -> str | None:

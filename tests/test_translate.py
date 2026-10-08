@@ -277,7 +277,11 @@ def test_issues_inside_one_expression_are_all_reported() -> None:
             None,
             ("LIKE with ESCAPE", "a LIKE 'x!%' ESCAPE '!'"),
         ),
-        ("SELECT a || b AS x FROM t", None, ("DPIPE expression", "a || b")),
+        (
+            "SELECT CONCAT_WS('-', a, b) AS x FROM t",
+            None,
+            ("function CONCAT_WS", "CONCAT_WS('-', a, b)"),
+        ),
         ("SELECT * FROM t GROUP BY a", None, ("SELECT * with aggregation", "*")),
         ("SELECT * FROM t LIMIT 5 OFFSET 2", None, ("OFFSET clause", "OFFSET 2")),
         ("SELECT AS STRUCT * FROM t", "bigquery", ("SELECT AS", "STRUCT")),
@@ -1273,5 +1277,234 @@ def test_unknown_parts_of_conditionals_are_rejected_not_ignored(
 
     with pytest.raises(UnsupportedSQLError) as caught:
         translate(tree, dialect)
+
+    assert [issue.message for issue in caught.value.issues] == [f"{name} with EXTRA"]
+
+
+# --- String and numeric functions --------------------------------------------
+
+
+def call(name: str, *arguments: ir.Expression) -> ir.FunctionCall:
+    return ir.FunctionCall(name, arguments)
+
+
+@pytest.mark.parametrize(
+    ("sql_expression", "expected"),
+    [
+        ("UPPER(a)", call("upper", A)),
+        ("LOWER(a)", call("lower", A)),
+        ("LENGTH(a)", call("length", A)),
+        ("CHAR_LENGTH(a)", call("length", A)),
+        ("TRIM(a)", call("trim", A)),
+        ("LTRIM(a)", call("ltrim", A)),
+        ("RTRIM(a)", call("rtrim", A)),
+        ("SUBSTRING(a, 2, 3)", call("substring", A, Literal(2), Literal(3))),
+        ("SUBSTRING(a FROM 2 FOR 3)", call("substring", A, Literal(2), Literal(3))),
+        ("SUBSTR(a, 2)", call("substr", A, Literal(2))),
+        ("CONCAT(a, '-', b)", call("concat", A, Literal("-"), B)),
+        ("a || b || c", call("concat", A, B, C)),
+        ("REPLACE(a, 'x', 'y')", call("replace", A, Literal("x"), Literal("y"))),
+        ("LEFT(a, 2)", call("left", A, Literal(2))),
+        ("RIGHT(a, 0)", call("right", A, Literal(0))),
+        ("ABS(a)", call("abs", A)),
+        ("ROUND(a)", call("round", A)),
+        ("ROUND(a, 2)", call("round", A, Literal(2))),
+        ("ROUND(a, -1)", call("round", A, Literal(-1))),
+        ("CEIL(a)", call("ceil", A)),
+        ("CEILING(a)", call("ceil", A)),
+        ("FLOOR(a)", call("floor", A)),
+        ("POWER(a, 2)", call("pow", A, Literal(2))),
+        ("SQRT(a)", call("sqrt", A)),
+        ("SIGN(a)", call("sign", A)),
+        ("LN(a)", call("ln", A)),
+        ("EXP(a)", call("exp", A)),
+        ("LOG(10, a)", call("log", Literal(10.0), A)),
+        ("GREATEST(a, b)", call("greatest", A, B)),
+        ("LEAST(a, b, 0)", call("least", A, B, Literal(0))),
+    ],
+)
+def test_functions(sql_expression: str, expected: ir.Expression) -> None:
+    assert only_item(f"SELECT {sql_expression} AS x FROM t") == Alias(expected, "x")
+
+
+@pytest.mark.parametrize(
+    ("sql_expression", "dialect", "expected"),
+    [
+        # T-SQL LEN ignores trailing spaces; SQLGlot's own conversion does not.
+        ("LEN(a)", "tsql", call("length", call("rtrim", A))),
+        ("LEFT(a, 2)", "tsql", call("left", A, Literal(2))),
+        # MySQL LENGTH counts bytes, CHAR_LENGTH characters.
+        ("LENGTH(a)", "mysql", call("octet_length", A)),
+        ("CHAR_LENGTH(a)", "mysql", call("length", A)),
+        # These dialects' CONCAT skip NULL inputs, like concat_ws.
+        ("CONCAT(a, b)", "postgres", call("concat_ws", Literal(""), A, B)),
+        ("CONCAT(a, b)", "tsql", call("concat_ws", Literal(""), A, B)),
+        ("CONCAT(a, b)", "oracle", call("concat_ws", Literal(""), A, B)),
+        ("a || b", "oracle", call("concat_ws", Literal(""), A, B)),
+        ("a || b", "postgres", call("concat", A, B)),
+        ("LOG(a)", "tsql", call("ln", A)),
+        ("LOG(a, 2)", "tsql", call("log", Literal(2.0), A)),
+        ("SUBSTRING(a, 2)", "snowflake", call("substr", A, Literal(2))),
+        ("ROUND(a, 1)", "snowflake", call("round", A, Literal(1))),
+        ("GREATEST(a, b)", "postgres", call("greatest", A, B)),
+        ("CAST(a AS VARCHAR(MAX))", "tsql", ir.Cast(A, "string")),
+    ],
+)
+def test_dialect_function_semantics(
+    sql_expression: str, dialect: str, expected: ir.Expression
+) -> None:
+    assert only_item(f"SELECT {sql_expression} AS x FROM t", dialect) == Alias(
+        expected, "x"
+    )
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT UPPER(a) FROM t",
+        "SELECT CEILING(a) + 1 FROM t",
+        "SELECT SUM(ABS(a)) FROM t",
+        "SELECT COALESCE(a, 0) FROM t",
+    ],
+)
+def test_function_results_need_an_alias(sql: str) -> None:
+    messages = [message for message, _ in unsupported_issues(sql)]
+
+    assert messages == ["function result without an alias"]
+
+
+def test_mysql_or_operator_is_not_concatenation() -> None:
+    # In MySQL, || is a logical OR.
+    assert only_item("SELECT a || b AS x FROM t", "mysql") == Alias(
+        BinaryOp(BinaryOperator.OR, A, B), "x"
+    )
+
+
+@pytest.mark.parametrize(
+    ("sql_expression", "dialect", "message"),
+    [
+        ("TRIM(BOTH 'x' FROM a)", None, "TRIM with EXPRESSION"),
+        ("TRIM(a)", "bigquery", "TRIM"),
+        (
+            "SUBSTRING(a, -2)",
+            None,
+            "SUBSTRING start that is not a constant integer of at least 1",
+        ),
+        (
+            "SUBSTRING(a, 0, 2)",
+            None,
+            "SUBSTRING start that is not a constant integer of at least 1",
+        ),
+        (
+            "SUBSTRING(a, b, 2)",
+            None,
+            "SUBSTRING start that is not a constant integer of at least 1",
+        ),
+        (
+            "SUBSTRING(a, 1, -1)",
+            None,
+            "SUBSTRING length that is not a constant integer of at least 0",
+        ),
+        (
+            "LEFT(a, b)",
+            None,
+            "LEFT length that is not a constant integer of at least 0",
+        ),
+        (
+            "RIGHT(a, -1)",
+            None,
+            "RIGHT length that is not a constant integer of at least 0",
+        ),
+        ("ROUND(a)", "postgres", "ROUND"),
+        ("ROUND(a)", "mysql", "ROUND"),
+        ("ROUND(a)", "oracle", "ROUND"),
+        ("ROUND(a, 2, 1)", "tsql", "ROUND with a truncation argument"),
+        ("ROUND(a, b)", None, "ROUND scale that is not a constant integer"),
+        ("LOG(a)", "postgres", "LOG with one argument"),
+        ("LOG(b, a)", None, "LOG with a base that is not a positive constant"),
+        ("LOG(0, a)", None, "LOG with a base that is not a positive constant"),
+        ("GREATEST(a, b)", "mysql", "GREATEST"),
+        ("LEAST(a, b)", "snowflake", "LEAST"),
+        ("GREATEST(a, b)", "oracle", "GREATEST"),
+    ],
+)
+def test_unsupported_functions(
+    sql_expression: str, dialect: str | None, message: str
+) -> None:
+    messages = [
+        m
+        for m, _ in unsupported_issues(f"SELECT {sql_expression} AS x FROM t", dialect)
+    ]
+
+    assert message in messages
+
+
+@pytest.mark.parametrize(
+    ("sql_expression", "dialect", "hint_fragment"),
+    [
+        ("ROUND(a)", "postgres", "halves to even"),
+        ("GREATEST(a, b)", "mysql", "returns NULL"),
+        ("LOG(a)", "postgres", "base 10"),
+        ("TRIM(a)", "bigquery", "tabs and newlines"),
+    ],
+)
+def test_function_landmines_explain_themselves(
+    sql_expression: str, dialect: str, hint_fragment: str
+) -> None:
+    with pytest.raises(UnsupportedSQLError) as caught:
+        translate_sql(f"SELECT {sql_expression} AS x FROM t", dialect)
+
+    [issue] = caught.value.issues
+    assert issue.hint is not None
+    assert hint_fragment in issue.hint
+
+
+@pytest.mark.parametrize(
+    "sql_expression",
+    [
+        "UPPER(f(a))",
+        "LENGTH(f(a))",
+        "TRIM(f(a))",
+        "SUBSTRING(f(a), 1, 2)",
+        "SUBSTR(f(a), 1)",
+        "LEFT(f(a), 1)",
+        "CONCAT(f(a), b)",
+        "REPLACE(f(a), 'x', 'y')",
+        "ROUND(f(a))",
+        "ROUND(f(a), 1)",
+        "POWER(f(a), 2)",
+        "LOG(10, f(a))",
+        "GREATEST(f(a), 1)",
+    ],
+)
+def test_issues_inside_functions_are_reported(sql_expression: str) -> None:
+    issues = unsupported_issues(f"SELECT {sql_expression} AS x FROM t")
+
+    assert issues == [("function F", "F(a)")]
+
+
+@pytest.mark.parametrize(
+    ("sql_expression", "node_type", "name"),
+    [
+        ("UPPER(a)", exp.Upper, "UPPER"),
+        ("LENGTH(a)", exp.Length, "LENGTH"),
+        ("SUBSTRING(a, 1, 2)", exp.Substring, "SUBSTRING"),
+        ("LEFT(a, 1)", exp.Left, "LEFT"),
+        ("CONCAT(a, b)", exp.Concat, "CONCAT"),
+        ("REPLACE(a, 'x', 'y')", exp.Replace, "REPLACE"),
+        ("ROUND(a)", exp.Round, "ROUND"),
+        ("POWER(a, 2)", exp.Pow, "POWER"),
+        ("LOG(10, a)", exp.Log, "LOG"),
+        ("GREATEST(a, b)", exp.Greatest, "GREATEST"),
+    ],
+)
+def test_unknown_parts_of_functions_are_rejected_not_ignored(
+    sql_expression: str, node_type: type, name: str
+) -> None:
+    tree = parse_sql(f"SELECT {sql_expression} AS x FROM t")
+    tree.find(node_type).set("extra", exp.true())
+
+    with pytest.raises(UnsupportedSQLError) as caught:
+        translate(tree)
 
     assert [issue.message for issue in caught.value.issues] == [f"{name} with EXTRA"]

@@ -74,7 +74,31 @@ ORDERS = [
 ]
 # fmt: on
 
+PRODUCTS_SCHEMA = StructType(
+    [
+        StructField("product_id", IntegerType()),
+        StructField("name", StringType()),
+        StructField("category", StringType()),
+        StructField("price", DecimalType(10, 3)),
+        StructField("weight", DoubleType()),
+        StructField("stock", IntegerType()),
+    ]
+)
+
+# fmt: off
+PRODUCTS = [
+    (1, "  Widget  ", "tools",   Decimal("2.500"),  2.5,   10),    # leading and trailing spaces; half boundary
+    (2, "gadget",     "Tools",   Decimal("-2.500"), -2.5,  0),     # lower case; negative half; zero
+    (3, "Café Crème", "kitchen", Decimal("0.125"),  0.125, 7),     # non-ASCII (multi-byte); third decimal
+    (4, "Bolt   ",    None,      Decimal("2.675"),  2.675, -3),    # trailing spaces only; NULL category
+    (5, "",           "tools",   Decimal("0.000"),  0.0,   None),  # empty string; zero; NULL stock
+    (6, None,         "misc",    None,              None,  4),     # NULL name and numbers
+    (7, "ZIP-Tie",    "Tools",   Decimal("12.345"), 1.5,   2),     # mixed case; hyphen
+]
+# fmt: on
+
 TABLES = {
     "customers": (CUSTOMERS_SCHEMA, CUSTOMERS),
     "orders": (ORDERS_SCHEMA, ORDERS),
+    "products": (PRODUCTS_SCHEMA, PRODUCTS),
 }

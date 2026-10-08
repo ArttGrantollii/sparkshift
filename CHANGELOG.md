@@ -58,6 +58,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every supported dialect. Rejects T-SQL `ISNULL`, T-SQL `VARCHAR` casts
   without a length, `FLOAT`/`REAL` casts, T-SQL `LIKE` character classes, and
   backslashes in `LIKE` patterns.
+- String and numeric functions: `UPPER`, `LOWER`, `LENGTH`, `TRIM` variants,
+  `SUBSTRING`, `CONCAT`, `||`, `REPLACE`, `LEFT`, `RIGHT`, `ABS`, `ROUND`,
+  `CEIL`, `FLOOR`, `POWER`, `SQRT`, `SIGN`, `LN`, `LOG(base, x)`, `EXP`,
+  `GREATEST`, `LEAST`. Emulates T-SQL `LEN`, MySQL byte-counting `LENGTH`, and
+  NULL-skipping `CONCAT` exactly; rejects `ROUND` where floating-point halves
+  round to even, NULL-propagating `GREATEST`/`LEAST`, ambiguous one-argument
+  `LOG`, BigQuery `TRIM`, and non-constant or negative positions.
+- Unaliased `SELECT` items that call functions now require an alias, because
+  Spark names such columns after the original spelling.
+- A `products` test table with whitespace, multi-byte text, and rounding
+  boundaries.
 - Generic IR child traversal, so checks such as "column is neither grouped nor
   aggregated" see inside every expression type.
 - Equivalence testing for `LIMIT` without `ORDER BY` (row count plus

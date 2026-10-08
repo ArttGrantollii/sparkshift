@@ -661,3 +661,34 @@ def test_generic_children_cover_every_expression_field() -> None:
 
     assert ir.children(case) == [A, Literal(1), B]
     assert ir.map_children(case, lambda child: C) == ir.Case(((C, C),), C)
+
+
+# --- String and numeric functions --------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        (ir.FunctionCall("upper", (A,)), 'F.upper(F.col("a"))'),
+        # Parameters PySpark takes as plain values are emitted as plain values.
+        (ir.FunctionCall("round", (A, Literal(2))), 'F.round(F.col("a"), 2)'),
+        (
+            ir.FunctionCall("substring", (A, Literal(2), Literal(3))),
+            'F.substring(F.col("a"), 2, 3)',
+        ),
+        (
+            ir.FunctionCall("concat_ws", (Literal(""), A, B)),
+            'F.concat_ws("", F.col("a"), F.col("b"))',
+        ),
+        (ir.FunctionCall("log", (Literal(10.0), A)), 'F.log(10.0, F.col("a"))'),
+        # Everywhere else, values stay Columns.
+        (ir.FunctionCall("left", (A, Literal(2))), 'F.left(F.col("a"), F.lit(2))'),
+        (
+            ir.FunctionCall("replace", (A, Literal("x"), Literal("y"))),
+            'F.replace(F.col("a"), F.lit("x"), F.lit("y"))',
+        ),
+        (ir.FunctionCall("substr", (A, Literal(2))), 'F.substr(F.col("a"), F.lit(2))'),
+    ],
+)
+def test_function_code(expression: ir.Expression, expected: str) -> None:
+    assert emit_expression(expression) == expected

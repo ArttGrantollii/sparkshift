@@ -79,12 +79,28 @@ UnsupportedSQLError: 2 unsupported constructs:
 | `IN (...)`, `BETWEEN`, `LIKE`, `ILIKE`, `IS [NOT] NULL`, `IS [NOT] DISTINCT FROM`, `<=>` | Supported (constant `LIKE` patterns) |
 | `CASE` (searched and simple), `IF`, `IIF`, `COALESCE`, `IFNULL`, `NVL`, `NULLIF` | Supported |
 | `CAST`, `TRY_CAST`, `::` to integer types, `DECIMAL(p, s)`, `DOUBLE`, `VARCHAR`/`TEXT`/`STRING`, `DATE`, `BOOLEAN` | Supported |
+| String functions: `UPPER`, `LOWER`, `LENGTH`/`LEN`/`CHAR_LENGTH`, `TRIM`/`LTRIM`/`RTRIM`, `SUBSTRING`/`SUBSTR`, `CONCAT`, `\|\|`, `REPLACE`, `LEFT`, `RIGHT` | Supported, with dialect rules below |
+| Numeric functions: `ABS`, `ROUND`, `CEIL`/`CEILING`, `FLOOR`, `POWER`, `SQRT`, `SIGN`, `LN`, `LOG(base, x)`, `EXP`, `GREATEST`, `LEAST` | Supported, with dialect rules below |
 | `NATURAL`, semi, anti, and as-of joins; joins to subqueries; `LATERAL` and `APPLY` | Unsupported — rejected with an error |
 | `GROUP BY` expressions, `ROLLUP`, `CUBE`, `GROUPING SETS`, `AVG(DISTINCT ...)` | Unsupported — rejected with an error |
 | `IN (subquery)`, `LIKE ... ESCAPE`, `IS TRUE`/`IS FALSE`, casts to `FLOAT`/`REAL`, `CHAR(n)`/`VARCHAR(n)`, unparameterized `DECIMAL`, and timestamps | Unsupported — rejected with an error |
-| Everything else, including `ORDER BY`, window functions, and scalar functions | Unsupported — rejected with an error |
+| Everything else, including `ORDER BY`, window functions, date functions, and other functions | Unsupported — rejected with an error |
 
 Support grows feature by feature; see the [roadmap](ROADMAP.md).
+
+### Dialect emulations
+
+Where a source dialect's function behaves differently from Spark's but an exact
+PySpark equivalent exists, SparkShift generates code with the source dialect's
+behavior:
+
+| Construct | Dialect | Behavior | Generated as |
+|---|---|---|---|
+| `LEN(x)` | T-SQL | Ignores trailing spaces | `F.length(F.rtrim(x))` |
+| `LENGTH(x)` | MySQL | Counts bytes, not characters | `F.octet_length(x)` |
+| `CONCAT(...)` | PostgreSQL, T-SQL, Oracle | Skips NULL inputs | `F.concat_ws("", ...)` |
+| `a \|\| b` | Oracle | Treats NULL as an empty string | `F.concat_ws("", a, b)` |
+| `a \|\| b` | MySQL | Logical OR, not concatenation | `a \| b` |
 
 ### Dialect differences
 
@@ -110,12 +126,22 @@ rejects it rather than guess:
 | `CAST(x AS FLOAT)` / `REAL` | All | Sizes differ: T-SQL `FLOAT` is 8 bytes, Spark `FLOAT` is 4. |
 | `LIKE '[a-c]%'` | T-SQL | `[ ]` is a character class in T-SQL; Spark matches it literally. |
 | `LIKE` patterns containing `\` | All | Whether backslash escapes wildcards differs between databases and Spark. |
+| `ROUND(x)` | PostgreSQL, MySQL, Oracle | Floating-point halves round to even (`2.5` → `2`) but exact numbers away from zero; Spark always rounds away, and only the column type would tell. |
+| `ROUND(x, n, 1)` | T-SQL | The third argument truncates instead of rounding. |
+| `GREATEST`, `LEAST` | MySQL, Oracle, Snowflake, BigQuery | Return NULL when any argument is NULL; Spark ignores NULL arguments. |
+| `LOG(x)` | PostgreSQL, Snowflake, Oracle, generic | Base 10 in some databases, natural logarithm in others; write `LN(x)` or `LOG(base, x)`. |
+| `TRIM` | BigQuery | Removes all Unicode whitespace, including tabs; Spark removes only spaces. |
+| `SUBSTRING`, `LEFT`, `RIGHT` with negative or computed positions | All | Negative positions behave differently across databases. |
 
 ### Known limitations
 
 - Database-specific string collation is not emulated. For example, MySQL and
-  SQL Server often compare strings, including in `LIKE`, case-insensitively;
-  Spark compares them case-sensitively.
+  SQL Server often compare strings, including in `LIKE` and `REPLACE`,
+  case-insensitively; Spark compares them case-sensitively.
+- Oracle treats an empty string as NULL; SparkShift does not emulate this.
+- An unaliased `SELECT` item that calls a function, such as `SELECT UPPER(name)`,
+  must be given an alias, because Spark names the column after the exact
+  spelling used (`CEIL` or `CEILING`), which is lost in parsing.
 - `CAST` failures follow Spark's ANSI behavior: an invalid value raises an
   error (use `TRY_CAST` for NULL instead), where some databases, such as MySQL,
   return a default value.
