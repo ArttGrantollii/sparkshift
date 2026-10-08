@@ -48,6 +48,16 @@ UnsupportedSQLError: 3 unsupported constructs:
 
 Support grows feature by feature; see the [roadmap](ROADMAP.md).
 
+## How correctness is verified
+
+Supported translations are backed by automated equivalence tests that execute
+both the original SQL and the generated PySpark against the same datasets on
+real Apache Spark, then compare the results with SQL semantics in mind: row
+order is ignored unless the query orders it, duplicate rows must match in
+number, column names and types must match, and NULLs are compared as values.
+The test data deliberately includes duplicates, NULLs, empty strings, and
+other edge cases. See [docs/testing.md](docs/testing.md).
+
 ## Development setup
 
 SparkShift is developed on Linux (WSL2 on Windows works). You need:
@@ -81,6 +91,7 @@ uv run ruff format --check .   # formatting
 ## Design documents
 
 - [Architecture](docs/architecture.md) — how the core is structured and the rules that keep it portable
+- [Testing and correctness](docs/testing.md) — test layers, equivalence testing, and result-comparison rules
 - [Architecture Decision Records](docs/adr/) — significant decisions and their trade-offs
 
 ## License

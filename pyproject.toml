@@ -63,6 +63,10 @@ select = [
     "RUF", # Ruff-specific rules
 ]
 
+[tool.ruff.lint.per-file-ignores]
+# Test data is laid out as aligned tables, one row per line.
+"tests/equivalence/datasets.py" = ["E501"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["--strict-markers", "--strict-config"]

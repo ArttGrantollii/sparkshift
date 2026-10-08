@@ -24,3 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `UnsupportedSQLError` listing every unsupported construct.
 - Intermediate representation and emitter (ADR 0003), with architecture tests
   keeping SQLGlot out of both.
+- Spark equivalence testing: executes the original SQL and the generated
+  PySpark on the same datasets and compares results with SQL semantics
+  (unordered multiset rows, exact schema, NULL-aware, float tolerance).
+  Test datasets cover duplicates, NULLs, empty strings, and other edge cases.
