@@ -965,3 +965,156 @@ def test_wrapping_sort_keys_keeps_the_python_syntax_tree(line_length: int) -> No
 def test_sort_requires_keys() -> None:
     with pytest.raises(ValueError, match="at least one key"):
         ir.Sort(TableScan(("t",)), ())
+
+
+# --- Window functions --------------------------------------------------------
+
+
+def ranked(*partition_by: ir.Expression) -> ir.WindowCall:
+    return ir.WindowCall(
+        ir.WindowFunction.RANK, partition_by, (ir.SortKey(B, False, True),)
+    )
+
+
+def total(*partition_by: ir.Expression) -> ir.WindowCall:
+    return ir.WindowCall(ir.AggregateCall(ir.AggregateFunction.SUM, (C,)), partition_by)
+
+
+def test_a_window_is_declared_once_and_shared() -> None:
+    running = ir.WindowCall(
+        ir.AggregateCall(ir.AggregateFunction.SUM, (C,)),
+        (A,),
+        (ir.SortKey(B, False, True),),
+    )
+    plan = Project(
+        TableScan(("t",)), (Alias(ranked(A), "r"), Alias(running, "running"))
+    )
+
+    assert emit(plan) == (
+        "from pyspark.sql import Window\n"
+        "from pyspark.sql import functions as F\n"
+        "\n"
+        'window = Window.partitionBy(F.col("a")).orderBy(F.col("b").asc())\n'
+        "\n"
+        "result = (\n"
+        '    spark.table("t")\n'
+        "    .select(\n"
+        '        F.rank().over(window).alias("r"),\n'
+        '        F.sum(F.col("c")).over(window).alias("running"),\n'
+        "    )\n"
+        ")\n"
+    )
+
+
+def test_different_windows_are_numbered_in_order_of_use() -> None:
+    plan = Project(
+        TableScan(("t",)),
+        (Alias(total(), "everything"), Alias(total(A), "per_a"), Alias(ranked(), "r")),
+    )
+
+    code = emit(plan)
+
+    assert (
+        "window_1 = Window.partitionBy()\n"
+        'window_2 = Window.partitionBy(F.col("a"))\n'
+        'window_3 = Window.orderBy(F.col("b").asc())\n'
+    ) in code
+    assert 'F.sum(F.col("c")).over(window_1).alias("everything")' in code
+    assert 'F.rank().over(window_3).alias("r")' in code
+
+
+def test_long_window_wraps_one_call_per_line() -> None:
+    columns = [Column((name,)) for name in ("country", "region", "city", "street")]
+    call = ir.WindowCall(
+        ir.WindowFunction.ROW_NUMBER,
+        tuple(columns[:2]),
+        tuple(ir.SortKey(column, True, False) for column in columns[2:]),
+    )
+
+    code = emit(Project(TableScan(("t",)), (Alias(call, "n"),)))
+
+    assert (
+        "window = (\n"
+        "    Window.partitionBy(\n"
+        '        F.col("country"),\n'
+        '        F.col("region"),\n'
+        "    )\n"
+        "    .orderBy(\n"
+        '        F.col("city").desc(),\n'
+        '        F.col("street").desc(),\n'
+        "    )\n"
+        ")\n"
+    ) in code
+
+
+def test_window_variable_does_not_shadow_a_table_variable() -> None:
+    join = ir.Join(
+        ir.RelationAlias(TableScan(("window",)), "w"),
+        ir.RelationAlias(TableScan(("t",)), "t"),
+        ir.JoinKind.CROSS,
+    )
+
+    code = emit(Project(join, (Alias(total(), "s"),)))
+
+    assert 'window = spark.table("window")\n' in code
+    assert "window_spec = Window.partitionBy()\n" in code
+    assert ".over(window_spec)" in code
+
+
+def test_window_alone_is_written_inline() -> None:
+    assert (
+        emit_expression(ranked(A))
+        == 'F.rank().over(Window.partitionBy(F.col("a")).orderBy(F.col("b").asc()))'
+    )
+
+
+def test_long_window_aggregate_wraps_like_an_alias() -> None:
+    long_sum = ir.WindowCall(
+        ir.AggregateCall(
+            ir.AggregateFunction.SUM,
+            (
+                BinaryOp(
+                    BinaryOperator.ADD,
+                    Column(("shipping_cost_in_euros",)),
+                    Column(("handling_fee_in_euros",)),
+                ),
+            ),
+        )
+    )
+
+    code = emit(Project(TableScan(("t",)), (Alias(long_sum, "extra"),)))
+
+    assert (
+        "        F.sum(\n"
+        '            F.col("shipping_cost_in_euros") + '
+        'F.col("handling_fee_in_euros"),\n'
+        '        ).over(window).alias("extra")\n'
+    ) in code
+
+
+@pytest.mark.parametrize("line_length", [88, 30, 10])
+def test_wrapping_windows_keeps_the_python_syntax_tree(line_length: int) -> None:
+    plan = Project(
+        TableScan(("t",)),
+        (
+            Alias(ranked(A, B, C), "r"),
+            Alias(total(LONG_AND), "s"),
+            Alias(BinaryOp(BinaryOperator.ADD, total(A), Literal(1)), "plus_one"),
+        ),
+    )
+
+    wrapped = emit(plan, line_length=line_length)
+    one_line = emit(plan, line_length=10**6)
+
+    assert ast.dump(ast.parse(wrapped)) == ast.dump(ast.parse(one_line))
+
+
+def test_generic_children_include_window_keys() -> None:
+    call = ir.WindowCall(COUNT_ROWS, (A,), (ir.SortKey(B, True, False),))
+
+    assert ir.children(call) == [COUNT_ROWS, A, B]
+    assert ir.map_children(call, lambda child: C) == ir.WindowCall(
+        C,  # type: ignore[arg-type]
+        (C,),
+        (ir.SortKey(C, True, False),),
+    )

@@ -96,3 +96,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DISTINCT` list.
 - Ordered equivalence testing: rows that tie on the sort keys may come in any
   order, and a `LIMIT` may cut the last group of ties.
+- Window functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, and `COUNT`, `SUM`,
+  `AVG`, `MIN`, `MAX` over `PARTITION BY` and `ORDER BY`, with SQL's default
+  frame and each dialect's NULL placement. Each distinct window is declared
+  once as a variable. Rejects explicit frames, other window functions,
+  `IGNORE NULLS`, named windows, `DISTINCT` in windows, and windows outside
+  the `SELECT` list or in aggregate queries.

@@ -17,6 +17,7 @@ import test_filtering
 import test_functions
 import test_joins
 import test_ordering
+import test_windows
 
 from sparkshift.emit import emit
 from sparkshift.parsing import parse_sql
@@ -31,6 +32,7 @@ MODULES = [
     test_functions,
     test_dates,
     test_ordering,
+    test_windows,
 ]
 
 

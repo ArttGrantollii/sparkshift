@@ -56,7 +56,7 @@ every unsupported construct:
 
 ```text
 UnsupportedSQLError: 2 unsupported constructs:
-  - WINDOW expression: ROW_NUMBER() OVER (ORDER BY name)
+  - function MY_UDF: MY_UDF(score)
   - OFFSET clause: OFFSET 20
 ```
 
@@ -86,10 +86,12 @@ UnsupportedSQLError: 2 unsupported constructs:
 | Date arithmetic in days, weeks, months, years: `+`/`-` `INTERVAL`, `DATEADD`, `DATE_ADD`, `DATE_SUB` | Supported; keeps the input type |
 | Day differences: `DATEDIFF` and `DATE_DIFF` in days | Supported, with each dialect's argument order |
 | `DATE_TRUNC` to year, quarter, month; `CURRENT_DATE`, `CURRENT_TIMESTAMP`; casts to timestamp types | Supported, with dialect rules below |
+| Window functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, and `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` `OVER (PARTITION BY ... ORDER BY ...)` | Supported in the `SELECT` list of queries without `GROUP BY`, with SQL's default frame |
+| Window frames (`ROWS`/`RANGE BETWEEN`), `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTILE`, `IGNORE NULLS`, named windows, `QUALIFY`, and windows in aggregate queries | Unsupported — rejected with an error |
 | `NATURAL`, semi, anti, and as-of joins; joins to subqueries; `LATERAL` and `APPLY` | Unsupported — rejected with an error |
 | `GROUP BY` expressions, `ROLLUP`, `CUBE`, `GROUPING SETS`, `AVG(DISTINCT ...)` | Unsupported — rejected with an error |
 | `IN (subquery)`, `LIKE ... ESCAPE`, `IS TRUE`/`IS FALSE`, casts to `FLOAT`/`REAL`, `CHAR(n)`/`VARCHAR(n)`, unparameterized `DECIMAL`, and timestamps | Unsupported — rejected with an error |
-| Everything else, including `OFFSET`, window functions, date formatting and parsing, and other functions | Unsupported — rejected with an error |
+| Everything else, including `OFFSET`, user-defined functions, date formatting and parsing, and other functions | Unsupported — rejected with an error |
 
 Support grows feature by feature; see the [roadmap](ROADMAP.md).
 
@@ -138,9 +140,9 @@ when it differs from Spark's default, for example `.asc_nulls_last()`:
 | Spark, generic SQL, T-SQL, MySQL, BigQuery | NULLs first | NULLs last |
 | PostgreSQL, Oracle, Snowflake | NULLs last | NULLs first |
 
-An explicit `NULLS FIRST` or `NULLS LAST` always wins. A plain `ORDER BY`
-name means a `SELECT` alias before a same-named table column, as standard
-SQL specifies.
+The same applies to `ORDER BY` inside a window. An explicit `NULLS FIRST`
+or `NULLS LAST` always wins. A plain `ORDER BY` name means a `SELECT` alias
+before a same-named table column, as standard SQL specifies.
 
 ### Dialect differences
 
@@ -205,6 +207,14 @@ rejects it rather than guess:
   join, because SQLGlot represents it exactly like the comma form `FROM a, b`.
 - When an aggregate query's `SELECT` order differs from the `GROUP BY` order,
   or a key is not selected, unaliased aggregates must be given an alias.
+- Window functions must be given an alias, because Spark names the column
+  after the whole window definition.
+- `ROW_NUMBER()` numbers rows that tie on the window's `ORDER BY` in an
+  arbitrary order, in Spark as in every database. Add a unique column to the
+  window's `ORDER BY` for repeatable results.
+- In a query with window functions, `ORDER BY` must use selected columns or
+  aliases: computing a window regroups the rows, so sorting earlier would
+  not last.
 
 ## How correctness is verified
 

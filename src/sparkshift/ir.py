@@ -205,6 +205,41 @@ class Cast:
     safe: bool = False
 
 
+@dataclass(frozen=True)
+class SortKey:
+    """One sort key: ascending unless ``descending``, with NULLs placed first
+    or last. The NULL placement is always explicit, because databases disagree
+    on the default."""
+
+    expression: "Expression"
+    descending: bool
+    nulls_first: bool
+
+
+class WindowFunction(Enum):
+    """Functions that only exist over a window: they number or rank rows."""
+
+    ROW_NUMBER = "row_number"
+    RANK = "rank"
+    DENSE_RANK = "dense_rank"
+
+
+@dataclass(frozen=True)
+class WindowCall:
+    """A function computed for each row over related rows, as in
+    ``SUM(amount) OVER (PARTITION BY customer_id ORDER BY order_date)``.
+
+    Rows with the same ``partition_by`` values form a window. With
+    ``order_by``, an aggregate covers the rows up to the current one,
+    including all rows that tie with it (SQL's default frame); without it,
+    the whole window.
+    """
+
+    function: "WindowFunction | AggregateCall"
+    partition_by: tuple["Expression", ...] = ()
+    order_by: tuple[SortKey, ...] = ()
+
+
 Expression: TypeAlias = (
     Column
     | Literal
@@ -222,6 +257,7 @@ Expression: TypeAlias = (
     | FunctionCall
     | Interval
     | Cast
+    | WindowCall
 )
 
 _EXPRESSION_TYPES = get_args(Expression)
@@ -250,6 +286,8 @@ def map_children(
 def _map_value(value: object, function: Callable[[Expression], Expression]) -> object:
     if isinstance(value, _EXPRESSION_TYPES):
         return function(value)  # type: ignore[arg-type]
+    if isinstance(value, SortKey):
+        return replace(value, expression=function(value.expression))
     if isinstance(value, tuple):
         return tuple(_map_value(item, function) for item in value)
     return value
@@ -352,17 +390,6 @@ class Distinct:
     """Remove duplicate rows; NULLs compare as equal, as in SQL's DISTINCT."""
 
     source: "Relation"
-
-
-@dataclass(frozen=True)
-class SortKey:
-    """One sort key: ascending unless ``descending``, with NULLs placed first
-    or last. The NULL placement is always explicit, because databases disagree
-    on the default."""
-
-    expression: Expression
-    descending: bool
-    nulls_first: bool
 
 
 @dataclass(frozen=True)

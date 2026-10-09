@@ -60,6 +60,23 @@ _AGGREGATE_FUNCTIONS: dict[type[exp.Expression], ir.AggregateFunction] = {
     exp.Max: ir.AggregateFunction.MAX,
 }
 
+_WINDOW_FUNCTIONS: dict[type[exp.Expression], ir.WindowFunction] = {
+    exp.RowNumber: ir.WindowFunction.ROW_NUMBER,
+    exp.Rank: ir.WindowFunction.RANK,
+    exp.DenseRank: ir.WindowFunction.DENSE_RANK,
+}
+
+# Parts of an OVER clause SparkShift does not handle yet.
+_WINDOW_PART_NAMES = {"spec": "window frame", "alias": "named window"}
+_WINDOW_FRAME_HINT = (
+    "Explicit frames such as ROWS BETWEEN are not supported yet; without one, "
+    "SQL's default frame applies."
+)
+_WINDOW_PLACE_HINT = (
+    "Window functions are supported in the SELECT list of queries without "
+    "GROUP BY, with an alias."
+)
+
 _GROUP_PART_NAMES = {
     "grouping_sets": "GROUPING SETS",
     "cube": "CUBE",
@@ -328,6 +345,9 @@ class _Translator:
         # Where aggregate functions are currently not allowed, for diagnostics
         # (for example "WHERE"); None while translating where they are allowed.
         self.no_aggregates_in: str | None = None
+        # Why window functions are not allowed here, as a diagnostic message;
+        # None only while translating a SELECT list that may contain them.
+        self.no_windows: str | None = "window function outside the SELECT list"
 
     def statement(self, tree: exp.Expression) -> ir.Relation:
         if not isinstance(tree, exp.Select):
@@ -367,8 +387,14 @@ class _Translator:
             value = select.args.get(part)
             if part == "expressions":
                 self.no_aggregates_in = None if aggregating else "SELECT"
+                outside = self.no_windows
+                if aggregating:
+                    self.no_windows = "window function in an aggregate query"
+                else:
+                    self.no_windows = None
                 items = self.projection(value)
                 self.no_aggregates_in = None
+                self.no_windows = outside
             elif part == "from_":
                 source = self.from_(select)
             elif not value:
@@ -415,6 +441,18 @@ class _Translator:
                         "ORDER BY key that is not a column of the SELECT DISTINCT list",
                         key.node.this,
                         hint="With DISTINCT, order by selected columns or aliases.",
+                    )
+            return None
+        if not sort_output and any(_has_window(item) for item in items):
+            # Sorting before the projection would not survive it: computing a
+            # window regroups the rows.
+            for key in keys:
+                if key.output is None:
+                    self.unsupported(
+                        "ORDER BY key that is not selected, in a query with "
+                        "window functions",
+                        key.node.this,
+                        hint="Select the column too, or order by an alias.",
                     )
             return None
 
@@ -817,6 +855,14 @@ class _Translator:
                 hint="Add an alias, for example: -amount AS negative_amount.",
             )
             return None
+        if expression is not None and _has_window(expression):
+            self.unsupported(
+                "window function without an alias",
+                node,
+                hint="Spark names this column after the whole window definition; "
+                "add an alias, for example: ... AS row_num.",
+            )
+            return None
         if expression is not None and _calls_function(expression):
             self.unsupported(
                 "function result without an alias", node, _FUNCTION_ALIAS_HINT
@@ -1170,6 +1216,8 @@ class _Translator:
             return self.negation(node)
         if isinstance(node, exp.Not):
             return self.not_(node)
+        if isinstance(node, exp.Window):
+            return self.window(node)
         handler = (
             self._PREDICATES_AND_CONDITIONALS.get(type(node))
             or self._FUNCTIONS.get(type(node))
@@ -1192,6 +1240,111 @@ class _Translator:
         else:
             self.unsupported(f"{node.key.upper()} expression", node)
         return None
+
+    # --- Window functions ------------------------------------------------
+
+    def window(self, node: exp.Window) -> ir.Expression | None:
+        """Translate ``function OVER (PARTITION BY ... ORDER BY ...)``."""
+        if self.no_windows is not None:
+            self.unsupported(self.no_windows, node, hint=_WINDOW_PLACE_HINT)
+            return None
+        supported = True
+        for part, value in node.args.items():
+            if value and part not in ("this", "partition_by", "order", "over"):
+                name = _WINDOW_PART_NAMES.get(part, f"window {part.upper()}")
+                hint = _WINDOW_FRAME_HINT if part == "spec" else None
+                self.unsupported(name, node, hint)
+                supported = False
+        order = node.args.get("order")
+        if order is not None:
+            supported &= self.check_parts(order, {"expressions"}, "window ORDER BY")
+
+        # Nothing inside a window may contain another window, and aggregates
+        # inside it belong to the window function, not to the query.
+        outside_windows, outside_aggregates = self.no_windows, self.no_aggregates_in
+        self.no_windows = "window function inside a window"
+        try:
+            function = self.window_function(node.this)
+            self.no_aggregates_in = "a window's PARTITION BY or ORDER BY"
+            partition_by = [
+                self.expression(key) for key in node.args.get("partition_by") or []
+            ]
+            order_by = [
+                self.window_sort_key(key)
+                for key in (order.expressions if order is not None else [])
+            ]
+        finally:
+            self.no_windows, self.no_aggregates_in = outside_windows, outside_aggregates
+
+        if not supported or function is None:
+            return None
+        if any(key is None for key in partition_by) or None in order_by:
+            return None
+        return ir.WindowCall(
+            function,
+            tuple(key for key in partition_by if key is not None),
+            tuple(key for key in order_by if key is not None),
+        )
+
+    def window_function(
+        self, node: exp.Expression
+    ) -> ir.WindowFunction | ir.AggregateCall | None:
+        """The function computed over a window: a ranking or an aggregate."""
+        if isinstance(node, exp.IgnoreNulls | exp.RespectNulls):
+            name = (
+                "IGNORE NULLS" if isinstance(node, exp.IgnoreNulls) else "RESPECT NULLS"
+            )
+            self.unsupported(name, node)
+            return None
+        if isinstance(node, exp.Window):
+            # SQLGlot represents Oracle's MAX(x) KEEP (...) as a nested window.
+            self.unsupported("KEEP (DENSE_RANK FIRST/LAST ...)", node)
+            return None
+        ranking = _WINDOW_FUNCTIONS.get(type(node))
+        if ranking is not None:
+            if any(node.args.values()):
+                # PostgreSQL's hypothetical RANK(x) WITHIN GROUP, for example.
+                self.unsupported(f"{ranking.name} with arguments", node)
+                return None
+            return ranking
+        aggregate = _AGGREGATE_FUNCTIONS.get(type(node))
+        if aggregate is not None:
+            if isinstance(node.this, exp.Distinct):
+                self.unsupported(
+                    f"{aggregate.name}(DISTINCT ...) over a window",
+                    node,
+                    hint="Spark does not support DISTINCT in window functions.",
+                )
+                return None
+            self.no_aggregates_in = None
+            return self.aggregate_call(node, aggregate)  # type: ignore[arg-type]
+        name = node.sql_name() if isinstance(node, exp.Func) else node.key
+        self.unsupported(f"window function {name.upper()}", node)
+        return None
+
+    def window_sort_key(self, node: exp.Ordered) -> ir.SortKey | None:
+        """Translate a window's ORDER BY key. SQLGlot sets ``nulls_first``
+        from the dialect's default, as for a query's ORDER BY."""
+        if not self.check_parts(
+            node, {"this", "desc", "nulls_first"}, "window ORDER BY"
+        ):
+            return None
+        if node.this.find(exp.Column) is None:
+            self.unsupported(
+                "constant in a window ORDER BY",
+                node.this,
+                hint="In a window, ORDER BY 1 sorts by the constant 1, "
+                "not by a column.",
+            )
+            return None
+        expression = self.expression(node.this)
+        if expression is None:
+            return None
+        return ir.SortKey(
+            expression,
+            descending=bool(node.args.get("desc")),
+            nulls_first=bool(node.args.get("nulls_first")),
+        )
 
     # --- Predicates, conditionals, and casts ------------------------------
 
@@ -1969,6 +2122,12 @@ def _calls_function(expression: ir.Expression) -> bool:
     if isinstance(expression, ir.FunctionCall | ir.Interval):
         return True
     return any(_calls_function(child) for child in ir.children(expression))
+
+
+def _has_window(expression: ir.Expression) -> bool:
+    if isinstance(expression, ir.WindowCall):
+        return True
+    return any(_has_window(child) for child in ir.children(expression))
 
 
 def _without_implicit_time_cast(node: exp.Expression) -> exp.Expression:

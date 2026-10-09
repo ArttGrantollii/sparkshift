@@ -22,7 +22,7 @@ RESULT_VARIABLE = "result"
 _Argument: TypeAlias = ir.Expression | ir.SortKey | str
 
 # Names the generated code already uses; table variables must not shadow them.
-_RESERVED_NAMES = frozenset({RESULT_VARIABLE, "spark", "F", "Decimal"})
+_RESERVED_NAMES = frozenset({RESULT_VARIABLE, "spark", "F", "Decimal", "Window"})
 
 _INDENT = "    "
 _MAX_LINE_LENGTH = 88
@@ -85,8 +85,10 @@ class _Emitter:
         self.line_length = line_length
         self.uses_functions = False
         self.uses_decimal = False
+        self.uses_window = False
         self.table_variables: dict[tuple[str, ...], str] = {}
         self.table_uses: Counter[tuple[str, ...]] = Counter()
+        self.window_variables: dict[_WindowKey, str] = {}
 
     def program(self, plan: ir.Relation) -> str:
         self.table_uses = Counter(
@@ -95,13 +97,26 @@ class _Emitter:
         # Queries that combine tables declare each source table once, up front.
         if any(isinstance(node, ir.Join) for node in _walk(plan)):
             self.table_variables = table_variables(plan)
+        # Each distinct window is declared once, so calls can share it.
+        self.window_variables = window_variables(
+            plan, set(self.table_variables.values())
+        )
 
         statement = f"{RESULT_VARIABLE} = {self.relation(plan)}\n"
+        windows = [
+            self.window_variable(name, key)
+            for key, name in self.window_variables.items()
+        ]
+        imports = []
+        if self.uses_window:
+            imports.append("from pyspark.sql import Window")
+        if self.uses_functions:
+            imports.append("from pyspark.sql import functions as F")
         sections = []
         if self.uses_decimal:
             sections.append("from decimal import Decimal")
-        if self.uses_functions:
-            sections.append("from pyspark.sql import functions as F")
+        if imports:
+            sections.append("\n".join(imports))
         if self.table_variables:
             sections.append(
                 "\n".join(
@@ -109,9 +124,46 @@ class _Emitter:
                     for parts, name in self.table_variables.items()
                 )
             )
-        # Standard-library imports, third-party imports, table variables, and
-        # the result are separated by blank lines.
+        if windows:
+            sections.append("\n".join(windows))
+        # Standard-library imports, third-party imports, table variables,
+        # windows, and the result are separated by blank lines.
         return "\n\n".join([*sections, statement])
+
+    def window_variable(self, name: str, key: "_WindowKey") -> str:
+        """``name = Window.partitionBy(...).orderBy(...)``, on one line if it
+        fits, otherwise one call per line."""
+        calls = self.window_calls(key)
+        inline = f"{name} = Window{''.join(calls)}"
+        if "\n" not in inline and len(inline) <= self.line_length:
+            return inline
+        lines = [f"Window{calls[0]}", *calls[1:]]
+        body = "".join(_indent(line) + "\n" for line in lines)
+        return f"{name} = (\n{body})"
+
+    def window_calls(self, key: "_WindowKey") -> list[str]:
+        self.uses_window = True
+        partition_by, order_by = key
+        calls = []
+        if partition_by or not order_by:
+            # An empty partitionBy() is one window over all rows: OVER ().
+            calls.append(self.call("partitionBy", partition_by))
+        if order_by:
+            calls.append(self.call("orderBy", order_by))
+        return calls
+
+    def window_name(self, call: ir.WindowCall) -> str:
+        """The variable holding a call's window, or the window itself when the
+        code is a single expression with no variables."""
+        key = (call.partition_by, call.order_by)
+        name = self.window_variables.get(key)
+        return name if name is not None else f"Window{''.join(self.window_calls(key))}"
+
+    def window_function(self, call: ir.WindowCall) -> str:
+        if isinstance(call.function, ir.WindowFunction):
+            self.uses_functions = True
+            return f"F.{call.function.value}()"
+        return self.expression(call.function)
 
     # --- Relations -------------------------------------------------------
 
@@ -265,6 +317,9 @@ class _Emitter:
             case ir.InList(expression=inner, values=values):
                 receiver = f"{self.operand(inner, _ATOM)}.isin"
                 return self.wrapped_call(receiver, list(values), column)
+            case ir.WindowCall(function=ir.AggregateCall() as function):
+                suffix = f".over({self.window_name(expression)})"
+                return self.suffixed(function, suffix, column)
             case ir.Between(expression=inner, low=low, high=high):
                 receiver = f"{self.operand(inner, _ATOM)}.between"
                 return self.wrapped_call(receiver, [low, high], column)
@@ -430,6 +485,9 @@ class _Emitter:
             case ir.Cast(expression=inner, data_type=data_type, safe=safe):
                 name = "try_cast" if safe else "cast"
                 return self.method(inner, name, python_string(data_type)), _ATOM
+            case ir.WindowCall():
+                window = self.window_name(expression)
+                return f"{self.window_function(expression)}.over({window})", _ATOM
             case ir.BinaryOp(op=op, left=left, right=right):
                 precedence = _PRECEDENCE[op]
                 if op is ir.BinaryOperator.OR:
@@ -553,6 +611,55 @@ def _walk(plan: ir.Relation) -> Iterator[ir.Relation]:
             | ir.Limit(source=source)
         ):
             yield from _walk(source)
+
+
+# A window's identity: its PARTITION BY and ORDER BY.
+_WindowKey: TypeAlias = tuple[tuple[ir.Expression, ...], tuple[ir.SortKey, ...]]
+
+
+def window_variables(plan: ir.Relation, taken: set[str]) -> dict[_WindowKey, str]:
+    """Name each distinct window in the order the code uses them: ``window``
+    if there is one, ``window_1``, ``window_2``, ... if there are several.
+    Names already ``taken`` by table variables get a ``_spec`` suffix."""
+    keys: list[_WindowKey] = []
+    for expression in _expressions(plan):
+        if isinstance(expression, ir.WindowCall):
+            key = (expression.partition_by, expression.order_by)
+            if key not in keys:
+                keys.append(key)
+    names = (
+        ["window"] if len(keys) == 1 else [f"window_{n + 1}" for n in range(len(keys))]
+    )
+    return {
+        key: f"{name}_spec" if name in taken else name
+        for key, name in zip(keys, names, strict=True)
+    }
+
+
+def _expressions(plan: ir.Relation) -> Iterator[ir.Expression]:
+    """Yield every expression in the plan and all their sub-expressions, from
+    the source relation up, as the generated chain uses them."""
+    for node in reversed(list(_walk(plan))):
+        roots: Sequence[ir.Expression] = ()
+        match node:
+            case ir.Join(condition=condition) if condition is not None:
+                roots = (condition,)
+            case ir.Filter(condition=condition):
+                roots = (condition,)
+            case ir.Aggregate(keys=keys, aggregates=aggregates):
+                roots = (*keys, *aggregates)
+            case ir.Project(items=items):
+                roots = items
+            case ir.Sort(keys=sort_keys):
+                roots = tuple(key.expression for key in sort_keys)
+        for root in roots:
+            yield from _subexpressions(root)
+
+
+def _subexpressions(expression: ir.Expression) -> Iterator[ir.Expression]:
+    yield expression
+    for child in ir.children(expression):
+        yield from _subexpressions(child)
 
 
 def _sort_suffix(key: ir.SortKey) -> str:

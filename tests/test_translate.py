@@ -816,9 +816,9 @@ def test_grouping_without_aggregates() -> None:
 
 
 def test_aggregates_inside_window_functions_do_not_make_an_aggregation() -> None:
-    issues = unsupported_issues("SELECT COUNT(*) OVER () AS n FROM t")
+    plan = translate_sql("SELECT a, COUNT(*) OVER () AS n FROM t")
 
-    assert issues == [("WINDOW expression", "COUNT(*) OVER ()")]
+    assert plan == Project(T, (A, Alias(ir.WindowCall(COUNT_ROWS), "n")))
 
 
 @pytest.mark.parametrize(
@@ -1985,3 +1985,240 @@ def test_unknown_parts_of_a_sort_key_are_rejected() -> None:
 
     [issue] = caught.value.issues
     assert issue.message == "ORDER BY WITH_FILL"
+
+
+# --- Window functions --------------------------------------------------------
+
+
+def window_item(sql: str, dialect: str | None = None) -> ir.WindowCall:
+    [item] = select_items(sql, dialect)
+    assert isinstance(item, Alias)
+    assert isinstance(item.expression, ir.WindowCall)
+    return item.expression
+
+
+@pytest.mark.parametrize(
+    ("function", "ranking"),
+    [
+        ("ROW_NUMBER", ir.WindowFunction.ROW_NUMBER),
+        ("RANK", ir.WindowFunction.RANK),
+        ("DENSE_RANK", ir.WindowFunction.DENSE_RANK),
+    ],
+)
+def test_ranking_functions(function: str, ranking: ir.WindowFunction) -> None:
+    call = window_item(
+        f"SELECT {function}() OVER (PARTITION BY a ORDER BY b DESC) AS r FROM t"
+    )
+
+    assert call == ir.WindowCall(ranking, (A,), (descending(B),))
+
+
+def test_aggregate_over_a_partition() -> None:
+    call = window_item("SELECT SUM(c) OVER (PARTITION BY a, b) AS s FROM t")
+
+    assert call == ir.WindowCall(
+        ir.AggregateCall(ir.AggregateFunction.SUM, (C,)), (A, B)
+    )
+
+
+def test_count_rows_over_the_whole_result() -> None:
+    assert window_item("SELECT COUNT(*) OVER () AS n FROM t") == ir.WindowCall(
+        COUNT_ROWS
+    )
+
+
+def test_running_aggregate_keeps_its_window_order() -> None:
+    call = window_item("SELECT AVG(c) OVER (ORDER BY a, b DESC) AS s FROM t")
+
+    assert call == ir.WindowCall(
+        ir.AggregateCall(ir.AggregateFunction.AVG, (C,)),
+        (),
+        (ascending(A), descending(B)),
+    )
+
+
+@pytest.mark.parametrize(
+    ("sql", "dialect", "key"),
+    [
+        ("SELECT RANK() OVER (ORDER BY b) AS r FROM t", None, ascending(B)),
+        (
+            "SELECT RANK() OVER (ORDER BY b) AS r FROM t",
+            "postgres",
+            ascending(B, nulls_first=False),
+        ),
+        (
+            "SELECT RANK() OVER (ORDER BY b DESC) AS r FROM t",
+            "oracle",
+            descending(B, nulls_first=True),
+        ),
+        (
+            "SELECT RANK() OVER (ORDER BY b NULLS LAST) AS r FROM t",
+            None,
+            ascending(B, nulls_first=False),
+        ),
+    ],
+)
+def test_window_null_placement_follows_the_source_dialect(
+    sql: str, dialect: str | None, key: ir.SortKey
+) -> None:
+    assert window_item(sql, dialect).order_by == (key,)
+
+
+def test_windows_are_computed_after_where_and_before_order_by() -> None:
+    plan = translate_sql(
+        "SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM t WHERE b > 1 ORDER BY rn"
+    )
+
+    numbered = ir.WindowCall(ir.WindowFunction.ROW_NUMBER, (), (ascending(A),))
+    assert plan == ir.Sort(
+        Project(
+            ir.Filter(T, BinaryOp(BinaryOperator.GREATER, B, Literal(1))),
+            (A, Alias(numbered, "rn")),
+        ),
+        (ascending(Column(("rn",))),),
+    )
+
+
+def test_window_next_to_select_star() -> None:
+    plan = translate_sql("SELECT *, RANK() OVER (ORDER BY a) AS r FROM t")
+
+    ranked = ir.WindowCall(ir.WindowFunction.RANK, (), (ascending(A),))
+    assert plan == Project(T, (Star(), Alias(ranked, "r")))
+
+
+@pytest.mark.parametrize(
+    ("sql", "dialect", "message"),
+    [
+        (
+            "SELECT a FROM t WHERE ROW_NUMBER() OVER (ORDER BY a) = 1",
+            None,
+            "window function outside the SELECT list",
+        ),
+        (
+            "SELECT a FROM t ORDER BY RANK() OVER (ORDER BY a)",
+            None,
+            "window function outside the SELECT list",
+        ),
+        (
+            "SELECT a, RANK() OVER (ORDER BY SUM(b)) AS r FROM t GROUP BY a",
+            None,
+            "window function in an aggregate query",
+        ),
+        (
+            "SELECT SUM(SUM(b)) OVER () AS s FROM t",
+            None,
+            "aggregate function SUM in another aggregate function",
+        ),
+        (
+            "SELECT RANK() OVER (PARTITION BY ROW_NUMBER() OVER (ORDER BY a) "
+            "ORDER BY b) AS r FROM t",
+            None,
+            "window function inside a window",
+        ),
+        (
+            "SELECT ROW_NUMBER() OVER (PARTITION BY SUM(a) ORDER BY b) AS r FROM t",
+            None,
+            "aggregate function SUM in a window's PARTITION BY or ORDER BY",
+        ),
+        (
+            "SELECT SUM(a) OVER (ORDER BY b ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) "
+            "AS s FROM t",
+            None,
+            "window frame",
+        ),
+        (
+            "SELECT SUM(a) OVER w AS s FROM t WINDOW w AS (PARTITION BY b)",
+            None,
+            "named window",
+        ),
+        ("SELECT LAG(a) OVER (ORDER BY b) AS l FROM t", None, "window function LAG"),
+        (
+            "SELECT FIRST_VALUE(a IGNORE NULLS) OVER (ORDER BY b) AS f FROM t",
+            None,
+            "IGNORE NULLS",
+        ),
+        (
+            "SELECT COUNT(DISTINCT a) OVER (PARTITION BY b) AS n FROM t",
+            None,
+            "COUNT(DISTINCT ...) over a window",
+        ),
+        ("SELECT RANK(a) OVER (ORDER BY b) AS r FROM t", None, "RANK with arguments"),
+        (
+            "SELECT MAX(a) KEEP (DENSE_RANK FIRST ORDER BY b) OVER (PARTITION BY c) "
+            "AS m FROM t",
+            "oracle",
+            "KEEP (DENSE_RANK FIRST/LAST ...)",
+        ),
+        (
+            "SELECT ROW_NUMBER() OVER (ORDER BY 1) AS rn FROM t",
+            None,
+            "constant in a window ORDER BY",
+        ),
+        (
+            "SELECT ROW_NUMBER() OVER (ORDER BY a) FROM t",
+            None,
+            "window function without an alias",
+        ),
+        (
+            "SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM t ORDER BY b",
+            None,
+            "ORDER BY key that is not selected, in a query with window functions",
+        ),
+    ],
+)
+def test_unsupported_window(sql: str, dialect: str | None, message: str) -> None:
+    assert message in [issue for issue, _ in unsupported_issues(sql, dialect)]
+
+
+def test_every_window_issue_is_reported() -> None:
+    issues = unsupported_issues("SELECT LAG(a) OVER (ORDER BY 1) AS l FROM t")
+
+    assert issues == [
+        ("window function LAG", "LAG(a)"),
+        ("constant in a window ORDER BY", "1"),
+    ]
+
+
+def test_order_by_a_window_alias_is_allowed_with_distinct() -> None:
+    plan = translate_sql(
+        "SELECT DISTINCT a, DENSE_RANK() OVER (ORDER BY a) AS r FROM t ORDER BY r"
+    )
+
+    ranked = ir.WindowCall(ir.WindowFunction.DENSE_RANK, (), (ascending(A),))
+    assert plan == ir.Sort(
+        ir.Distinct(Project(T, (A, Alias(ranked, "r")))),
+        (ascending(Column(("r",))),),
+    )
+
+
+def test_windows_report_only_the_sort_keys_they_do_not_output() -> None:
+    issues = unsupported_issues(
+        "SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM t ORDER BY rn, b"
+    )
+
+    assert issues == [
+        ("ORDER BY key that is not selected, in a query with window functions", "b")
+    ]
+
+
+def test_window_sort_key_issues_are_reported() -> None:
+    issues = unsupported_issues("SELECT RANK() OVER (ORDER BY my_udf(a)) AS r FROM t")
+
+    assert issues == [("function MY_UDF", "MY_UDF(a)")]
+
+
+def test_unknown_parts_of_a_window_sort_key_are_rejected() -> None:
+    tree = parse_sql("SELECT RANK() OVER (ORDER BY a) AS r FROM t")
+    tree.find(exp.Window).args["order"].expressions[0].set("with_fill", exp.WithFill())
+
+    with pytest.raises(UnsupportedSQLError) as caught:
+        translate(tree)
+
+    [issue] = caught.value.issues
+    assert issue.message == "window ORDER BY with WITH_FILL"
+
+
+def test_unsupported_expression_is_named_by_its_kind() -> None:
+    issues = unsupported_issues("SELECT (SELECT 1) AS x FROM t")
+
+    assert issues == [("SUBQUERY expression", "(SELECT 1)")]
