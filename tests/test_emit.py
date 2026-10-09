@@ -692,3 +692,33 @@ def test_generic_children_cover_every_expression_field() -> None:
 )
 def test_function_code(expression: ir.Expression, expected: str) -> None:
     assert emit_expression(expression) == expected
+
+
+# --- Dates and timestamps ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        (ir.Interval("days", Literal(3)), "F.make_interval(days=F.lit(3))"),
+        (ir.Interval("months", A), 'F.make_interval(months=F.col("a"))'),
+        (
+            BinaryOp(BinaryOperator.ADD, A, ir.Interval("weeks", Literal(2))),
+            'F.col("a") + F.make_interval(weeks=F.lit(2))',
+        ),
+        (
+            ir.FunctionCall("date_trunc", (Literal("month"), A)),
+            'F.date_trunc("month", F.col("a"))',
+        ),
+        (ir.FunctionCall("trunc", (A, Literal("year"))), 'F.trunc(F.col("a"), "year")'),
+        (ir.FunctionCall("current_date", ()), "F.current_date()"),
+        (ir.FunctionCall("datediff", (A, B)), 'F.datediff(F.col("a"), F.col("b"))'),
+    ],
+)
+def test_date_code(expression: ir.Expression, expected: str) -> None:
+    assert emit_expression(expression) == expected
+
+
+def test_interval_rejects_unknown_units() -> None:
+    with pytest.raises(ValueError, match="Unsupported interval unit"):
+        ir.Interval("hours", Literal(1))

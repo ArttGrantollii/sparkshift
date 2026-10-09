@@ -1159,7 +1159,7 @@ def test_grouping_check_sees_columns_inside_case() -> None:
         ("SELECT CAST(a AS CHAR(3)) AS x FROM t", None, "CAST to CHAR(3)"),
         ("SELECT CAST(a AS DECIMAL) AS x FROM t", None, "CAST to DECIMAL"),
         ("SELECT CAST(a AS TINYINT) AS x FROM t", "tsql", "CAST to TINYINT"),
-        ("SELECT CAST(a AS TIMESTAMP) AS x FROM t", None, "CAST to TIMESTAMP"),
+        ("SELECT CAST(a AS TIMESTAMP(3)) AS x FROM t", None, "CAST to TIMESTAMP(3)"),
         (
             "SELECT CAST(a AS VARCHAR) AS x FROM t",
             "tsql",
@@ -1499,6 +1499,223 @@ def test_issues_inside_functions_are_reported(sql_expression: str) -> None:
     ],
 )
 def test_unknown_parts_of_functions_are_rejected_not_ignored(
+    sql_expression: str, node_type: type, name: str
+) -> None:
+    tree = parse_sql(f"SELECT {sql_expression} AS x FROM t")
+    tree.find(node_type).set("extra", exp.true())
+
+    with pytest.raises(UnsupportedSQLError) as caught:
+        translate(tree)
+
+    assert [issue.message for issue in caught.value.issues] == [f"{name} with EXTRA"]
+
+
+# --- Dates and timestamps ----------------------------------------------------
+
+D = Column(("d",))
+
+
+def plus(base: ir.Expression, unit: str, amount: int) -> ir.BinaryOp:
+    return BinaryOp(BinaryOperator.ADD, base, ir.Interval(unit, Literal(amount)))
+
+
+@pytest.mark.parametrize(
+    ("sql_expression", "dialect", "expected"),
+    [
+        ("EXTRACT(YEAR FROM d)", None, call("year", D)),
+        ("EXTRACT(QUARTER FROM d)", None, call("quarter", D)),
+        ("EXTRACT(DAY FROM d)", None, call("dayofmonth", D)),
+        ("EXTRACT(MINUTE FROM d)", None, call("minute", D)),
+        ("DATEPART(hour, d)", "tsql", call("hour", D)),
+        ("YEAR(d)", None, call("year", D)),
+        # T-SQL and MySQL wrap the argument in a CAST to DATE, which is removed.
+        ("MONTH(d)", "tsql", call("month", D)),
+        ("DAY(d)", "mysql", call("dayofmonth", D)),
+        ("CURRENT_DATE", None, call("current_date")),
+        ("CURRENT_TIMESTAMP", None, call("current_timestamp")),
+        ("GETDATE()", "tsql", call("current_timestamp")),
+        ("NOW()", "postgres", call("current_timestamp")),
+        # Every dialect's day difference becomes datediff(end, start).
+        ("DATEDIFF(a, b)", None, call("datediff", A, B)),
+        ("DATEDIFF(day, a, b)", "tsql", call("datediff", B, A)),
+        ("DATEDIFF(day, a, b)", "snowflake", call("datediff", B, A)),
+        ("DATEDIFF(a, b)", "mysql", call("datediff", A, B)),
+        ("DATE_DIFF(a, b, DAY)", "bigquery", call("datediff", A, B)),
+        ("d + INTERVAL '3' DAY", None, plus(D, "days", 3)),
+        ("INTERVAL '3' DAY + d", None, plus(D, "days", 3)),
+        ("d + INTERVAL '3 days'", "postgres", plus(D, "days", 3)),
+        (
+            "d - INTERVAL '1' MONTH",
+            None,
+            BinaryOp(BinaryOperator.SUBTRACT, D, ir.Interval("months", Literal(1))),
+        ),
+        ("d + INTERVAL '2' WEEK", None, plus(D, "weeks", 2)),
+        ("d + INTERVAL '1' YEAR", None, plus(D, "years", 1)),
+        ("DATEADD(day, 3, d)", "tsql", plus(D, "days", 3)),
+        (
+            "DATEADD(month, a, d)",
+            "snowflake",
+            BinaryOp(BinaryOperator.ADD, D, ir.Interval("months", A)),
+        ),
+        ("DATE_ADD(d, INTERVAL 3 DAY)", "mysql", plus(D, "days", 3)),
+        (
+            "DATE_SUB(d, INTERVAL 3 DAY)",
+            "mysql",
+            BinaryOp(BinaryOperator.SUBTRACT, D, ir.Interval("days", Literal(3))),
+        ),
+        ("DATE_ADD(d, 3)", None, call("date_add", D, Literal(3))),
+        ("DATE_ADD(d, INTERVAL 3 DAY)", None, plus(D, "days", 3)),
+        ("DATE_SUB(d, 3)", None, call("date_sub", D, Literal(3))),
+        ("ADD_MONTHS(d, 1)", None, call("add_months", D, Literal(1))),
+        ("DATE_TRUNC('MONTH', d)", None, call("date_trunc", Literal("month"), D)),
+        (
+            "DATE_TRUNC('quarter', d)",
+            "postgres",
+            call("date_trunc", Literal("quarter"), D),
+        ),
+        ("DATE_TRUNC(d, YEAR)", "bigquery", call("trunc", D, Literal("year"))),
+    ],
+)
+def test_dates(
+    sql_expression: str, dialect: str | None, expected: ir.Expression
+) -> None:
+    assert only_item(f"SELECT {sql_expression} AS x FROM t", dialect) == Alias(
+        expected, "x"
+    )
+
+
+@pytest.mark.parametrize(
+    ("type_name", "dialect", "spark_type"),
+    [
+        ("TIMESTAMP", None, "timestamp"),
+        ("TIMESTAMP_NTZ", None, "timestamp_ntz"),
+        ("TIMESTAMP", "postgres", "timestamp_ntz"),
+        ("TIMESTAMPTZ", "postgres", "timestamp"),
+        ("TIMESTAMP", "snowflake", "timestamp_ntz"),
+        ("TIMESTAMP_LTZ", "snowflake", "timestamp"),
+        ("TIMESTAMP", "oracle", "timestamp_ntz"),
+        ("TIMESTAMP WITH TIME ZONE", "oracle", "timestamp"),
+        ("DATETIME", "mysql", "timestamp_ntz"),
+        ("TIMESTAMP", "mysql", "timestamp"),
+        ("DATETIME", "bigquery", "timestamp_ntz"),
+        ("TIMESTAMP", "bigquery", "timestamp"),
+        ("DATETIME2", "tsql", "timestamp_ntz"),
+        ("DATETIMEOFFSET", "tsql", "timestamp"),
+    ],
+)
+def test_timestamp_casts_choose_point_in_time_or_wall_clock(
+    type_name: str, dialect: str | None, spark_type: str
+) -> None:
+    item = only_item(f"SELECT CAST(a AS {type_name}) AS x FROM t", dialect)
+
+    assert item == Alias(ir.Cast(A, spark_type), "x")
+
+
+@pytest.mark.parametrize(
+    ("sql_expression", "dialect", "message"),
+    [
+        ("EXTRACT(SECOND FROM d)", None, "EXTRACT SECOND"),
+        ("EXTRACT(DOW FROM d)", None, "EXTRACT DOW"),
+        ("EXTRACT(WEEK FROM d)", None, "EXTRACT WEEK"),
+        ("SYSDATE", "oracle", "SYSDATE"),
+        ("DATEDIFF(month, a, b)", "tsql", "DATEDIFF in MONTH"),
+        ("DATE_DIFF(a, b, WEEK)", "bigquery", "DATEDIFF in WEEK"),
+        ("DATEDIFF(day, a, b)", None, "DATEDIFF in an unrecognized form"),
+        ("DATEDIFF(a, b)", "postgres", "DATEDIFF"),
+        ("DATEADD(hour, 1, d)", "tsql", "date arithmetic in HOUR"),
+        ("d + INTERVAL '1' HOUR", None, "date arithmetic in HOUR"),
+        (
+            "DATE_ADD(d, INTERVAL 'x' DAY)",
+            "mysql",
+            "interval amount that is not an integer",
+        ),
+        ("INTERVAL '1' DAY - d", None, "an interval minus a value"),
+        ("INTERVAL '1' DAY + INTERVAL '2' DAY", None, "arithmetic on two intervals"),
+        ("DATE_ADD(d, 3)", "snowflake", "DATE_ADD without a unit"),
+        ("ADD_MONTHS(d, 1)", "oracle", "ADD_MONTHS"),
+        ("ADD_MONTHS(d, 1)", "snowflake", "ADD_MONTHS"),
+        ("DATE_TRUNC('month', d)", "snowflake", "DATE_TRUNC"),
+        ("DATETRUNC(month, d)", "tsql", "DATE_TRUNC"),
+        ("TRUNC(d, 'MM')", "oracle", "DATE_TRUNC"),
+        ("DATE_TRUNC('WEEK', d)", None, "DATE_TRUNC to WEEK"),
+        ("CAST(a AS DATETIME)", "tsql", "CAST to DATETIME"),
+        ("CAST(a AS SMALLDATETIME)", "tsql", "CAST to SMALLDATETIME"),
+        # SQLGlot renders T-SQL TIMESTAMP as ROWVERSION; the hint explains.
+        ("CAST(a AS TIMESTAMP)", "tsql", "CAST to ROWVERSION"),
+        ("CAST(a AS DATETIME)", None, "CAST to DATETIME"),
+    ],
+)
+def test_unsupported_dates(
+    sql_expression: str, dialect: str | None, message: str
+) -> None:
+    messages = [
+        m
+        for m, _ in unsupported_issues(f"SELECT {sql_expression} AS x FROM t", dialect)
+    ]
+
+    assert message in messages
+
+
+@pytest.mark.parametrize(
+    ("sql_expression", "dialect", "hint_fragment"),
+    [
+        ("EXTRACT(DOW FROM d)", None, "Sunday"),
+        ("CAST(a AS DATETIME)", "tsql", "1/300"),
+        ("CAST(a AS TIMESTAMP)", "tsql", "ROWVERSION"),
+        ("ADD_MONTHS(d, 1)", "oracle", "Mar 31"),
+        ("DATEDIFF(day, a, b)", None, "two arguments"),
+    ],
+)
+def test_date_landmines_explain_themselves(
+    sql_expression: str, dialect: str | None, hint_fragment: str
+) -> None:
+    with pytest.raises(UnsupportedSQLError) as caught:
+        translate_sql(f"SELECT {sql_expression} AS x FROM t", dialect)
+
+    [issue] = caught.value.issues
+    assert issue.hint is not None
+    assert hint_fragment in issue.hint
+
+
+def test_unaliased_date_arithmetic_needs_an_alias() -> None:
+    messages = [m for m, _ in unsupported_issues("SELECT d + INTERVAL '1' DAY FROM t")]
+
+    assert messages == ["function result without an alias"]
+
+
+@pytest.mark.parametrize(
+    "sql_expression",
+    [
+        "EXTRACT(YEAR FROM f(a))",
+        "YEAR(f(a))",
+        "DATEDIFF(f(a), b)",
+        "f(a) + INTERVAL '1' DAY",
+        "DATE_ADD(f(a), 1)",
+        "DATEADD(day, f(a), d)",
+        "ADD_MONTHS(f(a), 1)",
+        "DATE_TRUNC('MONTH', f(a))",
+    ],
+)
+def test_issues_inside_date_functions_are_reported(sql_expression: str) -> None:
+    dialect = "snowflake" if sql_expression.startswith("DATEADD") else None
+    issues = unsupported_issues(f"SELECT {sql_expression} AS x FROM t", dialect)
+
+    assert issues == [("function F", "F(a)")]
+
+
+@pytest.mark.parametrize(
+    ("sql_expression", "node_type", "name"),
+    [
+        ("EXTRACT(YEAR FROM d)", exp.Extract, "EXTRACT"),
+        ("YEAR(d)", exp.Year, "YEAR"),
+        ("CURRENT_DATE", exp.CurrentDate, "CURRENT_DATE"),
+        ("DATEDIFF(a, b)", exp.DateDiff, "DATEDIFF"),
+        ("DATE_ADD(d, 1)", exp.DateAdd, "DATE_ADD"),
+        ("ADD_MONTHS(d, 1)", exp.AddMonths, "ADD_MONTHS"),
+        ("DATE_TRUNC('MONTH', d)", exp.DateTrunc, "DATE_TRUNC"),
+    ],
+)
+def test_unknown_parts_of_date_functions_are_rejected_not_ignored(
     sql_expression: str, node_type: type, name: str
 ) -> None:
     tree = parse_sql(f"SELECT {sql_expression} AS x FROM t")

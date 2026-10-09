@@ -123,6 +123,10 @@ _CAST_HINTS = {
         "CHAR(n) pads with spaces differently across databases; "
         "cast to VARCHAR without a length."
     ),
+    exp.DataType.Type.ROWVERSION: (
+        "In T-SQL, TIMESTAMP means ROWVERSION, an automatically generated "
+        "binary row version, not a date and time."
+    ),
     exp.DataType.Type.UTINYINT: (
         "This TINYINT is unsigned (0 to 255) and overflows differently from "
         "Spark's signed TINYINT; cast to SMALLINT."
@@ -172,6 +176,90 @@ _CONSTANT_HINT = (
 _FUNCTION_ALIAS_HINT = (
     "Spark names this column after the exact function spelling (for example "
     "CEIL or CEILING), which SparkShift cannot reproduce; add an alias."
+)
+
+# Date parts with the same meaning in every supported dialect.
+_DATE_PARTS = {
+    "YEAR": "year",
+    "QUARTER": "quarter",
+    "MONTH": "month",
+    "DAY": "dayofmonth",
+    "HOUR": "hour",
+    "MINUTE": "minute",
+}
+_DATE_PART_FUNCTIONS = {
+    exp.Year: "year",
+    exp.Quarter: "quarter",
+    exp.Month: "month",
+    exp.Day: "dayofmonth",
+    exp.DayOfMonth: "dayofmonth",
+    exp.Hour: "hour",
+}
+_WEEKDAY_HINT = (
+    "Weekday and week numbers differ across databases (Sunday is 0 or 1; "
+    "ISO or US weeks)."
+)
+_DATE_PART_HINTS = {
+    "SECOND": "Some databases include fractions of a second and others do not.",
+    "DOW": _WEEKDAY_HINT,
+    "DAYOFWEEK": _WEEKDAY_HINT,
+    "WEEKDAY": _WEEKDAY_HINT,
+    "WEEK": _WEEKDAY_HINT,
+    "ISOWEEK": _WEEKDAY_HINT,
+}
+_DAY_UNITS = frozenset({"DAY", "DAYS"})
+_KNOWN_DATE_UNITS = _DAY_UNITS | {
+    "YEAR",
+    "QUARTER",
+    "MONTH",
+    "WEEK",
+    "HOUR",
+    "MINUTE",
+    "SECOND",
+    "MILLISECOND",
+    "MICROSECOND",
+    "NANOSECOND",
+}
+_DATEDIFF_FORM_HINT = (
+    "In this dialect DATEDIFF takes two arguments, DATEDIFF(end, start), and "
+    "counts days."
+)
+_INTERVAL_UNITS = {
+    "DAY": "days",
+    "DAYS": "days",
+    "WEEK": "weeks",
+    "WEEKS": "weeks",
+    "MONTH": "months",
+    "MONTHS": "months",
+    "YEAR": "years",
+    "YEARS": "years",
+}
+_TRUNC_UNITS = frozenset({"YEAR", "QUARTER", "MONTH"})
+_NO_DATEDIFF_DIALECTS = frozenset({"postgres", "oracle"})
+_NO_DATEDIFF_HINT = "This dialect has no DATEDIFF function."
+_DATEDIFF_UNIT_HINT = (
+    "Only day differences are supported: databases count month and year "
+    "boundaries differently."
+)
+_SYSDATE_HINT = (
+    "Oracle's SYSDATE has no fractional seconds and uses the database server's "
+    "time zone; use CURRENT_TIMESTAMP."
+)
+_ADD_MONTHS_HINT = (
+    "ADD_MONTHS keeps the last day of the month in Oracle and Snowflake "
+    "(Feb 29 + 1 month = Mar 31) but not in Spark; use + INTERVAL '1' MONTH."
+)
+_DATE_TRUNC_HINT = (
+    "Truncation returns the input's type in this dialect (or does not exist), "
+    "and SparkShift cannot see column types. PostgreSQL's DATE_TRUNC and "
+    "BigQuery's DATE_TRUNC are supported."
+)
+_TSQL_IMPRECISE_DATETIMES = frozenset(
+    {exp.DataType.Type.DATETIME, exp.DataType.Type.SMALLDATETIME}
+)
+_TSQL_DATETIME_HINT = (
+    "T-SQL DATETIME rounds to 1/300 of a second and SMALLDATETIME to the "
+    "minute; Spark timestamps keep microseconds. Use DATETIME2."
 )
 
 _TSQL_VARCHAR_HINT = (
@@ -861,8 +949,11 @@ class _Translator:
             return self.negation(node)
         if isinstance(node, exp.Not):
             return self.not_(node)
-        handler = self._PREDICATES_AND_CONDITIONALS.get(type(node))
-        handler = handler or self._FUNCTIONS.get(type(node))
+        handler = (
+            self._PREDICATES_AND_CONDITIONALS.get(type(node))
+            or self._FUNCTIONS.get(type(node))
+            or self._DATE_FUNCTIONS.get(type(node))
+        )
         if handler is not None:
             return handler(self, node)
 
@@ -1060,10 +1151,40 @@ class _Translator:
             scale = int(parameters[1].name) if len(parameters) > 1 else 0
             if 1 <= precision <= 38 and 0 <= scale <= precision:
                 return f"decimal({precision},{scale})"
+        if not parameters:
+            timestamp_type = self.timestamp_type(kind)
+            if timestamp_type is not None:
+                return timestamp_type
         hint = _CAST_HINTS.get(kind)
         if kind is exp.DataType.Type.DECIMAL and not parameters:
             hint = _DECIMAL_DEFAULT_HINT
+        if self.dialect == "tsql" and kind in _TSQL_IMPRECISE_DATETIMES:
+            hint = _TSQL_DATETIME_HINT
         self.unsupported(f"{name} to {data_type.sql(dialect=self.dialect)}", node, hint)
+        return None
+
+    def timestamp_type(self, kind: exp.DataType.Type) -> str | None:
+        """Map a timestamp type to Spark's point-in-time ``timestamp`` or its
+        wall-clock ``timestamp_ntz``.
+
+        SQLGlot already normalizes names per dialect: MySQL's and BigQuery's
+        TIMESTAMP are TIMESTAMPTZ (points in time), BigQuery's DATETIME is
+        TIMESTAMP (wall clock), and T-SQL's TIMESTAMP is ROWVERSION.
+        """
+        types = exp.DataType.Type
+        if kind in (types.TIMESTAMPTZ, types.TIMESTAMPLTZ):
+            return "timestamp"
+        if kind is types.TIMESTAMPNTZ:
+            return "timestamp_ntz"
+        if kind is types.TIMESTAMP:
+            # In generic SQL, TIMESTAMP means Spark's own TIMESTAMP; in the
+            # supported dialects it is a wall-clock time.
+            return "timestamp" if self.dialect is None else "timestamp_ntz"
+        if (kind, self.dialect) in {
+            (types.DATETIME, "mysql"),
+            (types.DATETIME2, "tsql"),
+        }:
+            return "timestamp_ntz"
         return None
 
     _PREDICATES_AND_CONDITIONALS: ClassVar[
@@ -1278,6 +1399,220 @@ class _Translator:
         exp.Least: greatest_or_least,
     }
 
+    # --- Dates and timestamps --------------------------------------------
+
+    def extract(self, node: exp.Extract) -> ir.Expression | None:
+        """EXTRACT(part FROM x), and T-SQL's DATEPART(part, x)."""
+        if not self.check_parts(node, {"this", "expression"}, "EXTRACT"):
+            return None
+        part = node.this.name.upper()
+        name = _DATE_PARTS.get(part)
+        if name is None:
+            self.unsupported(f"EXTRACT {part}", node, _DATE_PART_HINTS.get(part))
+            return None
+        operand = self.expression(node.expression)
+        return None if operand is None else ir.FunctionCall(name, (operand,))
+
+    def date_part_function(self, node: exp.Func) -> ir.Expression | None:
+        """YEAR(x), MONTH(x), DAY(x), QUARTER(x), HOUR(x), DAYOFMONTH(x)."""
+        if not self.check_parts(node, {"this"}, node.sql_name()):
+            return None
+        # T-SQL and MySQL wrap the argument in a CAST to DATE; the year,
+        # month, and day of a timestamp are those of its date.
+        argument = node.this
+        if isinstance(argument, exp.TsOrDsToDate):
+            argument = argument.this
+        operand = self.expression(argument)
+        if operand is None:
+            return None
+        return ir.FunctionCall(_DATE_PART_FUNCTIONS[type(node)], (operand,))
+
+    def current_date_or_time(
+        self, node: exp.CurrentDate | exp.CurrentTimestamp
+    ) -> ir.Expression | None:
+        if isinstance(node, exp.CurrentTimestamp) and node.args.get("sysdate"):
+            self.unsupported("SYSDATE", node, _SYSDATE_HINT)
+            return None
+        name = (
+            "current_date" if isinstance(node, exp.CurrentDate) else "current_timestamp"
+        )
+        if not self.check_parts(node, set(), name.upper()):
+            return None
+        return ir.FunctionCall(name, ())
+
+    def date_diff(self, node: exp.DateDiff) -> ir.Expression | None:
+        """Day differences: DATEDIFF(day, start, end), MySQL's DATEDIFF(end,
+        start), and BigQuery's DATE_DIFF(end, start, DAY). SQLGlot puts the end
+        in ``this`` and the start in ``expression`` for every dialect."""
+        allowed = {"this", "expression", "unit", "date_part_boundary"}
+        if not self.check_parts(node, allowed, "DATEDIFF"):
+            return None
+        if self.dialect in _NO_DATEDIFF_DIALECTS:
+            self.unsupported("DATEDIFF", node, _NO_DATEDIFF_HINT)
+            return None
+        unit = node.args.get("unit")
+        # Rendered rather than read by name: SQLGlot represents some units,
+        # such as BigQuery's WEEK, as nodes without a plain name.
+        unit_name = (
+            unit.sql(dialect=self.dialect).upper() if unit is not None else "DAY"
+        )
+        if unit_name not in _KNOWN_DATE_UNITS:
+            # A three-argument DATEDIFF in a dialect whose DATEDIFF takes two
+            # arguments: SQLGlot reads a column name as the "unit".
+            self.unsupported(
+                "DATEDIFF in an unrecognized form", node, _DATEDIFF_FORM_HINT
+            )
+            return None
+        if unit_name not in _DAY_UNITS:
+            self.unsupported(f"DATEDIFF in {unit_name}", node, _DATEDIFF_UNIT_HINT)
+            return None
+        operands = self.translate_all(
+            [
+                _without_implicit_time_cast(node.this),
+                _without_implicit_time_cast(node.expression),
+            ]
+        )
+        return None if operands is None else ir.FunctionCall("datediff", operands)
+
+    def date_add(self, node: exp.DateAdd | exp.DateSub) -> ir.Expression | None:
+        """DATEADD(unit, n, x), DATE_ADD(x, INTERVAL n unit), DATE_SUB(...)."""
+        name = "DATE_SUB" if isinstance(node, exp.DateSub) else "DATE_ADD"
+        if not self.check_parts(node, {"this", "expression", "unit"}, name):
+            return None
+        amount_node, unit_node = node.expression, node.args.get("unit")
+        if unit_node is None and not isinstance(amount_node, exp.Interval):
+            return self.spark_date_add(node)
+        if isinstance(amount_node, exp.Interval):
+            amount_node, unit_node = amount_node.this, amount_node.args.get("unit")
+        interval = self.interval(amount_node, unit_node, node)
+        base = self.expression(node.this)
+        if interval is None or base is None:
+            return None
+        operator = (
+            ir.BinaryOperator.SUBTRACT
+            if isinstance(node, exp.DateSub)
+            else ir.BinaryOperator.ADD
+        )
+        return ir.BinaryOp(operator, base, interval)
+
+    def spark_date_add(self, node: exp.DateAdd | exp.DateSub) -> ir.Expression | None:
+        """Spark's own DATE_ADD(x, n) and DATE_SUB(x, n), which add whole days and
+        always return a date. Only generic SQL means exactly this."""
+        name = "date_sub" if isinstance(node, exp.DateSub) else "date_add"
+        if self.dialect is not None:
+            self.unsupported(f"{name.upper()} without a unit", node)
+            return None
+        operands = self.translate_all([node.this, node.expression])
+        return None if operands is None else ir.FunctionCall(name, operands)
+
+    def interval_arithmetic(
+        self, node: exp.Add | exp.Sub, operator: ir.BinaryOperator
+    ) -> ir.Expression | None:
+        """x + INTERVAL 'n' unit, x - INTERVAL 'n' unit, INTERVAL 'n' unit + x."""
+        left, right = node.this, node.expression
+        if isinstance(left, exp.Interval) and isinstance(right, exp.Interval):
+            self.unsupported("arithmetic on two intervals", node)
+            return None
+        if isinstance(left, exp.Interval) and isinstance(node, exp.Sub):
+            self.unsupported("an interval minus a value", node)
+            return None
+        interval_node, base_node = (
+            (left, right) if isinstance(left, exp.Interval) else (right, left)
+        )
+        interval = self.interval(
+            interval_node.this, interval_node.args.get("unit"), interval_node
+        )
+        base = self.expression(base_node)
+        if interval is None or base is None:
+            return None
+        return ir.BinaryOp(operator, base, interval)
+
+    def interval(
+        self,
+        amount_node: exp.Expression | None,
+        unit_node: exp.Expression | None,
+        owner: exp.Expression,
+    ) -> ir.Interval | None:
+        unit_name = unit_node.name.upper() if unit_node is not None else ""
+        unit = _INTERVAL_UNITS.get(unit_name)
+        if unit is None:
+            self.unsupported(
+                f"date arithmetic in {unit_name or 'an unknown unit'}",
+                owner,
+                "Only DAY, WEEK, MONTH, and YEAR units are supported so far.",
+            )
+            return None
+        if isinstance(amount_node, exp.Literal) and amount_node.is_string:
+            # MySQL's INTERVAL '3' DAY and PostgreSQL's INTERVAL '3 days'.
+            count = _integer_literal(exp.Literal.number(amount_node.this.strip()))
+            if count is None:
+                self.unsupported("interval amount that is not an integer", owner)
+                return None
+            return ir.Interval(unit, ir.Literal(count))
+        amount = self.expression(amount_node) if amount_node is not None else None
+        return None if amount is None else ir.Interval(unit, amount)
+
+    def add_months(self, node: exp.AddMonths) -> ir.Expression | None:
+        if self.dialect is not None or node.args.get("preserve_end_of_month"):
+            self.unsupported("ADD_MONTHS", node, _ADD_MONTHS_HINT)
+            return None
+        if not self.check_parts(node, {"this", "expression"}, "ADD_MONTHS"):
+            return None
+        operands = self.translate_all([node.this, node.expression])
+        return None if operands is None else ir.FunctionCall("add_months", operands)
+
+    def date_trunc(
+        self, node: exp.DateTrunc | exp.TimestampTrunc
+    ) -> ir.Expression | None:
+        """Truncation, whose result type differs by dialect: PostgreSQL and Spark
+        return a timestamp; BigQuery's DATE_TRUNC returns a date."""
+        allowed = {"this", "unit", "input_type_preserved"}
+        if not self.check_parts(node, allowed, "DATE_TRUNC"):
+            return None
+        returns_timestamp = (
+            self.dialect is None and isinstance(node, exp.DateTrunc)
+        ) or (self.dialect == "postgres" and isinstance(node, exp.TimestampTrunc))
+        returns_date = self.dialect == "bigquery" and isinstance(node, exp.DateTrunc)
+        if node.args.get("input_type_preserved") or not (
+            returns_timestamp or returns_date
+        ):
+            self.unsupported("DATE_TRUNC", node, _DATE_TRUNC_HINT)
+            return None
+        unit = node.args["unit"].name.upper()
+        if unit not in _TRUNC_UNITS:
+            self.unsupported(
+                f"DATE_TRUNC to {unit}",
+                node,
+                "Only YEAR, QUARTER, and MONTH are supported so far.",
+            )
+            return None
+        operand = self.expression(node.this)
+        if operand is None:
+            return None
+        if returns_date:
+            return ir.FunctionCall("trunc", (operand, ir.Literal(unit.lower())))
+        return ir.FunctionCall("date_trunc", (ir.Literal(unit.lower()), operand))
+
+    _DATE_FUNCTIONS: ClassVar[
+        dict[type[exp.Expression], Callable[..., ir.Expression | None]]
+    ] = {
+        exp.Extract: extract,
+        exp.Year: date_part_function,
+        exp.Quarter: date_part_function,
+        exp.Month: date_part_function,
+        exp.Day: date_part_function,
+        exp.DayOfMonth: date_part_function,
+        exp.Hour: date_part_function,
+        exp.CurrentDate: current_date_or_time,
+        exp.CurrentTimestamp: current_date_or_time,
+        exp.DateDiff: date_diff,
+        exp.DateAdd: date_add,
+        exp.DateSub: date_add,
+        exp.AddMonths: add_months,
+        exp.DateTrunc: date_trunc,
+        exp.TimestampTrunc: date_trunc,
+    }
+
     def column(self, node: exp.Column) -> ir.Column | None:
         if isinstance(node.this, exp.Star):
             # Only valid directly in the SELECT list, handled there.
@@ -1335,6 +1670,11 @@ class _Translator:
     def binary(
         self, node: exp.Expression, operator: ir.BinaryOperator
     ) -> ir.Expression | None:
+        if isinstance(node, exp.Add | exp.Sub) and (
+            isinstance(node.expression, exp.Interval)
+            or isinstance(node.this, exp.Interval)
+        ):
+            return self.interval_arithmetic(node, operator)
         hint = self.dialect_semantics_hint(node)
         if hint is not None:
             name = "+ operator" if isinstance(node, exp.Add) else "division"
@@ -1403,10 +1743,19 @@ def _is_aggregate_query(select: exp.Select) -> bool:
 
 
 def _calls_function(expression: ir.Expression) -> bool:
-    """Whether a scalar function call appears anywhere in an expression."""
-    if isinstance(expression, ir.FunctionCall):
+    """Whether a scalar function call (including an interval, which becomes
+    make_interval) appears anywhere in an expression."""
+    if isinstance(expression, ir.FunctionCall | ir.Interval):
         return True
     return any(_calls_function(child) for child in ir.children(expression))
+
+
+def _without_implicit_time_cast(node: exp.Expression) -> exp.Expression:
+    """Remove the string-to-timestamp conversion SQLGlot inserts around T-SQL
+    DATEDIFF arguments; Spark's datediff accepts dates and timestamps."""
+    if isinstance(node, exp.TimeStrToTime):
+        return node.this
+    return node
 
 
 def _is_max_length(parameters: list[exp.Expression]) -> bool:

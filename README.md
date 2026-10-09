@@ -81,10 +81,14 @@ UnsupportedSQLError: 2 unsupported constructs:
 | `CAST`, `TRY_CAST`, `::` to integer types, `DECIMAL(p, s)`, `DOUBLE`, `VARCHAR`/`TEXT`/`STRING`, `DATE`, `BOOLEAN` | Supported |
 | String functions: `UPPER`, `LOWER`, `LENGTH`/`LEN`/`CHAR_LENGTH`, `TRIM`/`LTRIM`/`RTRIM`, `SUBSTRING`/`SUBSTR`, `CONCAT`, `\|\|`, `REPLACE`, `LEFT`, `RIGHT` | Supported, with dialect rules below |
 | Numeric functions: `ABS`, `ROUND`, `CEIL`/`CEILING`, `FLOOR`, `POWER`, `SQRT`, `SIGN`, `LN`, `LOG(base, x)`, `EXP`, `GREATEST`, `LEAST` | Supported, with dialect rules below |
+| Date parts: `EXTRACT`/`DATEPART`/`YEAR`/`MONTH`/`DAY`/… for year, quarter, month, day, hour, minute | Supported |
+| Date arithmetic in days, weeks, months, years: `+`/`-` `INTERVAL`, `DATEADD`, `DATE_ADD`, `DATE_SUB` | Supported; keeps the input type |
+| Day differences: `DATEDIFF` and `DATE_DIFF` in days | Supported, with each dialect's argument order |
+| `DATE_TRUNC` to year, quarter, month; `CURRENT_DATE`, `CURRENT_TIMESTAMP`; casts to timestamp types | Supported, with dialect rules below |
 | `NATURAL`, semi, anti, and as-of joins; joins to subqueries; `LATERAL` and `APPLY` | Unsupported — rejected with an error |
 | `GROUP BY` expressions, `ROLLUP`, `CUBE`, `GROUPING SETS`, `AVG(DISTINCT ...)` | Unsupported — rejected with an error |
 | `IN (subquery)`, `LIKE ... ESCAPE`, `IS TRUE`/`IS FALSE`, casts to `FLOAT`/`REAL`, `CHAR(n)`/`VARCHAR(n)`, unparameterized `DECIMAL`, and timestamps | Unsupported — rejected with an error |
-| Everything else, including `ORDER BY`, window functions, date functions, and other functions | Unsupported — rejected with an error |
+| Everything else, including `ORDER BY`, window functions, date formatting and parsing, and other functions | Unsupported — rejected with an error |
 
 Support grows feature by feature; see the [roadmap](ROADMAP.md).
 
@@ -101,6 +105,26 @@ behavior:
 | `CONCAT(...)` | PostgreSQL, T-SQL, Oracle | Skips NULL inputs | `F.concat_ws("", ...)` |
 | `a \|\| b` | Oracle | Treats NULL as an empty string | `F.concat_ws("", a, b)` |
 | `a \|\| b` | MySQL | Logical OR, not concatenation | `a \| b` |
+| `DATEDIFF(day, start, end)` | T-SQL, Snowflake | Arguments in the opposite order to Spark | `F.datediff(end, start)` |
+| `x + INTERVAL '3' DAY`, `DATEADD(day, 3, x)` | All | Keeps the input type (a timestamp keeps its time of day) | `x + F.make_interval(days=...)` |
+| `DATE_TRUNC('month', x)` | PostgreSQL | Returns a timestamp | `F.date_trunc("month", x)` |
+| `DATE_TRUNC(x, MONTH)` | BigQuery | Returns a date | `F.trunc(x, "month")` |
+
+### Timestamps and time zones
+
+Spark has two timestamp types: `TIMESTAMP`, a point in time shown in the
+session time zone, and `TIMESTAMP_NTZ`, a wall-clock time without a time zone.
+Casts map each source type to the one with the same meaning:
+
+| Source type | Meaning | Spark type |
+|---|---|---|
+| PostgreSQL, Snowflake, and Oracle `TIMESTAMP`; T-SQL `DATETIME2`; MySQL and BigQuery `DATETIME` | Wall-clock time | `timestamp_ntz` |
+| `TIMESTAMPTZ`, `TIMESTAMP WITH TIME ZONE`, Snowflake `TIMESTAMP_LTZ`, MySQL and BigQuery `TIMESTAMP`, T-SQL `DATETIMEOFFSET` | Point in time | `timestamp` |
+| Generic SQL `TIMESTAMP` | Spark's own meaning | `timestamp` |
+
+Snowflake's `TIMESTAMP` follows its default `TIMESTAMP_TYPE_MAPPING` of
+`TIMESTAMP_NTZ`. Values are interpreted in the Spark session time zone, which
+should match the time zone the source data was produced in.
 
 ### Dialect differences
 
@@ -132,6 +156,13 @@ rejects it rather than guess:
 | `LOG(x)` | PostgreSQL, Snowflake, Oracle, generic | Base 10 in some databases, natural logarithm in others; write `LN(x)` or `LOG(base, x)`. |
 | `TRIM` | BigQuery | Removes all Unicode whitespace, including tabs; Spark removes only spaces. |
 | `SUBSTRING`, `LEFT`, `RIGHT` with negative or computed positions | All | Negative positions behave differently across databases. |
+| `EXTRACT(SECOND ...)`, weekdays, week numbers | All | Fractions of a second, the first day of the week, and week numbering differ. |
+| `DATEDIFF` in months, years, or other units | All | Databases count month and year boundaries differently. |
+| `DATE_TRUNC` | Snowflake, T-SQL, Oracle, MySQL | Returns the input's type (or does not exist); only the schema would tell. |
+| `ADD_MONTHS` | Oracle, Snowflake | Keeps the last day of the month (Feb 29 + 1 month = Mar 31); Spark does not. |
+| `CAST(x AS DATETIME)`, `SMALLDATETIME` | T-SQL | Round to 1/300 of a second or to the minute. |
+| `CAST(x AS TIMESTAMP)` | T-SQL | Means `ROWVERSION`, a binary row version. |
+| `SYSDATE` | Oracle | No fractional seconds; uses the server's time zone. |
 
 ### Known limitations
 
@@ -139,6 +170,10 @@ rejects it rather than guess:
   SQL Server often compare strings, including in `LIKE` and `REPLACE`,
   case-insensitively; Spark compares them case-sensitively.
 - Oracle treats an empty string as NULL; SparkShift does not emulate this.
+- In PostgreSQL, subtracting two dates gives a number of days; in Spark it
+  gives an interval. SparkShift cannot tell that two columns are dates.
+- Date formatting and parsing with format strings (`TO_DATE(s, fmt)`,
+  `FORMAT`, `TO_CHAR`) are not supported yet; each dialect uses its own codes.
 - An unaliased `SELECT` item that calls a function, such as `SELECT UPPER(name)`,
   must be given an alias, because Spark names the column after the exact
   spelling used (`CEIL` or `CEILING`), which is lost in parsing.

@@ -34,6 +34,8 @@ _PLAIN_VALUE_PARAMETERS = {
     "substring": frozenset({1, 2}),
     "concat_ws": frozenset({0}),
     "log": frozenset({0}),
+    "date_trunc": frozenset({0}),
+    "trunc": frozenset({1}),
 }
 
 # Python operator precedence, from loosest to tightest binding. PySpark builds
@@ -268,6 +270,11 @@ class _Emitter:
                     for position, argument in enumerate(arguments)
                 )
                 return f"F.{name}({code})", _ATOM
+            case ir.Interval(unit=unit, amount=amount):
+                # make_interval keeps the input type when added: a date stays
+                # a date, and a timestamp keeps its time of day.
+                self.uses_functions = True
+                return f"F.make_interval({unit}={self.expression(amount)})", _ATOM
             case ir.Cast(expression=inner, data_type=data_type, safe=safe):
                 name = "try_cast" if safe else "cast"
                 return self.method(inner, name, python_string(data_type)), _ATOM

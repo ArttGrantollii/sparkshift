@@ -65,6 +65,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   NULL-skipping `CONCAT` exactly; rejects `ROUND` where floating-point halves
   round to even, NULL-propagating `GREATEST`/`LEAST`, ambiguous one-argument
   `LOG`, BigQuery `TRIM`, and non-constant or negative positions.
+- Dates and timestamps: date parts, `CURRENT_DATE`/`CURRENT_TIMESTAMP`, day
+  differences with each dialect's argument order, type-preserving date
+  arithmetic in days, weeks, months, and years via `make_interval`, Spark's
+  `DATE_ADD`/`DATE_SUB`, PostgreSQL and BigQuery `DATE_TRUNC`, and casts that
+  map each dialect's timestamp types to Spark's `timestamp` (point in time) or
+  `timestamp_ntz` (wall clock). Rejects seconds, weekdays, week numbers,
+  non-day `DATEDIFF` units, input-type-preserving `DATE_TRUNC`, end-of-month
+  `ADD_MONTHS`, T-SQL `DATETIME`/`SMALLDATETIME`/`TIMESTAMP`, and `SYSDATE`.
 - Unaliased `SELECT` items that call functions now require an alias, because
   Spark names such columns after the original spelling.
 - A `products` test table with whitespace, multi-byte text, and rounding

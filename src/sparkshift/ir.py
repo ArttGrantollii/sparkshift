@@ -178,6 +178,21 @@ class FunctionCall:
 
 
 @dataclass(frozen=True)
+class Interval:
+    """A calendar interval, such as 3 days or 1 month, to add to a date or
+    timestamp. Adding it keeps the input's type: a date stays a date and a
+    timestamp keeps its time of day. ``unit`` is ``"days"``, ``"weeks"``,
+    ``"months"``, or ``"years"``."""
+
+    unit: str
+    amount: "Expression"
+
+    def __post_init__(self) -> None:
+        if self.unit not in {"days", "weeks", "months", "years"}:
+            raise ValueError(f"Unsupported interval unit: {self.unit}")
+
+
+@dataclass(frozen=True)
 class Cast:
     """Convert to a Spark type, such as ``"int"`` or ``"decimal(10,2)"``.
 
@@ -205,6 +220,7 @@ Expression: TypeAlias = (
     | NullSafeEqual
     | Case
     | FunctionCall
+    | Interval
     | Cast
 )
 
