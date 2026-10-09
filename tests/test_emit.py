@@ -885,3 +885,83 @@ def test_wrapping_negations_keeps_the_python_syntax_tree(line_length: int) -> No
     one_line = emit(plan, line_length=10**6)
 
     assert ast.dump(ast.parse(wrapped)) == ast.dump(ast.parse(one_line))
+
+
+# --- Sorting -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("descending", "nulls_first", "method"),
+    [
+        (False, True, "asc"),  # Spark's default for ascending
+        (False, False, "asc_nulls_last"),
+        (True, False, "desc"),  # Spark's default for descending
+        (True, True, "desc_nulls_first"),
+    ],
+)
+def test_sort_key_spells_out_only_non_default_null_placement(
+    descending: bool, nulls_first: bool, method: str
+) -> None:
+    key = ir.SortKey(A, descending, nulls_first)
+
+    assert emit(ir.Sort(TableScan(("t",)), (key,))).endswith(
+        f'    .orderBy(F.col("a").{method}())\n)\n'
+    )
+
+
+def test_several_sort_keys_go_one_per_line() -> None:
+    keys = (ir.SortKey(A, True, False), ir.SortKey(B, False, True))
+
+    assert emit(ir.Sort(TableScan(("t",)), keys)).endswith(
+        "    .orderBy(\n"
+        '        F.col("a").desc(),\n'
+        '        F.col("b").asc(),\n'
+        "    )\n"
+        ")\n"
+    )
+
+
+def test_sort_key_on_an_operator_expression_is_parenthesized() -> None:
+    key = ir.SortKey(BinaryOp(BinaryOperator.ADD, A, B), False, False)
+
+    assert '.orderBy((F.col("a") + F.col("b")).asc_nulls_last())' in emit(
+        ir.Sort(TableScan(("t",)), (key,))
+    )
+
+
+def test_long_sort_key_wraps_like_an_alias() -> None:
+    total = BinaryOp(
+        BinaryOperator.ADD,
+        Column(("shipping_cost_in_euros",)),
+        Column(("handling_fee_in_euros",)),
+    )
+    plan = ir.Sort(TableScan(("orders",)), (ir.SortKey(total, True, True),))
+
+    assert emit(plan).endswith(
+        "    .orderBy(\n"
+        "        (\n"
+        '            F.col("shipping_cost_in_euros") + F.col("handling_fee_in_euros")\n'
+        "        ).desc_nulls_first()\n"
+        "    )\n"
+        ")\n"
+    )
+
+
+@pytest.mark.parametrize("line_length", [88, 30, 10])
+def test_wrapping_sort_keys_keeps_the_python_syntax_tree(line_length: int) -> None:
+    keys = (
+        ir.SortKey(LONG_AND, False, False),
+        ir.SortKey(ir.FunctionCall("greatest", (A, B, C)), True, True),
+        ir.SortKey(UnaryOp(UnaryOperator.NEGATE, A), False, True),
+    )
+    plan = ir.Sort(TableScan(("t",)), keys)
+
+    wrapped = emit(plan, line_length=line_length)
+    one_line = emit(plan, line_length=10**6)
+
+    assert ast.dump(ast.parse(wrapped)) == ast.dump(ast.parse(one_line))
+
+
+def test_sort_requires_keys() -> None:
+    with pytest.raises(ValueError, match="at least one key"):
+        ir.Sort(TableScan(("t",)), ())

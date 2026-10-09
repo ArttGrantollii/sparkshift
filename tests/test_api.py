@@ -5,7 +5,8 @@ import pytest
 import sparkshift
 
 UNSUPPORTED_EXAMPLE = (
-    "SELECT name, ROW_NUMBER() OVER (ORDER BY name) AS rn FROM customers ORDER BY name"
+    "SELECT name, ROW_NUMBER() OVER (ORDER BY name) AS rn FROM customers "
+    "LIMIT 10 OFFSET 20"
 )
 
 
@@ -41,7 +42,7 @@ def test_unsupported_query_lists_every_issue() -> None:
     assert str(caught.value) == (
         "2 unsupported constructs:\n"
         "  - WINDOW expression: ROW_NUMBER() OVER (ORDER BY name)\n"
-        "  - ORDER BY clause: ORDER BY name"
+        "  - OFFSET clause: OFFSET 20"
     )
 
 

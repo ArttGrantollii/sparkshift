@@ -7,7 +7,9 @@ SQLGlot versions — so nothing is ever silently ignored. All unsupported parts
 are collected before failing, so users see them at once.
 """
 
+from collections import Counter
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import ClassVar
 
@@ -353,6 +355,7 @@ class _Translator:
         condition: ir.Expression | None = None
         group: exp.Group | None = None
         having: exp.Having | None = None
+        order: exp.Order | None = None
         distinct = False
         limit: int | None = None
         failed = False
@@ -380,6 +383,8 @@ class _Translator:
                 group = value
             elif part == "having":
                 having = value
+            elif part == "order":
+                order = value
             elif part == "distinct":
                 distinct = self.distinct(value)
                 failed |= not distinct
@@ -394,23 +399,210 @@ class _Translator:
         if source is None or items is None or failed:
             return None
 
+        keys: list[_OrderKey] = []
+        if order is not None:
+            resolved = self.order_by(order, select, items, aggregating)
+            if resolved is None:
+                return None
+            keys = resolved
+        # Sort the output when every key names an output column; otherwise
+        # sort earlier, while the input columns still exist.
+        sort_output = all(key.output is not None for key in keys)
+        if not sort_output and distinct:
+            for key in keys:
+                if key.output is None:
+                    self.unsupported(
+                        "ORDER BY key that is not a column of the SELECT DISTINCT list",
+                        key.node.this,
+                        hint="With DISTINCT, order by selected columns or aliases.",
+                    )
+            return None
+
         # Build the plan in SQL's logical evaluation order, not the order the
         # clauses are written in: FROM (and joins), WHERE, GROUP BY, HAVING,
-        # SELECT, DISTINCT, LIMIT.
+        # SELECT, DISTINCT, ORDER BY, LIMIT.
         relation: ir.Relation | None = source
         if condition is not None:
             relation = ir.Filter(source, condition)
         if aggregating:
-            relation = self.aggregation(select, relation, items, group, having)
+            early = [] if sort_output else keys
+            relation = self.aggregation(select, relation, items, group, having, early)
         elif items != (ir.Star(),):
+            if not sort_output:
+                # Sorting before a projection keeps the order, as Spark SQL
+                # itself does for keys that are not selected.
+                sort_keys = tuple(_sort_key(key, key.expression) for key in keys)
+                relation = ir.Sort(relation, sort_keys)
             relation = ir.Project(relation, items)
         if relation is None:
             return None
         if distinct:
             relation = ir.Distinct(relation)
+        if keys and sort_output:
+            # Every key has an output form here.
+            sort_keys = tuple(
+                _sort_key(key, key.output or key.expression) for key in keys
+            )
+            relation = ir.Sort(relation, sort_keys)
         if limit is not None:
             relation = ir.Limit(relation, limit)
         return relation
+
+    def order_by(
+        self,
+        order: exp.Order,
+        select: exp.Select,
+        items: tuple[ir.Expression, ...],
+        aggregating: bool,
+    ) -> list["_OrderKey"] | None:
+        """Translate ORDER BY keys, resolving each against the SELECT list."""
+        issues_before = len(self.issues)
+        for part, value in order.args.items():
+            if value and part != "expressions":
+                self.unsupported(f"ORDER BY {part.upper()}", order)
+        keys = [
+            self.order_key(node, select, items, aggregating)
+            for node in order.expressions
+        ]
+        if len(self.issues) > issues_before:
+            return None
+        return [key for key in keys if key is not None]
+
+    def order_key(
+        self,
+        node: exp.Ordered,
+        select: exp.Select,
+        items: tuple[ir.Expression, ...],
+        aggregating: bool,
+    ) -> "_OrderKey | None":
+        """Resolve one ORDER BY key: a SELECT position, an output column name,
+        or an expression over the input (or, when aggregating, over groups).
+
+        SQLGlot sets ``nulls_first`` from the dialect's default when the query
+        does not say NULLS FIRST or NULLS LAST, so it is always explicit here.
+        """
+        for part, value in node.args.items():
+            if value and part not in ("this", "desc", "nulls_first"):
+                self.unsupported(f"ORDER BY {part.upper()}", node)
+                return None
+        term = node.this
+        names = _output_names(items)
+        # Output columns a sort can refer to by name: those named exactly once.
+        counts = Counter(name.lower() for name in names if name is not None)
+        unique = [
+            name if name is not None and counts[name.lower()] == 1 else None
+            for name in names
+        ]
+
+        def resolved(index: int) -> _OrderKey:
+            name = unique[index]
+            output = None if name is None else ir.Column((name,))
+            return _OrderKey(node, output, _source_expression(items[index]))
+
+        if isinstance(term, exp.Literal) and not term.is_string and term.this.isdigit():
+            index = self.order_position(term, items)
+            if index is None:
+                return None
+            key = resolved(index)
+            if key.output is None and aggregating:
+                self.unsupported(
+                    "ORDER BY position of a SELECT item without a unique name",
+                    term,
+                    hint="Give the item an alias, for example: COUNT(*) AS orders.",
+                )
+                return None
+            return key
+        if term.find(exp.Column) is None and term.find(exp.AggFunc) is None:
+            self.unsupported(
+                "ORDER BY a constant",
+                term,
+                hint="A constant does not order rows; an integer means a "
+                "SELECT position.",
+            )
+            return None
+        if (
+            isinstance(term, exp.Column)
+            and not term.table
+            and not isinstance(term.this, exp.Star)
+        ):
+            # A plain name means an output column first, as in standard SQL.
+            matches = [
+                index
+                for index, name in enumerate(names)
+                if name is not None and name.lower() == term.name.lower()
+            ]
+            if len(matches) == 1:
+                return resolved(matches[0])
+            if len(matches) > 1:
+                self.unsupported(
+                    "ORDER BY name that matches several SELECT items",
+                    term,
+                    hint="Rename the items, or order by a position.",
+                )
+                return None
+        elif self.uses_select_alias(term, select):
+            return None
+
+        if aggregating:
+            expression = self.expression(term)
+        else:
+            expression = self.expression_without_aggregates(
+                term, "ORDER BY without GROUP BY"
+            )
+        if expression is None:
+            return None
+        output: ir.Expression | None = None
+        if items == (ir.Star(),):
+            output = expression  # every input column is an output column
+        for index, item in enumerate(items):
+            name = unique[index]
+            if name is not None and _source_expression(item) == expression:
+                output = ir.Column((name,))
+        return _OrderKey(node, output, expression)
+
+    def order_position(
+        self, node: exp.Literal, items: tuple[ir.Expression, ...]
+    ) -> int | None:
+        """Resolve ORDER BY 2 to the index of the second SELECT item."""
+        position = int(node.this)
+        if not 1 <= position <= len(items):
+            self.unsupported("ORDER BY position out of range", node)
+            return None
+        if isinstance(items[position - 1], ir.Star):
+            self.unsupported(
+                "ORDER BY position of *", node, hint="Order by column names."
+            )
+            return None
+        return position - 1
+
+    def uses_select_alias(self, term: exp.Expression, select: exp.Select) -> bool:
+        """Reject SELECT aliases used inside an ORDER BY expression.
+
+        A plain alias name means the output column in every dialect, but inside
+        an expression some databases (PostgreSQL) read the name as a table
+        column instead. Without the schema, SparkShift cannot tell which
+        applies, unless the alias names a column of the same name.
+        """
+        aliases = {
+            node.alias.lower(): node.this
+            for node in select.expressions
+            if isinstance(node, exp.Alias)
+        }
+        found = False
+        for column in term.find_all(exp.Column):
+            name = column.name.lower()
+            if column.table or name not in aliases:
+                continue
+            target = aliases[name]
+            if isinstance(target, exp.Column) and target.name.lower() == name:
+                continue
+            self.unsupported(
+                "SELECT alias inside an ORDER BY expression",
+                column,
+                hint="Order by the alias alone, or repeat the aliased expression.",
+            )
+            found = True
+        return found
 
     def where(self, where: exp.Where, select: exp.Select) -> ir.Expression | None:
         issues_before = len(self.issues)
@@ -650,8 +842,10 @@ class _Translator:
         items: tuple[ir.Expression, ...],
         group: exp.Group | None,
         having: exp.Having | None,
+        order: list["_OrderKey"],
     ) -> ir.Relation | None:
-        """Translate GROUP BY, aggregates, and HAVING.
+        """Translate GROUP BY, aggregates, HAVING, and ``order``: ORDER BY keys
+        that need columns the SELECT list does not output.
 
         PySpark's ``groupBy(...).agg(...)`` outputs the key columns first and
         then the aggregates. SQL allows any order and may leave keys out, so a
@@ -686,13 +880,23 @@ class _Translator:
         def output_name(key: ir.Column) -> str:
             return key_names.get(key, key.name_parts[-1])
 
+        def over_groups(expression: ir.Expression, clause: str) -> ir.Expression | None:
+            return self.over_groups(
+                expression, clause, select, keys, output_name, aggregates, helpers
+            )
+
         helpers: list[ir.Expression] = []
         condition = None
         if having is not None:
-            condition = self.having(
-                having, select, keys, output_name, aggregates, helpers
-            )
+            condition = self.having(having, over_groups)
             failed |= condition is None
+        sort_keys = []
+        for key in order:
+            expression = key.output or over_groups(key.expression, "ORDER BY")
+            if expression is None:
+                failed = True
+            else:
+                sort_keys.append(_sort_key(key, expression))
         if failed:
             return None
 
@@ -707,6 +911,10 @@ class _Translator:
         )
         if condition is not None:
             relation = ir.Filter(relation, condition)
+        if sort_keys:
+            # Before the final projection, which may drop helper columns the
+            # keys use; projecting keeps the order.
+            relation = ir.Sort(relation, tuple(sort_keys))
 
         natural = [("key", n) for n in range(len(keys))]
         natural += [("aggregate", n) for n in range(len(aggregates))]
@@ -834,21 +1042,34 @@ class _Translator:
     def having(
         self,
         having: exp.Having,
+        over_groups: Callable[[ir.Expression, str], ir.Expression | None],
+    ) -> ir.Expression | None:
+        """Translate HAVING into a filter on the aggregated result."""
+        issues_before = len(self.issues)
+        condition = self.expression(having.this)
+        if condition is None or len(self.issues) > issues_before:
+            return None
+        return over_groups(condition, "HAVING")
+
+    def over_groups(
+        self,
+        expression: ir.Expression,
+        clause: str,
         select: exp.Select,
         keys: list[ir.Column],
         output_name: Callable[[ir.Column], str],
         aggregates: list[ir.Expression],
         helpers: list[ir.Expression],
     ) -> ir.Expression | None:
-        """Translate HAVING into a filter on the aggregated result.
+        """Rewrite an expression from HAVING or ORDER BY to use the columns of
+        the aggregated result.
 
         Aggregates already in the SELECT list are referred to by their alias;
         others are computed as helper columns, which a final projection drops.
+        Grouped columns are referred to by their output name.
         """
         issues_before = len(self.issues)
-        condition = self.expression(having.this)
-        if condition is None or len(self.issues) > issues_before:
-            return None
+        prefix = "_having" if clause == "HAVING" else "_order"
         aliases = {
             node.alias.lower()
             for node in select.expressions
@@ -867,7 +1088,7 @@ class _Translator:
                     assert isinstance(helper, ir.Alias)
                     if helper.expression == expression:
                         return ir.Column((helper.name,))
-                helpers.append(ir.Alias(expression, f"_having_{len(helpers) + 1}"))
+                helpers.append(ir.Alias(expression, f"{prefix}_{len(helpers) + 1}"))
                 return ir.Column((helpers[-1].name,))  # type: ignore[union-attr]
             if isinstance(expression, ir.Column):
                 key = _matching_key(expression, keys)
@@ -875,8 +1096,8 @@ class _Translator:
                     return ir.Column((output_name(key),))
                 name = ".".join(expression.name_parts)
                 if name.lower() in aliases:
-                    message = "HAVING reference to a SELECT alias"
-                    hint = "Repeat the aggregate expression in HAVING."
+                    message = f"{clause} reference to a SELECT alias"
+                    hint = f"Repeat the aggregate expression in {clause}."
                 else:
                     message = "column that is neither grouped nor aggregated"
                     hint = "Add it to GROUP BY or wrap it in an aggregate such as MAX."
@@ -884,7 +1105,7 @@ class _Translator:
                 return expression
             return None
 
-        rewritten = _rewrite(condition, replace)
+        rewritten = _rewrite(expression, replace)
         return None if len(self.issues) > issues_before else rewritten
 
     def aggregate_call(
@@ -1809,6 +2030,45 @@ def _differently_named(node: exp.Expression) -> str | None:
     if isinstance(inner, exp.If):
         return "IF"
     return None
+
+
+@dataclass(frozen=True)
+class _OrderKey:
+    """An ORDER BY key, resolved as far as the SELECT list allows."""
+
+    node: exp.Ordered
+    # The key in terms of the query's output columns, if it names one.
+    output: ir.Expression | None
+    # The key in terms of the input columns; in an aggregate query it may
+    # contain aggregates.
+    expression: ir.Expression
+
+
+def _sort_key(key: _OrderKey, expression: ir.Expression) -> ir.SortKey:
+    return ir.SortKey(
+        expression,
+        descending=bool(key.node.args.get("desc")),
+        nulls_first=bool(key.node.args.get("nulls_first")),
+    )
+
+
+def _output_names(items: tuple[ir.Expression, ...]) -> list[str | None]:
+    """The output column name of each SELECT item: its alias, or a column's own
+    name. Other unaliased items get names that depend on spelling: None."""
+    names: list[str | None] = []
+    for item in items:
+        if isinstance(item, ir.Alias):
+            names.append(item.name)
+        elif isinstance(item, ir.Column):
+            names.append(item.name_parts[-1])
+        else:
+            names.append(None)
+    return names
+
+
+def _source_expression(item: ir.Expression) -> ir.Expression:
+    """A SELECT item without its alias."""
+    return item.expression if isinstance(item, ir.Alias) else item
 
 
 def _plain_column(item: ir.Expression) -> tuple[ir.Column, str] | None:

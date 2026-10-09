@@ -11,11 +11,15 @@ import re
 from collections import Counter
 from collections.abc import Iterator, Sequence
 from decimal import Decimal
-from typing import assert_never
+from typing import TypeAlias, assert_never
 
 from sparkshift import ir
 
 RESULT_VARIABLE = "result"
+
+# What a chain step such as .select(...) or .orderBy(...) takes: expressions,
+# sort keys, or code that is already written, such as a table or a number.
+_Argument: TypeAlias = ir.Expression | ir.SortKey | str
 
 # Names the generated code already uses; table variables must not shadow them.
 _RESERVED_NAMES = frozenset({RESULT_VARIABLE, "spark", "F", "Decimal"})
@@ -164,6 +168,9 @@ class _Emitter:
             case ir.Distinct(source=source):
                 start, calls = self.chain(source)
                 return start, [*calls, self.call("distinct", [])]
+            case ir.Sort(source=source, keys=keys):
+                start, calls = self.chain(source)
+                return start, [*calls, self.call("orderBy", keys)]
             case ir.Limit(source=source, count=count):
                 start, calls = self.chain(source)
                 return start, [*calls, self.call("limit", [str(count)])]
@@ -184,7 +191,7 @@ class _Emitter:
         start, calls = self.chain(plan)
         return start + "".join(calls)
 
-    def call(self, method: str, arguments: Sequence[ir.Expression | str]) -> str:
+    def call(self, method: str, arguments: Sequence[_Argument]) -> str:
         """Render a chain step such as ``.select(...)``: inline if it is short
         and has at most one argument; otherwise each argument on its own line,
         wrapped further if it is still too long."""
@@ -205,31 +212,29 @@ class _Emitter:
     # Python syntax tree. Continuation lines are indented relative to the
     # expression's first line; ``column`` is where that first line starts.
 
-    def code(self, value: ir.Expression | str) -> str:
-        return value if isinstance(value, str) else self.expression(value)
+    def code(self, value: _Argument) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, ir.SortKey):
+            return f"{self.operand(value.expression, _ATOM)}{_sort_suffix(value)}"
+        return self.expression(value)
 
-    def argument(self, value: ir.Expression | str, column: int) -> str:
+    def argument(self, value: _Argument, column: int) -> str:
         """Code for a value starting at ``column``, wrapped if it does not fit
         (leaving room for a trailing comma)."""
         code = self.code(value)
         if isinstance(value, str) or column + len(code) + 1 <= self.line_length:
             return code
+        if isinstance(value, ir.SortKey):
+            suffix = _sort_suffix(value)
+            return self.suffixed(value.expression, suffix, column) or code
         return self.wrapped(value, column) or code
 
     def wrapped(self, expression: ir.Expression, column: int) -> str | None:
         """Multi-line code for an expression, or None if it has no good break."""
         match expression:
             case ir.Alias(expression=inner, name=name):
-                suffix = f".alias({python_string(name)})"
-                if self.render(inner)[1] < _ATOM:
-                    # Already needs parentheses before .alias: give it
-                    # its own lines inside them, as Black does.
-                    return f"{self.parenthesized(inner, column)}{suffix}"
-                inner_code = self.wrapped(inner, column)
-                if inner_code is None:
-                    return None
-                separator = "\n" if isinstance(inner, ir.Case) else ""
-                return f"{inner_code}{separator}{suffix}"
+                return self.suffixed(inner, f".alias({python_string(name)})", column)
             case ir.BinaryOp(op=op) if op in _BOOLEAN_OPERATORS:
                 return self.boolean_chain(expression, column)
             case ir.UnaryOp(op=op, operand=operand):
@@ -264,6 +269,19 @@ class _Emitter:
                 receiver = f"{self.operand(inner, _ATOM)}.between"
                 return self.wrapped_call(receiver, [low, high], column)
         return None
+
+    def suffixed(self, inner: ir.Expression, suffix: str, column: int) -> str | None:
+        """Multi-line code for ``inner`` followed by a method call such as
+        ``.alias("x")`` or ``.desc()``, or None if it has no good break."""
+        if self.render(inner)[1] < _ATOM:
+            # Already needs parentheses before the method: give it its own
+            # lines inside them, as Black does.
+            return f"{self.parenthesized(inner, column)}{suffix}"
+        inner_code = self.wrapped(inner, column)
+        if inner_code is None:
+            return None
+        separator = "\n" if isinstance(inner, ir.Case) else ""
+        return f"{inner_code}{separator}{suffix}"
 
     def call_text(
         self, prefix: str, arguments: Sequence[ir.Expression | str], column: int
@@ -531,9 +549,18 @@ def _walk(plan: ir.Relation) -> Iterator[ir.Relation]:
             | ir.Aggregate(source=source)
             | ir.Project(source=source)
             | ir.Distinct(source=source)
+            | ir.Sort(source=source)
             | ir.Limit(source=source)
         ):
             yield from _walk(source)
+
+
+def _sort_suffix(key: ir.SortKey) -> str:
+    """The Column method for a sort key. Spark puts NULLs first when ascending
+    and last when descending; other placements are spelled out."""
+    if key.descending:
+        return ".desc_nulls_first()" if key.nulls_first else ".desc()"
+    return ".asc()" if key.nulls_first else ".asc_nulls_last()"
 
 
 def _spark_table(parts: tuple[str, ...]) -> str:

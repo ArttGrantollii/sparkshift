@@ -242,12 +242,12 @@ def test_tsql_subtraction_is_supported() -> None:
 
 def test_all_unsupported_constructs_are_reported_together() -> None:
     issues = unsupported_issues(
-        "WITH x AS (SELECT 1) SELECT name FROM customers ORDER BY name"
+        "WITH x AS (SELECT 1) SELECT name FROM customers LIMIT 5 OFFSET 2"
     )
 
     assert issues == [
         ("WITH clause", "WITH x AS (SELECT 1)"),
-        ("ORDER BY clause", "ORDER BY name"),
+        ("OFFSET clause", "OFFSET 2"),
     ]
 
 
@@ -1725,3 +1725,263 @@ def test_unknown_parts_of_date_functions_are_rejected_not_ignored(
         translate(tree)
 
     assert [issue.message for issue in caught.value.issues] == [f"{name} with EXTRA"]
+
+
+# --- ORDER BY ----------------------------------------------------------------
+
+
+def ascending(expression: ir.Expression, nulls_first: bool = True) -> ir.SortKey:
+    return ir.SortKey(expression, descending=False, nulls_first=nulls_first)
+
+
+def descending(expression: ir.Expression, nulls_first: bool = False) -> ir.SortKey:
+    return ir.SortKey(expression, descending=True, nulls_first=nulls_first)
+
+
+@pytest.mark.parametrize(
+    ("dialect", "nulls_first_ascending"),
+    [
+        (None, True),
+        ("tsql", True),
+        ("mysql", True),
+        ("bigquery", True),
+        ("postgres", False),
+        ("oracle", False),
+        ("snowflake", False),
+    ],
+)
+def test_null_placement_follows_the_source_dialect(
+    dialect: str | None, nulls_first_ascending: bool
+) -> None:
+    # NULLs sort as the smallest value in some databases and the largest in
+    # others, so the same ORDER BY puts them at opposite ends.
+    plan = translate_sql("SELECT a, b FROM t ORDER BY a, b DESC", dialect)
+
+    assert plan == ir.Sort(
+        Project(T, (A, B)),
+        (
+            ascending(A, nulls_first=nulls_first_ascending),
+            descending(B, nulls_first=not nulls_first_ascending),
+        ),
+    )
+
+
+def test_explicit_null_placement_overrides_the_default() -> None:
+    plan = translate_sql(
+        "SELECT a, b FROM t ORDER BY a NULLS FIRST, b DESC NULLS LAST", "postgres"
+    )
+
+    assert plan == ir.Sort(
+        Project(T, (A, B)),
+        (ascending(A, nulls_first=True), descending(B, nulls_first=False)),
+    )
+
+
+def test_order_by_position_refers_to_the_output_column() -> None:
+    plan = translate_sql("SELECT a, b AS x FROM t ORDER BY 2 DESC")
+
+    assert plan == ir.Sort(
+        Project(T, (A, Alias(B, "x"))), (descending(Column(("x",))),)
+    )
+
+
+def test_order_by_name_means_the_alias_even_if_it_shadows_a_column() -> None:
+    # Standard SQL: a plain ORDER BY name refers to an output column first.
+    plan = translate_sql("SELECT b AS a FROM t ORDER BY a")
+
+    assert plan == ir.Sort(Project(T, (Alias(B, "a"),)), (ascending(A),))
+
+
+def test_order_by_a_selected_expression_uses_its_output_column() -> None:
+    double = BinaryOp(BinaryOperator.MULTIPLY, A, Literal(2))
+    plan = translate_sql("SELECT a * 2 AS d FROM t ORDER BY a * 2")
+
+    assert plan == ir.Sort(
+        Project(T, (Alias(double, "d"),)), (ascending(Column(("d",))),)
+    )
+
+
+def test_order_by_an_unselected_column_sorts_before_the_projection() -> None:
+    condition = BinaryOp(BinaryOperator.GREATER, C, Literal(1))
+    plan = translate_sql("SELECT a FROM t WHERE c > 1 ORDER BY b")
+
+    assert plan == Project(ir.Sort(ir.Filter(T, condition), (ascending(B),)), (A,))
+
+
+def test_aliases_become_their_expressions_when_sorting_before_projecting() -> None:
+    plus_one = BinaryOp(BinaryOperator.ADD, A, Literal(1))
+    plan = translate_sql("SELECT a + 1 AS x FROM t ORDER BY x DESC, b")
+
+    assert plan == Project(
+        ir.Sort(T, (descending(plus_one), ascending(B))), (Alias(plus_one, "x"),)
+    )
+
+
+def test_alias_of_the_same_column_may_be_used_in_an_expression() -> None:
+    plus_one = BinaryOp(BinaryOperator.ADD, A, Literal(1))
+    plan = translate_sql("SELECT a AS a FROM t ORDER BY a + 1")
+
+    assert plan == Project(ir.Sort(T, (ascending(plus_one),)), (Alias(A, "a"),))
+
+
+def test_select_star_sorts_its_input_directly() -> None:
+    assert translate_sql("SELECT * FROM t ORDER BY a") == ir.Sort(T, (ascending(A),))
+
+
+def test_order_by_comes_after_distinct_and_before_limit() -> None:
+    plan = translate_sql("SELECT DISTINCT a FROM t WHERE b > 1 ORDER BY a LIMIT 3")
+
+    assert plan == ir.Limit(
+        ir.Sort(
+            ir.Distinct(
+                Project(
+                    ir.Filter(T, BinaryOp(BinaryOperator.GREATER, B, Literal(1))),
+                    (A,),
+                )
+            ),
+            (ascending(A),),
+        ),
+        3,
+    )
+
+
+def test_top_with_order_by_is_a_top_n_query() -> None:
+    plan = translate_sql("SELECT TOP 3 a FROM t ORDER BY a DESC", "tsql")
+
+    assert plan == ir.Limit(ir.Sort(Project(T, (A,)), (descending(A),)), 3)
+
+
+def test_order_by_an_aggregate_alias_sorts_the_aggregated_result() -> None:
+    plan = translate_sql(
+        "SELECT status, COUNT(*) AS n FROM orders GROUP BY status ORDER BY n DESC"
+    )
+
+    assert plan == ir.Sort(
+        ir.Aggregate(ORDERS, (STATUS,), (Alias(COUNT_ROWS, "n"),)),
+        (descending(Column(("n",))),),
+    )
+
+
+def test_order_by_an_unselected_aggregate_uses_a_helper_column() -> None:
+    total = ir.AggregateCall(ir.AggregateFunction.SUM, (AMOUNT,))
+    plan = translate_sql(
+        "SELECT status FROM orders GROUP BY status ORDER BY SUM(amount) DESC"
+    )
+
+    assert plan == Project(
+        ir.Sort(
+            ir.Aggregate(ORDERS, (STATUS,), (Alias(total, "_order_1"),)),
+            (descending(Column(("_order_1",))),),
+        ),
+        (STATUS,),
+    )
+
+
+def test_order_by_reuses_a_having_helper_column() -> None:
+    plan = translate_sql(
+        "SELECT status FROM orders GROUP BY status "
+        "HAVING COUNT(*) > 1 ORDER BY COUNT(*) DESC"
+    )
+
+    helper = Column(("_having_1",))
+    assert plan == Project(
+        ir.Sort(
+            ir.Filter(
+                ir.Aggregate(ORDERS, (STATUS,), (Alias(COUNT_ROWS, "_having_1"),)),
+                BinaryOp(BinaryOperator.GREATER, helper, Literal(1)),
+            ),
+            (descending(helper),),
+        ),
+        (STATUS,),
+    )
+
+
+def test_order_by_an_unselected_group_key() -> None:
+    plan = translate_sql(
+        "SELECT COUNT(*) AS n FROM orders GROUP BY status ORDER BY status"
+    )
+
+    assert plan == Project(
+        ir.Sort(
+            ir.Aggregate(ORDERS, (STATUS,), (Alias(COUNT_ROWS, "n"),)),
+            (ascending(STATUS),),
+        ),
+        (Column(("n",)),),
+    )
+
+
+@pytest.mark.parametrize(
+    ("sql", "dialect", "message"),
+    [
+        (
+            "SELECT DISTINCT a FROM t ORDER BY b",
+            None,
+            "ORDER BY key that is not a column of the SELECT DISTINCT list",
+        ),
+        (
+            "SELECT a AS x FROM t ORDER BY x + 1",
+            None,
+            "SELECT alias inside an ORDER BY expression",
+        ),
+        (
+            "SELECT a AS x, b AS x FROM t ORDER BY x",
+            None,
+            "ORDER BY name that matches several SELECT items",
+        ),
+        ("SELECT a FROM t ORDER BY NULL", "mysql", "ORDER BY a constant"),
+        ("SELECT a FROM t ORDER BY 'a'", None, "ORDER BY a constant"),
+        ("SELECT a FROM t ORDER BY -1", None, "ORDER BY a constant"),
+        ("SELECT a FROM t ORDER BY 2", None, "ORDER BY position out of range"),
+        ("SELECT a FROM t ORDER BY 0", None, "ORDER BY position out of range"),
+        ("SELECT * FROM t ORDER BY 1", None, "ORDER BY position of *"),
+        (
+            "SELECT status, COUNT(*) FROM orders GROUP BY status ORDER BY 2",
+            None,
+            "ORDER BY position of a SELECT item without a unique name",
+        ),
+        (
+            "SELECT a FROM t ORDER BY COUNT(*)",
+            None,
+            "aggregate function COUNT in ORDER BY without GROUP BY",
+        ),
+        (
+            "SELECT status FROM orders GROUP BY status ORDER BY amount",
+            None,
+            "column that is neither grouped nor aggregated",
+        ),
+        ("SELECT a FROM t ORDER SIBLINGS BY a", "oracle", "ORDER BY SIBLINGS"),
+    ],
+)
+def test_unsupported_order_by(sql: str, dialect: str | None, message: str) -> None:
+    assert message in [issue for issue, _ in unsupported_issues(sql, dialect)]
+
+
+def test_every_order_by_issue_is_reported() -> None:
+    issues = unsupported_issues("SELECT a AS x FROM t ORDER BY x + 1, NULL, 5")
+
+    assert issues == [
+        ("SELECT alias inside an ORDER BY expression", "x"),
+        ("ORDER BY a constant", "NULL"),
+        ("ORDER BY position out of range", "5"),
+    ]
+
+
+def test_distinct_reports_only_the_keys_it_does_not_output() -> None:
+    issues = unsupported_issues("SELECT DISTINCT a FROM t ORDER BY a, b")
+
+    assert issues == [
+        ("ORDER BY key that is not a column of the SELECT DISTINCT list", "b")
+    ]
+
+
+def test_unknown_parts_of_a_sort_key_are_rejected() -> None:
+    # A part SQLGlot may parse in other dialects, such as ClickHouse WITH FILL,
+    # must never be silently dropped.
+    tree = parse_sql("SELECT a FROM t ORDER BY a")
+    tree.args["order"].expressions[0].set("with_fill", exp.WithFill())
+
+    with pytest.raises(UnsupportedSQLError) as caught:
+        translate(tree)
+
+    [issue] = caught.value.issues
+    assert issue.message == "ORDER BY WITH_FILL"

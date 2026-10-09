@@ -355,6 +355,30 @@ class Distinct:
 
 
 @dataclass(frozen=True)
+class SortKey:
+    """One sort key: ascending unless ``descending``, with NULLs placed first
+    or last. The NULL placement is always explicit, because databases disagree
+    on the default."""
+
+    expression: Expression
+    descending: bool
+    nulls_first: bool
+
+
+@dataclass(frozen=True)
+class Sort:
+    """Order rows by ``keys``, the first key deciding first. Rows equal on
+    every key may come in any order."""
+
+    source: "Relation"
+    keys: tuple[SortKey, ...]
+
+    def __post_init__(self) -> None:
+        if not self.keys:
+            raise ValueError("Sort needs at least one key")
+
+
+@dataclass(frozen=True)
 class Limit:
     """Keep at most ``count`` rows."""
 
@@ -368,5 +392,13 @@ class Limit:
 
 # Any IR node that produces a DataFrame.
 Relation: TypeAlias = (
-    TableScan | RelationAlias | Join | Filter | Aggregate | Project | Distinct | Limit
+    TableScan
+    | RelationAlias
+    | Join
+    | Filter
+    | Aggregate
+    | Project
+    | Distinct
+    | Sort
+    | Limit
 )

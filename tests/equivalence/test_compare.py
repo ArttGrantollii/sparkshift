@@ -8,7 +8,13 @@ These run on plain Python data and need no Spark.
 from decimal import Decimal
 
 import pytest
-from compare import Snapshot, differences, limited_differences, values_equal
+from compare import (
+    Snapshot,
+    differences,
+    limited_differences,
+    ordered_differences,
+    values_equal,
+)
 
 COLUMNS = (("id", "int"), ("value", "string"))
 
@@ -177,3 +183,133 @@ def test_limited_result_with_different_columns_is_detected() -> None:
     [problem] = limited_differences(UNLIMITED, actual, 1)
 
     assert problem.startswith("Columns differ")
+
+
+# --- ORDER BY: tie groups in sequence ----------------------------------------
+
+# Sorted by id, NULLs last. id 1 has three tied rows; id 3 has two.
+SORTED = snap((1, "a"), (1, "b"), (1, "a"), (2, "c"), (3, "d"), (3, "e"), (None, "f"))
+
+
+@pytest.mark.parametrize(
+    "actual",
+    [
+        SORTED,
+        # Tied rows in another order.
+        snap((1, "b"), (1, "a"), (1, "a"), (2, "c"), (3, "e"), (3, "d"), (None, "f")),
+    ],
+)
+def test_ordered_result_with_ties_in_any_order_matches(actual: Snapshot) -> None:
+    assert ordered_differences(SORTED, actual, ["id"]) == []
+
+
+@pytest.mark.parametrize(
+    ("actual", "first_problem"),
+    [
+        (
+            # Groups swapped: ascending vs descending.
+            snap(
+                (None, "f"), (3, "d"), (3, "e"), (2, "c"), (1, "a"), (1, "b"), (1, "a")
+            ),
+            "Rows 1 to 3 are out of order",
+        ),
+        (
+            # NULLs first instead of last.
+            snap(
+                (None, "f"), (1, "a"), (1, "b"), (1, "a"), (2, "c"), (3, "d"), (3, "e")
+            ),
+            "Rows 1 to 3 are out of order",
+        ),
+        (
+            # A row moved across a group boundary.
+            snap(
+                (1, "a"), (1, "b"), (2, "c"), (1, "a"), (3, "d"), (3, "e"), (None, "f")
+            ),
+            "Rows 1 to 3 are out of order",
+        ),
+        (
+            # Same rows within a group, but a duplicate changed.
+            snap(
+                (1, "a"), (1, "b"), (1, "b"), (2, "c"), (3, "d"), (3, "e"), (None, "f")
+            ),
+            "Rows 1 to 3 are out of order",
+        ),
+        (
+            snap((1, "a"), (1, "b"), (1, "a"), (2, "c"), (3, "d"), (3, "e")),
+            "Expected 7 rows, got 6",
+        ),
+    ],
+)
+def test_ordered_result_out_of_order_is_detected(
+    actual: Snapshot, first_problem: str
+) -> None:
+    problems = ordered_differences(SORTED, actual, ["id"])
+
+    assert problems
+    assert problems[0].startswith(first_problem)
+
+
+def test_ordered_difference_shows_expected_and_found_rows() -> None:
+    actual = snap(
+        (1, "a"), (1, "b"), (2, "c"), (1, "a"), (3, "d"), (3, "e"), (None, "f")
+    )
+
+    assert ordered_differences(SORTED, actual, ["id"]) == [
+        "Rows 1 to 3 are out of order (rows that tie on id may come in any order)",
+        "Expected at these positions (1):\n  (1, 'a')",
+        "Found instead (1):\n  (2, 'c')",
+    ]
+
+
+def test_ordering_on_all_columns_requires_the_exact_sequence() -> None:
+    swapped = snap(
+        (1, "b"), (1, "a"), (1, "a"), (2, "c"), (3, "d"), (3, "e"), (None, "f")
+    )
+
+    assert ordered_differences(SORTED, swapped, ["id", "value"]) != []
+
+
+@pytest.mark.parametrize(
+    "actual",
+    [
+        snap((1, "a"), (1, "b"), (1, "a"), (2, "c"), (3, "d")),
+        snap((1, "a"), (1, "b"), (1, "a"), (2, "c"), (3, "e")),  # either tied row
+        snap((1, "a"), (1, "a")),  # cut inside the first group
+        snap(),
+    ],
+)
+def test_limit_may_cut_the_last_group_of_ties(actual: Snapshot) -> None:
+    assert ordered_differences(SORTED, actual, ["id"], len(actual.rows)) == []
+
+
+@pytest.mark.parametrize(
+    "actual",
+    [
+        snap((1, "a"), (1, "b"), (1, "a"), (2, "c"), (None, "f")),  # skips id 3
+        snap((1, "a"), (1, "b"), (1, "a"), (2, "c"), (3, "z")),  # not in the group
+        snap((1, "b"), (1, "b")),  # (1, "b") occurs only once
+    ],
+)
+def test_limit_with_rows_from_outside_the_cut_group_is_detected(
+    actual: Snapshot,
+) -> None:
+    assert ordered_differences(SORTED, actual, ["id"], len(actual.rows)) != []
+
+
+def test_limited_ordered_result_with_the_wrong_count_is_detected() -> None:
+    actual = snap((1, "a"), (1, "b"))
+
+    assert ordered_differences(SORTED, actual, ["id"], 3) == ["Expected 3 rows, got 2"]
+
+
+def test_ordered_result_with_different_columns_is_detected() -> None:
+    actual = snap((1,), columns=(("id", "int"),))
+
+    [problem] = ordered_differences(SORTED, actual, ["id"])
+
+    assert problem.startswith("Columns differ")
+
+
+def test_order_keys_must_be_output_columns() -> None:
+    with pytest.raises(ValueError, match="order_keys must be output columns"):
+        ordered_differences(SORTED, SORTED, ["amount"])

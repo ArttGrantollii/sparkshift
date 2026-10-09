@@ -57,7 +57,7 @@ every unsupported construct:
 ```text
 UnsupportedSQLError: 2 unsupported constructs:
   - WINDOW expression: ROW_NUMBER() OVER (ORDER BY name)
-  - ORDER BY clause: ORDER BY name
+  - OFFSET clause: OFFSET 20
 ```
 
 ## Supported SQL
@@ -74,6 +74,7 @@ UnsupportedSQLError: 2 unsupported constructs:
 | `WHERE` | Supported |
 | `DISTINCT` | Supported (`DISTINCT ON` is not) |
 | Row limits: `LIMIT n`, T-SQL `TOP n`, `FETCH FIRST n ROWS ONLY` | Supported, for a constant `n` |
+| `ORDER BY` columns, aliases, positions (`ORDER BY 2`), expressions, and aggregates, with `ASC`/`DESC` and `NULLS FIRST`/`NULLS LAST` | Supported, with each dialect's NULL placement |
 | Aggregates: `COUNT(*)`, `COUNT`, `COUNT(DISTINCT ...)`, `SUM`, `SUM(DISTINCT ...)`, `AVG`, `MIN`, `MAX` | Supported |
 | `GROUP BY` columns, positions (`GROUP BY 1`), and `HAVING` | Supported, with dialect exceptions below |
 | `IN (...)`, `BETWEEN`, `LIKE`, `ILIKE`, `IS [NOT] NULL`, `IS [NOT] DISTINCT FROM`, `<=>` | Supported (constant `LIKE` patterns) |
@@ -88,7 +89,7 @@ UnsupportedSQLError: 2 unsupported constructs:
 | `NATURAL`, semi, anti, and as-of joins; joins to subqueries; `LATERAL` and `APPLY` | Unsupported — rejected with an error |
 | `GROUP BY` expressions, `ROLLUP`, `CUBE`, `GROUPING SETS`, `AVG(DISTINCT ...)` | Unsupported — rejected with an error |
 | `IN (subquery)`, `LIKE ... ESCAPE`, `IS TRUE`/`IS FALSE`, casts to `FLOAT`/`REAL`, `CHAR(n)`/`VARCHAR(n)`, unparameterized `DECIMAL`, and timestamps | Unsupported — rejected with an error |
-| Everything else, including `ORDER BY`, window functions, date formatting and parsing, and other functions | Unsupported — rejected with an error |
+| Everything else, including `OFFSET`, window functions, date formatting and parsing, and other functions | Unsupported — rejected with an error |
 
 Support grows feature by feature; see the [roadmap](ROADMAP.md).
 
@@ -126,6 +127,21 @@ Snowflake's `TIMESTAMP` follows its default `TIMESTAMP_TYPE_MAPPING` of
 `TIMESTAMP_NTZ`. Values are interpreted in the Spark session time zone, which
 should match the time zone the source data was produced in.
 
+### Sorting and NULLs
+
+Databases disagree on where NULLs go when sorting. SparkShift reads the
+placement from the source dialect and spells it out in the generated code
+when it differs from Spark's default, for example `.asc_nulls_last()`:
+
+| Dialects | `ORDER BY x` | `ORDER BY x DESC` |
+|---|---|---|
+| Spark, generic SQL, T-SQL, MySQL, BigQuery | NULLs first | NULLs last |
+| PostgreSQL, Oracle, Snowflake | NULLs last | NULLs first |
+
+An explicit `NULLS FIRST` or `NULLS LAST` always wins. A plain `ORDER BY`
+name means a `SELECT` alias before a same-named table column, as standard
+SQL specifies.
+
 ### Dialect differences
 
 SparkShift generates code with Spark semantics. Where a construct in the
@@ -144,6 +160,7 @@ rejects it rather than guess:
 | `TOP n PERCENT`, `WITH TIES`, `OFFSET` | T-SQL, Oracle, others | Not equivalent to a plain row limit. |
 | `GROUP BY 1` | Oracle, T-SQL | Oracle groups by the constant 1; T-SQL does not allow positions. |
 | `GROUP BY` or `HAVING` naming a `SELECT` alias | All | Databases differ on whether a same-named column wins, and only the schema would tell. |
+| A `SELECT` alias inside an `ORDER BY` expression (`ORDER BY total * 2`) | All | Some databases, such as PostgreSQL, read the name as a table column instead. |
 | Selecting a column that is neither grouped nor aggregated | MySQL (relaxed mode) | MySQL returns an arbitrary value; Spark raises an error. |
 | `ISNULL(a, b)` | T-SQL | Returns the first argument's type (`ISNULL(int_col, 1.5)` is 1); `COALESCE` returns 1.5. |
 | `CAST(x AS VARCHAR)` without a length | T-SQL | Means `VARCHAR(30)` and truncates longer values. |
@@ -167,8 +184,9 @@ rejects it rather than guess:
 ### Known limitations
 
 - Database-specific string collation is not emulated. For example, MySQL and
-  SQL Server often compare strings, including in `LIKE` and `REPLACE`,
-  case-insensitively; Spark compares them case-sensitively.
+  SQL Server often compare and sort strings, including in `LIKE`, `REPLACE`,
+  and `ORDER BY`, case-insensitively; Spark compares and sorts them
+  case-sensitively, so `'Z'` sorts before `'a'`.
 - Oracle treats an empty string as NULL; SparkShift does not emulate this.
 - In PostgreSQL, subtracting two dates gives a number of days; in Spark it
   gives an interval. SparkShift cannot tell that two columns are dates.

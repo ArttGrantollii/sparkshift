@@ -16,6 +16,7 @@ import test_expressions
 import test_filtering
 import test_functions
 import test_joins
+import test_ordering
 
 from sparkshift.emit import emit
 from sparkshift.parsing import parse_sql
@@ -29,12 +30,24 @@ MODULES = [
     test_conditionals,
     test_functions,
     test_dates,
+    test_ordering,
 ]
 
-CASES = [(None, sql) for module in MODULES for sql in module.SCENARIOS.values()] + [
+
+def _sql(scenario: str | tuple[str, ...]) -> str:
+    """A scenario is its SQL, or a tuple that starts with it (followed by
+    settings such as ordering keys)."""
+    return scenario if isinstance(scenario, str) else scenario[0]
+
+
+CASES = [
+    (None, _sql(scenario))
+    for module in MODULES
+    for scenario in module.SCENARIOS.values()
+] + [
     (dialect, sql)
     for module in MODULES
-    for dialect, sql, _ in getattr(module, "DIALECT_SCENARIOS", {}).values()
+    for dialect, sql, *_ in getattr(module, "DIALECT_SCENARIOS", {}).values()
 ]
 
 

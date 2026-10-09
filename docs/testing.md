@@ -42,17 +42,22 @@ in `tests/equivalence/compare.py` applies these rules:
 
 | # | Rule | Why |
 |---|---|---|
-| 1 | **Row order is ignored** | Without `ORDER BY`, SQL guarantees no row order. Two correct plans may return rows in different orders. |
+| 1 | **Row order is ignored, unless the query has `ORDER BY`** | Without `ORDER BY`, SQL guarantees no row order. Two correct plans may return rows in different orders. |
 | 2 | **Rows are compared as a multiset** | Duplicate rows must match in number. Comparing as a set would hide a bug that removes duplicates. |
 | 3 | **Column names, order, and types must match** | `SELECT *` must produce the same columns in the same order; `int` vs `bigint` or a different decimal scale is a real difference to consumers. |
 | 4 | **Nullability flags are ignored** | Spark derives "may contain NULL" metadata differently depending on the code path. Actual NULL values are still compared. |
 | 5 | **NULL matches NULL** | In SQL, `NULL = NULL` is not true, but when comparing results, NULL in both means they agree. |
 | 6 | **Floats match within a tolerance; everything else exactly** | Floating-point addition is not associative, so a different evaluation order can change the last digits. Decimals, strings, dates, and timestamps must match exactly. |
 | 7 | **`LIMIT` without `ORDER BY`: count plus sub-multiset** | Such a query may return *any* `n` rows, so two correct runs can return different rows. The harness removes the `LIMIT` to build the unlimited reference, then checks that the row count matches and that every returned row exists in the unlimited result, duplicates included. |
+| 8 | **`ORDER BY`: tie groups in sequence** | Rows that are equal on the sort keys may come in any order, so comparing lists with `==` would be flaky. Consecutive rows with equal keys form a group; the groups must appear in the same sequence, and each is compared as a multiset. With a `LIMIT`, only the last group may be cut short, and its rows must come from the same group of the unlimited result. |
 
-Ordered comparison (for queries with `ORDER BY`) must also account for ties,
-where rows with equal sort keys may appear in any order. It will be added
-together with `ORDER BY` support.
+### Ordered scenarios
+
+A scenario for a query with `ORDER BY` names its `order_keys`: the output
+columns whose values decide the order. The harness requires them exactly when
+the query has `ORDER BY`, so no ordered query is checked as if order did not
+matter. When a query sorts by a column it does not output, the test data has
+no ties on that column, and every output column is a key.
 
 ### Dialect scenarios
 
@@ -68,7 +73,9 @@ pass and prove nothing. `tests/equivalence/test_compare.py` therefore includes
 cases that must fail: a missing duplicate, NULL vs empty string, NULL vs zero,
 `int` vs `bigint`, reordered columns, unequal decimals, floats outside the
 tolerance, and — for `LIMIT` — a wrong row count, a row not in the unlimited
-result, and a duplicate returned more often than it exists.
+result, and a duplicate returned more often than it exists. For `ORDER BY`,
+it must catch reversed order, NULLs at the wrong end, a row moved across a
+group boundary, and a cut group padded with a row from elsewhere.
 
 ## Test data
 

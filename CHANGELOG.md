@@ -87,3 +87,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   line for long calls, and Black-style parentheses before `.alias`.
   Tests check that every equivalence scenario's code fits, and that
   wrapping never changes the Python syntax tree.
+- `ORDER BY` on columns, aliases, positions, expressions, and aggregates, with
+  `ASC`/`DESC` and `NULLS FIRST`/`NULLS LAST`. NULLs are placed as the
+  source dialect does (PostgreSQL, Oracle, and Snowflake put them last when
+  ascending). Keys that are not selected sort before the projection, or in
+  aggregate queries through helper columns. Rejects aliases inside `ORDER BY`
+  expressions, constants, ambiguous names, and keys outside a `SELECT
+  DISTINCT` list.
+- Ordered equivalence testing: rows that tie on the sort keys may come in any
+  order, and a `LIMIT` may cut the last group of ties.
