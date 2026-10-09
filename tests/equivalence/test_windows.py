@@ -101,6 +101,62 @@ SCENARIOS = {
         "FROM customers c JOIN orders o ON c.customer_id = o.customer_id",
         None,
     ),
+    # Offset and value functions, and explicit frames. order_id ties only
+    # between the identical rows of order 109.
+    "LAG and LEAD with offsets and defaults": (
+        "SELECT order_id, amount, LAG(amount) OVER (ORDER BY order_id) AS prev, "
+        "LEAD(amount, 2, 0) OVER (ORDER BY order_id) AS after_next FROM orders",
+        None,
+    ),
+    # Customer 3's second order has a NULL amount; LAG returns it as a value.
+    "LAG within partitions": (
+        "SELECT order_id, customer_id, "
+        "LAG(amount) OVER (PARTITION BY customer_id ORDER BY order_id) AS prev, "
+        "LEAD(amount) OVER (PARTITION BY customer_id ORDER BY order_id) AS next "
+        "FROM orders",
+        None,
+    ),
+    # The default frame ends at the current row (and its ties), so
+    # LAST_VALUE is the current row's own value; the whole window gives the
+    # partition's last value.
+    "LAST_VALUE under the default frame and the whole window": (
+        "SELECT order_id, LAST_VALUE(amount) OVER (ORDER BY order_id) AS so_far, "
+        "LAST_VALUE(amount) OVER (ORDER BY order_id ROWS BETWEEN UNBOUNDED "
+        "PRECEDING AND UNBOUNDED FOLLOWING) AS overall FROM orders",
+        None,
+    ),
+    # Customer 3's amounts sort NULL first; IGNORE NULLS skips it.
+    "FIRST_VALUE with IGNORE NULLS": (
+        "SELECT order_id, FIRST_VALUE(amount) IGNORE NULLS OVER ("
+        "PARTITION BY customer_id ORDER BY amount NULLS FIRST ROWS BETWEEN "
+        "UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS lowest_known, "
+        "FIRST_VALUE(amount) OVER (PARTITION BY customer_id ORDER BY amount "
+        "NULLS FIRST) AS lowest FROM orders",
+        None,
+    ),
+    # Ten rows in three buckets: 4, 3, and 3.
+    "NTILE with uneven buckets": (
+        "SELECT order_id, NTILE(3) OVER (ORDER BY order_id) AS bucket FROM orders",
+        None,
+    ),
+    "moving average over three rows": (
+        "SELECT order_id, AVG(amount) OVER (ORDER BY order_id "
+        "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS moving FROM orders",
+        None,
+    ),
+    "frame after the current row, per partition": (
+        "SELECT order_id, SUM(amount) OVER (PARTITION BY status ORDER BY order_id "
+        "ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS with_next FROM orders",
+        None,
+    ),
+    # RANGE counts rows that tie on status as one: all 'completed' rows see
+    # the same rows from their own position to the end.
+    "RANGE frame to the end of the window": (
+        "SELECT order_id, status, COUNT(*) OVER (ORDER BY status "
+        "RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS from_here "
+        "FROM orders",
+        None,
+    ),
 }
 
 
@@ -154,6 +210,44 @@ DIALECT_SCENARIOS = {
         "SELECT order_id, ROW_NUMBER() OVER (ORDER BY order_id DESC) AS nth "
         "FROM orders ORDER BY nth LIMIT 3",
         ["nth"],
+    ),
+    # Snowflake documents the whole window as LAST_VALUE's default frame.
+    "Snowflake LAST_VALUE covers the whole window": (
+        "snowflake",
+        "SELECT order_id, LAST_VALUE(amount) OVER (ORDER BY order_id) AS final "
+        "FROM orders",
+        "SELECT order_id, LAST_VALUE(amount) OVER (ORDER BY order_id NULLS LAST "
+        "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS final "
+        "FROM orders",
+        None,
+    ),
+    # ROWS 2 PRECEDING ends at the current row.
+    "T-SQL short frame": (
+        "tsql",
+        "SELECT order_id, SUM(amount) OVER (ORDER BY order_id ROWS 2 PRECEDING) "
+        "AS recent FROM orders",
+        "SELECT order_id, SUM(amount) OVER (ORDER BY order_id "
+        "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS recent FROM orders",
+        None,
+    ),
+    "BigQuery LAST_VALUE with an explicit frame": (
+        "bigquery",
+        "SELECT order_id, LAST_VALUE(amount) OVER (PARTITION BY customer_id "
+        "ORDER BY order_id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED "
+        "FOLLOWING) AS final FROM orders",
+        "SELECT order_id, LAST_VALUE(amount) OVER (PARTITION BY customer_id "
+        "ORDER BY order_id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED "
+        "FOLLOWING) AS final FROM orders",
+        None,
+    ),
+    # Oracle sorts NULLs first when descending; the NULL customer comes first.
+    "Oracle LAG with a default, descending": (
+        "oracle",
+        "SELECT order_id, LAG(order_id, 1, 0) OVER (ORDER BY customer_id DESC, "
+        "order_id) AS before FROM orders",
+        "SELECT order_id, LAG(order_id, 1, 0) OVER (ORDER BY customer_id DESC "
+        "NULLS FIRST, order_id) AS before FROM orders",
+        None,
     ),
 }
 

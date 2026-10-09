@@ -1118,3 +1118,87 @@ def test_generic_children_include_window_keys() -> None:
         (C,),
         (ir.SortKey(C, True, False),),
     )
+
+
+# --- Offset functions and window frames --------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("frame", "method"),
+    [
+        (ir.WindowFrame(True, -2, 0), ".rowsBetween(-2, Window.currentRow)"),
+        (ir.WindowFrame(True, 0, 3), ".rowsBetween(Window.currentRow, 3)"),
+        (
+            ir.WindowFrame(True, None, None),
+            ".rowsBetween(Window.unboundedPreceding, Window.unboundedFollowing)",
+        ),
+        (
+            ir.WindowFrame(False, None, 0),
+            ".rangeBetween(Window.unboundedPreceding, Window.currentRow)",
+        ),
+    ],
+)
+def test_frames_are_written_as_window_methods(
+    frame: ir.WindowFrame, method: str
+) -> None:
+    call = ir.WindowCall(COUNT_ROWS, (), (ir.SortKey(A, False, True),), frame)
+
+    code = emit(Project(TableScan(("t",)), (Alias(call, "n"),)))
+
+    assert method in code
+
+
+def test_windows_with_different_frames_are_different_variables() -> None:
+    order = (ir.SortKey(A, False, True),)
+    plan = Project(
+        TableScan(("t",)),
+        (
+            Alias(ir.WindowCall(COUNT_ROWS, (), order), "running"),
+            Alias(
+                ir.WindowCall(COUNT_ROWS, (), order, ir.WindowFrame(True, -1, 0)),
+                "pair",
+            ),
+        ),
+    )
+
+    code = emit(plan)
+
+    assert 'window_1 = Window.orderBy(F.col("a").asc())\n' in code
+    assert (
+        'window_2 = Window.orderBy(F.col("a").asc())'
+        ".rowsBetween(-1, Window.currentRow)\n"
+    ) in code
+
+
+@pytest.mark.parametrize(
+    ("function", "code"),
+    [
+        (ir.FunctionCall("lag", (A,)), 'F.lag(F.col("a"))'),
+        (
+            ir.FunctionCall("lead", (A, Literal(2), Literal(0))),
+            'F.lead(F.col("a"), 2, 0)',
+        ),
+        (ir.FunctionCall("ntile", (Literal(4),)), "F.ntile(4)"),
+        (
+            ir.FunctionCall("first_value", (A, Literal(True))),
+            'F.first_value(F.col("a"), ignoreNulls=True)',
+        ),
+    ],
+)
+def test_offset_and_value_function_arguments(
+    function: ir.FunctionCall, code: str
+) -> None:
+    call = ir.WindowCall(function, (), (ir.SortKey(B, False, True),))
+
+    assert emit_expression(call).startswith(f"{code}.over(")
+
+
+@pytest.mark.parametrize(
+    ("rows", "start", "end"),
+    [(False, -1, 0), (False, 0, 2), (True, 2, 1)],
+)
+def test_invalid_window_frames_are_rejected(
+    rows: bool, start: int | None, end: int | None
+) -> None:
+    with pytest.raises(ValueError, match=r"RANGE frame|cannot end before"):
+        ir.WindowFrame(rows, start, end)

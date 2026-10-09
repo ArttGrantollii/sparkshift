@@ -2121,21 +2121,25 @@ def test_window_next_to_select_star() -> None:
             "aggregate function SUM in a window's PARTITION BY or ORDER BY",
         ),
         (
-            "SELECT SUM(a) OVER (ORDER BY b ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) "
-            "AS s FROM t",
-            None,
-            "window frame",
+            "SELECT SUM(a) OVER (ORDER BY b GROUPS BETWEEN 1 PRECEDING AND "
+            "CURRENT ROW) AS s FROM t",
+            "postgres",
+            "GROUPS window frame",
         ),
         (
             "SELECT SUM(a) OVER w AS s FROM t WINDOW w AS (PARTITION BY b)",
             None,
             "named window",
         ),
-        ("SELECT LAG(a) OVER (ORDER BY b) AS l FROM t", None, "window function LAG"),
         (
-            "SELECT FIRST_VALUE(a IGNORE NULLS) OVER (ORDER BY b) AS f FROM t",
+            "SELECT NTH_VALUE(a, 2) OVER (ORDER BY b) AS v FROM t",
             None,
-            "IGNORE NULLS",
+            "window function NTH_VALUE",
+        ),
+        (
+            "SELECT LEAD(a) IGNORE NULLS OVER (ORDER BY b) AS f FROM t",
+            None,
+            "IGNORE NULLS on LEAD",
         ),
         (
             "SELECT COUNT(DISTINCT a) OVER (PARTITION BY b) AS n FROM t",
@@ -2171,10 +2175,10 @@ def test_unsupported_window(sql: str, dialect: str | None, message: str) -> None
 
 
 def test_every_window_issue_is_reported() -> None:
-    issues = unsupported_issues("SELECT LAG(a) OVER (ORDER BY 1) AS l FROM t")
+    issues = unsupported_issues("SELECT NTH_VALUE(a, 2) OVER (ORDER BY 1) AS v FROM t")
 
     assert issues == [
-        ("window function LAG", "LAG(a)"),
+        ("window function NTH_VALUE", "NTH_VALUE(a, 2)"),
         ("constant in a window ORDER BY", "1"),
     ]
 
@@ -2222,3 +2226,265 @@ def test_unsupported_expression_is_named_by_its_kind() -> None:
     issues = unsupported_issues("SELECT (SELECT 1) AS x FROM t")
 
     assert issues == [("SUBQUERY expression", "(SELECT 1)")]
+
+
+# --- Offset functions and window frames --------------------------------------
+
+ORDER_BY_B = (ascending(B),)
+
+
+@pytest.mark.parametrize(
+    ("call", "function"),
+    [
+        ("LAG(a)", ir.FunctionCall("lag", (A,))),
+        ("LEAD(a, 2)", ir.FunctionCall("lead", (A, Literal(2)))),
+        ("LAG(a, 1, 0)", ir.FunctionCall("lag", (A, Literal(1), Literal(0)))),
+        # A NULL default is the default: nothing to pass.
+        ("LAG(a, 3, NULL)", ir.FunctionCall("lag", (A, Literal(3)))),
+        (
+            "LEAD(a, 1, -2.5)",
+            ir.FunctionCall("lead", (A, Literal(1), Literal(Decimal("-2.5")))),
+        ),
+        ("LAG(a, 1, 'none')", ir.FunctionCall("lag", (A, Literal(1), Literal("none")))),
+        # RESPECT NULLS is every function's default.
+        ("LAG(a) RESPECT NULLS", ir.FunctionCall("lag", (A,))),
+        ("FIRST_VALUE(a)", ir.FunctionCall("first_value", (A,))),
+        ("LAST_VALUE(a)", ir.FunctionCall("last_value", (A,))),
+        (
+            "LAST_VALUE(a) IGNORE NULLS",
+            ir.FunctionCall("last_value", (A, Literal(True))),
+        ),
+        ("NTILE(4)", ir.FunctionCall("ntile", (Literal(4),))),
+    ],
+)
+def test_offset_and_value_functions(call: str, function: ir.FunctionCall) -> None:
+    window = window_item(f"SELECT {call} OVER (ORDER BY b) AS v FROM t")
+
+    assert window == ir.WindowCall(function, (), ORDER_BY_B)
+
+
+@pytest.mark.parametrize(
+    ("frame", "expected"),
+    [
+        ("ROWS BETWEEN 2 PRECEDING AND CURRENT ROW", ir.WindowFrame(True, -2, 0)),
+        # A frame with only a start ends at the current row.
+        ("ROWS 3 PRECEDING", ir.WindowFrame(True, -3, 0)),
+        ("ROWS UNBOUNDED PRECEDING", ir.WindowFrame(True, None, 0)),
+        ("ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING", ir.WindowFrame(True, 0, 2)),
+        ("ROWS BETWEEN 1 FOLLOWING AND 3 FOLLOWING", ir.WindowFrame(True, 1, 3)),
+        (
+            "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+            ir.WindowFrame(True, None, None),
+        ),
+        (
+            "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+            ir.WindowFrame(False, None, 0),
+        ),
+        (
+            "RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING",
+            ir.WindowFrame(False, 0, None),
+        ),
+    ],
+)
+def test_window_frames(frame: str, expected: ir.WindowFrame) -> None:
+    window = window_item(f"SELECT SUM(a) OVER (ORDER BY b {frame}) AS s FROM t")
+
+    assert window.frame == expected
+
+
+def test_value_functions_take_explicit_frames() -> None:
+    window = window_item(
+        "SELECT LAST_VALUE(a) OVER (ORDER BY b ROWS BETWEEN UNBOUNDED PRECEDING "
+        "AND UNBOUNDED FOLLOWING) AS v FROM t",
+        "bigquery",
+    )
+
+    assert window.frame == ir.WindowFrame(True, None, None)
+
+
+def test_snowflake_value_functions_default_to_the_whole_window() -> None:
+    # Snowflake documents ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED
+    # FOLLOWING as the default frame of FIRST_VALUE and LAST_VALUE.
+    # SQLGlot's Snowflake parser adds that frame; this pins it.
+    window = window_item(
+        "SELECT LAST_VALUE(a) OVER (ORDER BY b) AS v FROM t", "snowflake"
+    )
+
+    assert window.frame == ir.WindowFrame(True, None, None)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # Without ORDER BY, every frame default covers the whole window.
+        "SELECT LAST_VALUE(a) OVER (PARTITION BY c) AS v FROM t",
+        # Snowflake's aggregates use SQL's default frame.
+        "SELECT SUM(a) OVER (ORDER BY b) AS v FROM t",
+    ],
+)
+def test_snowflake_keeps_the_default_frame_elsewhere(sql: str) -> None:
+    assert window_item(sql, "snowflake").frame is None
+
+
+@pytest.mark.parametrize(
+    ("sql", "dialect", "message"),
+    [
+        (
+            "SELECT ROW_NUMBER() OVER () AS rn FROM t",
+            None,
+            "ROW_NUMBER without ORDER BY",
+        ),
+        (
+            "SELECT LAG(a) OVER (PARTITION BY b) AS l FROM t",
+            None,
+            "LAG without ORDER BY",
+        ),
+        (
+            "SELECT RANK() OVER (ORDER BY b ROWS 1 PRECEDING) AS r FROM t",
+            None,
+            "window frame on RANK",
+        ),
+        (
+            "SELECT NTILE(2) OVER (ORDER BY b ROWS 1 PRECEDING) AS n FROM t",
+            None,
+            "window frame on NTILE",
+        ),
+        (
+            "SELECT LAG(a, -1) OVER (ORDER BY b) AS l FROM t",
+            None,
+            "LAG offset that is not a non-negative integer",
+        ),
+        (
+            "SELECT LEAD(a, c) OVER (ORDER BY b) AS l FROM t",
+            None,
+            "LEAD offset that is not a non-negative integer",
+        ),
+        (
+            "SELECT LAG(a, 1, c) OVER (ORDER BY b) AS l FROM t",
+            None,
+            "LAG default that is not a constant",
+        ),
+        (
+            "SELECT LAG(a, 1, -c) OVER (ORDER BY b) AS l FROM t",
+            None,
+            "LAG default that is not a constant",
+        ),
+        (
+            "SELECT LAG(a) IGNORE NULLS OVER (ORDER BY b) AS l FROM t",
+            "snowflake",
+            "IGNORE NULLS on LAG",
+        ),
+        (
+            "SELECT NTILE(0) OVER (ORDER BY b) AS n FROM t",
+            None,
+            "NTILE with a bucket count that is not a positive integer",
+        ),
+        (
+            "SELECT NTILE(c) OVER (ORDER BY b) AS n FROM t",
+            None,
+            "NTILE with a bucket count that is not a positive integer",
+        ),
+        (
+            "SELECT FIRST_VALUE(a) OVER (ORDER BY b) AS v FROM t",
+            "bigquery",
+            "FIRST_VALUE with ORDER BY but no frame",
+        ),
+        (
+            "SELECT SUM(a) OVER (ORDER BY b RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) "
+            "AS s FROM t",
+            None,
+            "RANGE frame with an offset",
+        ),
+        (
+            "SELECT SUM(a) OVER (ORDER BY b ROWS BETWEEN 1 FOLLOWING AND 1 PRECEDING) "
+            "AS s FROM t",
+            None,
+            "window frame that ends before it starts",
+        ),
+        (
+            "SELECT SUM(a) OVER (PARTITION BY b ROWS 1 PRECEDING) AS s FROM t",
+            None,
+            "window frame without ORDER BY",
+        ),
+        (
+            "SELECT SUM(a) OVER (ORDER BY b ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING "
+            "EXCLUDE CURRENT ROW) AS s FROM t",
+            "postgres",
+            "window frame with EXCLUDE",
+        ),
+        (
+            "SELECT SUM(a) OVER (ORDER BY b ROWS BETWEEN c PRECEDING AND CURRENT ROW) "
+            "AS s FROM t",
+            None,
+            "window frame offset that is not a non-negative integer",
+        ),
+        (
+            "SELECT SUM(a) OVER (ORDER BY b ROWS BETWEEN UNBOUNDED FOLLOWING AND "
+            "CURRENT ROW) AS s FROM t",
+            None,
+            "window frame start at UNBOUNDED FOLLOWING",
+        ),
+        (
+            "SELECT SUM(a) OVER (ORDER BY b ROWS BETWEEN CURRENT ROW AND "
+            "UNBOUNDED PRECEDING) AS s FROM t",
+            None,
+            "window frame end at UNBOUNDED PRECEDING",
+        ),
+    ],
+)
+def test_unsupported_offset_function_or_frame(
+    sql: str, dialect: str | None, message: str
+) -> None:
+    assert message in [issue for issue, _ in unsupported_issues(sql, dialect)]
+
+
+def test_offset_function_value_issues_are_reported() -> None:
+    issues = unsupported_issues(
+        "SELECT LAG(my_udf(a)) OVER (ORDER BY b) AS l, "
+        "LAST_VALUE(my_udf(c)) OVER (ORDER BY b) AS v FROM t"
+    )
+
+    assert issues == [
+        ("function MY_UDF", "MY_UDF(a)"),
+        ("function MY_UDF", "MY_UDF(c)"),
+    ]
+
+
+def test_whole_window_frame_without_order_by_is_the_default() -> None:
+    window = window_item(
+        "SELECT SUM(a) OVER (PARTITION BY c ROWS BETWEEN UNBOUNDED PRECEDING "
+        "AND UNBOUNDED FOLLOWING) AS s FROM t"
+    )
+
+    assert window == ir.WindowCall(
+        ir.AggregateCall(ir.AggregateFunction.SUM, (A,)), (C,)
+    )
+
+
+@pytest.mark.parametrize(
+    ("sql", "node_type", "message"),
+    [
+        ("SELECT LAG(a) OVER (ORDER BY b) AS v FROM t", exp.Lag, "LAG with EXTRA"),
+        (
+            "SELECT LAST_VALUE(a) OVER (ORDER BY b) AS v FROM t",
+            exp.LastValue,
+            "LAST_VALUE with EXTRA",
+        ),
+        (
+            "SELECT NTILE(2) OVER (ORDER BY b) AS v FROM t",
+            exp.Ntile,
+            "NTILE with EXTRA",
+        ),
+    ],
+)
+def test_unknown_parts_of_window_functions_are_rejected(
+    sql: str, node_type: type[exp.Expression], message: str
+) -> None:
+    # Parts a future SQLGlot version may add must never be silently dropped.
+    tree = parse_sql(sql)
+    tree.find(node_type).set("extra", exp.Literal.number(1))
+
+    with pytest.raises(UnsupportedSQLError) as caught:
+        translate(tree)
+
+    assert [issue.message for issue in caught.value.issues] == [message]

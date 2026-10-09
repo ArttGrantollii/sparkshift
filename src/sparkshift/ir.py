@@ -225,19 +225,43 @@ class WindowFunction(Enum):
 
 
 @dataclass(frozen=True)
+class WindowFrame:
+    """The rows of a window that a function covers, relative to the current
+    row: ``start`` and ``end`` are offsets, negative before the current row
+    and positive after it, or None for the window's first or last row.
+
+    With ``rows``, offsets count rows (SQL's ROWS). Otherwise rows that tie
+    with the current row on the window's ORDER BY count as one (RANGE), and
+    only None and 0 are allowed.
+    """
+
+    rows: bool
+    start: int | None
+    end: int | None
+
+    def __post_init__(self) -> None:
+        if not self.rows and {self.start, self.end} - {None, 0}:
+            raise ValueError("A RANGE frame only takes unbounded or 0 offsets")
+        if self.start is not None and self.end is not None and self.start > self.end:
+            raise ValueError("A window frame cannot end before it starts")
+
+
+@dataclass(frozen=True)
 class WindowCall:
     """A function computed for each row over related rows, as in
     ``SUM(amount) OVER (PARTITION BY customer_id ORDER BY order_date)``.
 
-    Rows with the same ``partition_by`` values form a window. With
-    ``order_by``, an aggregate covers the rows up to the current one,
-    including all rows that tie with it (SQL's default frame); without it,
-    the whole window.
+    Rows with the same ``partition_by`` values form a window. Without a
+    ``frame``, a function with ``order_by`` covers the rows up to the current
+    one, including all rows that tie with it (SQL's default frame); without
+    ``order_by``, the whole window. ``function`` is a ranking, an aggregate,
+    or a function that only works over a window, such as ``lag``.
     """
 
-    function: "WindowFunction | AggregateCall"
+    function: "WindowFunction | AggregateCall | FunctionCall"
     partition_by: tuple["Expression", ...] = ()
     order_by: tuple[SortKey, ...] = ()
+    frame: WindowFrame | None = None
 
 
 Expression: TypeAlias = (

@@ -34,7 +34,7 @@ _PLAIN_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 # Parameters that PySpark functions take as plain Python values rather than
 # Columns, by position: F.round(col, 2), F.substring(col, 2, 3),
-# F.concat_ws("", ...), F.log(10.0, col).
+# F.concat_ws("", ...), F.log(10.0, col), F.lag(col, 2, 0).
 _PLAIN_VALUE_PARAMETERS = {
     "round": frozenset({1}),
     "substring": frozenset({1, 2}),
@@ -42,6 +42,16 @@ _PLAIN_VALUE_PARAMETERS = {
     "log": frozenset({0}),
     "date_trunc": frozenset({0}),
     "trunc": frozenset({1}),
+    "lag": frozenset({1, 2}),
+    "lead": frozenset({1, 2}),
+    "ntile": frozenset({0}),
+}
+
+# Flags passed by keyword, so the code says what they mean:
+# F.first_value(col, ignoreNulls=True).
+_KEYWORD_PARAMETERS = {
+    "first_value": {1: "ignoreNulls"},
+    "last_value": {1: "ignoreNulls"},
 }
 
 # Python operator precedence, from loosest to tightest binding. PySpark builds
@@ -143,19 +153,24 @@ class _Emitter:
 
     def window_calls(self, key: "_WindowKey") -> list[str]:
         self.uses_window = True
-        partition_by, order_by = key
+        partition_by, order_by, frame = key
         calls = []
         if partition_by or not order_by:
             # An empty partitionBy() is one window over all rows: OVER ().
             calls.append(self.call("partitionBy", partition_by))
         if order_by:
             calls.append(self.call("orderBy", order_by))
+        if frame is not None:
+            method = "rowsBetween" if frame.rows else "rangeBetween"
+            start = _frame_bound(frame.start, "Window.unboundedPreceding")
+            end = _frame_bound(frame.end, "Window.unboundedFollowing")
+            calls.append(f".{method}({start}, {end})")
         return calls
 
     def window_name(self, call: ir.WindowCall) -> str:
         """The variable holding a call's window, or the window itself when the
         code is a single expression with no variables."""
-        key = (call.partition_by, call.order_by)
+        key = _window_key(call)
         name = self.window_variables.get(key)
         return name if name is not None else f"Window{''.join(self.window_calls(key))}"
 
@@ -317,7 +332,9 @@ class _Emitter:
             case ir.InList(expression=inner, values=values):
                 receiver = f"{self.operand(inner, _ATOM)}.isin"
                 return self.wrapped_call(receiver, list(values), column)
-            case ir.WindowCall(function=ir.AggregateCall() as function):
+            case ir.WindowCall(
+                function=ir.AggregateCall() | ir.FunctionCall() as function
+            ):
                 suffix = f".over({self.window_name(expression)})"
                 return self.suffixed(function, suffix, column)
             case ir.Between(expression=inner, low=low, high=high):
@@ -400,12 +417,17 @@ class _Emitter:
         """Arguments of a pyspark function, with plain-value parameters rendered
         as Python values: F.round(col, 2), not F.round(col, F.lit(2))."""
         plain = _PLAIN_VALUE_PARAMETERS.get(name, frozenset())
-        return [
-            self.python_value(argument.value)
-            if position in plain and isinstance(argument, ir.Literal)
-            else argument
-            for position, argument in enumerate(arguments)
-        ]
+        keywords = _KEYWORD_PARAMETERS.get(name, {})
+        values: list[ir.Expression | str] = []
+        for position, argument in enumerate(arguments):
+            if position in keywords and isinstance(argument, ir.Literal):
+                value = self.python_value(argument.value)
+                values.append(f"{keywords[position]}={value}")
+            elif position in plain and isinstance(argument, ir.Literal):
+                values.append(self.python_value(argument.value))
+            else:
+                values.append(argument)
+        return values
 
     # --- Expressions -----------------------------------------------------
 
@@ -613,8 +635,20 @@ def _walk(plan: ir.Relation) -> Iterator[ir.Relation]:
             yield from _walk(source)
 
 
-# A window's identity: its PARTITION BY and ORDER BY.
-_WindowKey: TypeAlias = tuple[tuple[ir.Expression, ...], tuple[ir.SortKey, ...]]
+_WindowKey: TypeAlias = tuple[
+    tuple[ir.Expression, ...], tuple[ir.SortKey, ...], ir.WindowFrame | None
+]
+
+
+def _window_key(call: ir.WindowCall) -> _WindowKey:
+    """A window's identity: its PARTITION BY, ORDER BY, and frame."""
+    return call.partition_by, call.order_by, call.frame
+
+
+def _frame_bound(offset: int | None, unbounded: str) -> str:
+    if offset is None:
+        return unbounded
+    return "Window.currentRow" if offset == 0 else str(offset)
 
 
 def window_variables(plan: ir.Relation, taken: set[str]) -> dict[_WindowKey, str]:
@@ -624,7 +658,7 @@ def window_variables(plan: ir.Relation, taken: set[str]) -> dict[_WindowKey, str
     keys: list[_WindowKey] = []
     for expression in _expressions(plan):
         if isinstance(expression, ir.WindowCall):
-            key = (expression.partition_by, expression.order_by)
+            key = _window_key(expression)
             if key not in keys:
                 keys.append(key)
     names = (

@@ -102,3 +102,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   once as a variable. Rejects explicit frames, other window functions,
   `IGNORE NULLS`, named windows, `DISTINCT` in windows, and windows outside
   the `SELECT` list or in aggregate queries.
+- `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, and `NTILE`, and explicit `ROWS`
+  and `RANGE` window frames. `IGNORE NULLS` for `FIRST_VALUE` and
+  `LAST_VALUE`. Snowflake's documented whole-window default for `FIRST_VALUE`
+  and `LAST_VALUE` is written out as an explicit frame; BigQuery, whose
+  default is undocumented, needs an explicit frame. Rejects `RANGE` offsets,
+  `GROUPS` frames, `EXCLUDE`, and frames on ranking and offset functions.
+
+### Fixed
+
+- `ROW_NUMBER`, `RANK`, and `DENSE_RANK` without `ORDER BY` in the window are
+  now rejected; they produced code that Spark refuses to run.

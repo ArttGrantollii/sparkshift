@@ -86,8 +86,9 @@ UnsupportedSQLError: 2 unsupported constructs:
 | Date arithmetic in days, weeks, months, years: `+`/`-` `INTERVAL`, `DATEADD`, `DATE_ADD`, `DATE_SUB` | Supported; keeps the input type |
 | Day differences: `DATEDIFF` and `DATE_DIFF` in days | Supported, with each dialect's argument order |
 | `DATE_TRUNC` to year, quarter, month; `CURRENT_DATE`, `CURRENT_TIMESTAMP`; casts to timestamp types | Supported, with dialect rules below |
-| Window functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, and `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` `OVER (PARTITION BY ... ORDER BY ...)` | Supported in the `SELECT` list of queries without `GROUP BY`, with SQL's default frame |
-| Window frames (`ROWS`/`RANGE BETWEEN`), `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTILE`, `IGNORE NULLS`, named windows, `QUALIFY`, and windows in aggregate queries | Unsupported — rejected with an error |
+| Window functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, and `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` `OVER (PARTITION BY ... ORDER BY ...)` | Supported in the `SELECT` list of queries without `GROUP BY` |
+| Window frames: `ROWS BETWEEN` with `UNBOUNDED`, `n PRECEDING`, `CURRENT ROW`, `n FOLLOWING`; `RANGE BETWEEN` with `UNBOUNDED` and `CURRENT ROW`; `IGNORE NULLS` for `FIRST_VALUE`/`LAST_VALUE` | Supported |
+| `NTH_VALUE`, `RANGE` frames with offsets, `GROUPS` frames, `EXCLUDE`, `IGNORE NULLS` for `LAG`/`LEAD`, named windows, `QUALIFY`, and windows in aggregate queries | Unsupported — rejected with an error |
 | `NATURAL`, semi, anti, and as-of joins; joins to subqueries; `LATERAL` and `APPLY` | Unsupported — rejected with an error |
 | `GROUP BY` expressions, `ROLLUP`, `CUBE`, `GROUPING SETS`, `AVG(DISTINCT ...)` | Unsupported — rejected with an error |
 | `IN (subquery)`, `LIKE ... ESCAPE`, `IS TRUE`/`IS FALSE`, casts to `FLOAT`/`REAL`, `CHAR(n)`/`VARCHAR(n)`, unparameterized `DECIMAL`, and timestamps | Unsupported — rejected with an error |
@@ -112,6 +113,7 @@ behavior:
 | `x + INTERVAL '3' DAY`, `DATEADD(day, 3, x)` | All | Keeps the input type (a timestamp keeps its time of day) | `x + F.make_interval(days=...)` |
 | `DATE_TRUNC('month', x)` | PostgreSQL | Returns a timestamp | `F.date_trunc("month", x)` |
 | `DATE_TRUNC(x, MONTH)` | BigQuery | Returns a date | `F.trunc(x, "month")` |
+| `FIRST_VALUE`, `LAST_VALUE` without a frame | Snowflake | Cover the whole window | `.rowsBetween(Window.unboundedPreceding, Window.unboundedFollowing)` |
 
 ### Timestamps and time zones
 
@@ -143,6 +145,17 @@ when it differs from Spark's default, for example `.asc_nulls_last()`:
 The same applies to `ORDER BY` inside a window. An explicit `NULLS FIRST`
 or `NULLS LAST` always wins. A plain `ORDER BY` name means a `SELECT` alias
 before a same-named table column, as standard SQL specifies.
+
+### Window frames
+
+Without an explicit frame, a window function with `ORDER BY` covers the rows
+up to the current row and every row tied with it, as standard SQL and Spark
+specify. So `LAST_VALUE(x) OVER (ORDER BY d)` is usually the current row's
+own value; add `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` for
+the window's last value. Snowflake documents the whole window as the default
+for `FIRST_VALUE` and `LAST_VALUE`, and SparkShift writes that frame out.
+BigQuery does not document this default, so these functions need an explicit
+frame there.
 
 ### Dialect differences
 
@@ -182,6 +195,9 @@ rejects it rather than guess:
 | `CAST(x AS DATETIME)`, `SMALLDATETIME` | T-SQL | Round to 1/300 of a second or to the minute. |
 | `CAST(x AS TIMESTAMP)` | T-SQL | Means `ROWVERSION`, a binary row version. |
 | `SYSDATE` | Oracle | No fractional seconds; uses the server's time zone. |
+| `FIRST_VALUE`, `LAST_VALUE` with `ORDER BY` but no frame | BigQuery | The default frame is not documented. |
+| `RANGE BETWEEN 5 PRECEDING AND ...` | All | The offset is measured in the `ORDER BY` column's type (a number, or an interval for dates), which only the schema would tell. |
+| `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `LAG`, `LEAD` without `ORDER BY` | PostgreSQL, MySQL, others | The result depends on an arbitrary row order, and Spark requires an `ORDER BY`. |
 
 ### Known limitations
 

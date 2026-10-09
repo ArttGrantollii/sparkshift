@@ -67,11 +67,14 @@ _WINDOW_FUNCTIONS: dict[type[exp.Expression], ir.WindowFunction] = {
 }
 
 # Parts of an OVER clause SparkShift does not handle yet.
-_WINDOW_PART_NAMES = {"spec": "window frame", "alias": "named window"}
-_WINDOW_FRAME_HINT = (
-    "Explicit frames such as ROWS BETWEEN are not supported yet; without one, "
-    "SQL's default frame applies."
+_WINDOW_PART_NAMES = {"alias": "named window"}
+
+# Window functions Spark only computes over an ordered window without a
+# frame, and the ones whose result depends on the frame's last row.
+_ORDERED_WINDOW_FUNCTIONS = frozenset(
+    {"ROW_NUMBER", "RANK", "DENSE_RANK", "LAG", "LEAD", "NTILE"}
 )
+_VALUE_WINDOW_FUNCTIONS = frozenset({"FIRST_VALUE", "LAST_VALUE"})
 _WINDOW_PLACE_HINT = (
     "Window functions are supported in the SELECT list of queries without "
     "GROUP BY, with an alias."
@@ -1244,16 +1247,15 @@ class _Translator:
     # --- Window functions ------------------------------------------------
 
     def window(self, node: exp.Window) -> ir.Expression | None:
-        """Translate ``function OVER (PARTITION BY ... ORDER BY ...)``."""
+        """Translate ``function OVER (PARTITION BY ... ORDER BY ... frame)``."""
         if self.no_windows is not None:
             self.unsupported(self.no_windows, node, hint=_WINDOW_PLACE_HINT)
             return None
         supported = True
         for part, value in node.args.items():
-            if value and part not in ("this", "partition_by", "order", "over"):
+            if value and part not in ("this", "partition_by", "order", "spec", "over"):
                 name = _WINDOW_PART_NAMES.get(part, f"window {part.upper()}")
-                hint = _WINDOW_FRAME_HINT if part == "spec" else None
-                self.unsupported(name, node, hint)
+                self.unsupported(name, node)
                 supported = False
         order = node.args.get("order")
         if order is not None:
@@ -1276,26 +1278,69 @@ class _Translator:
         finally:
             self.no_windows, self.no_aggregates_in = outside_windows, outside_aggregates
 
-        if not supported or function is None:
+        spec = node.args.get("spec")
+        issues_before = len(self.issues)
+        frame = (
+            None if spec is None else self.window_frame(spec, ordered=bool(order_by))
+        )
+        if function is None or not supported or len(self.issues) > issues_before:
             return None
         if any(key is None for key in partition_by) or None in order_by:
+            return None
+
+        name = _window_function_name(function)
+        if name in _ORDERED_WINDOW_FUNCTIONS:
+            # Spark requires an ORDER BY for these and rejects a frame, which
+            # they ignore in the databases that accept one.
+            if not order_by:
+                self.unsupported(
+                    f"{name} without ORDER BY",
+                    node,
+                    hint="Spark requires an ORDER BY in the window; without one, "
+                    "the result depends on an arbitrary row order.",
+                )
+                return None
+            if spec is not None:
+                self.unsupported(
+                    f"window frame on {name}",
+                    spec,
+                    hint="This function does not use a frame; remove it.",
+                )
+                return None
+        if (
+            name in _VALUE_WINDOW_FUNCTIONS
+            and spec is None
+            and order_by
+            and self.dialect == "bigquery"
+        ):
+            # Without a frame, Spark and most databases use SQL's default: up
+            # to the current row and its ties. (For Snowflake, whose documented
+            # default is the whole window, SQLGlot adds that frame itself.)
+            self.unsupported(
+                f"{name} with ORDER BY but no frame",
+                node,
+                hint="BigQuery does not document this function's default "
+                "frame. Add one, for example ROWS BETWEEN UNBOUNDED "
+                "PRECEDING AND UNBOUNDED FOLLOWING.",
+            )
             return None
         return ir.WindowCall(
             function,
             tuple(key for key in partition_by if key is not None),
             tuple(key for key in order_by if key is not None),
+            frame,
         )
 
     def window_function(
         self, node: exp.Expression
-    ) -> ir.WindowFunction | ir.AggregateCall | None:
-        """The function computed over a window: a ranking or an aggregate."""
-        if isinstance(node, exp.IgnoreNulls | exp.RespectNulls):
-            name = (
-                "IGNORE NULLS" if isinstance(node, exp.IgnoreNulls) else "RESPECT NULLS"
-            )
-            self.unsupported(name, node)
-            return None
+    ) -> ir.WindowFunction | ir.AggregateCall | ir.FunctionCall | None:
+        """The function computed over a window: a ranking, an aggregate, or a
+        function such as LAG that only works over a window."""
+        if isinstance(node, exp.RespectNulls):
+            # RESPECT NULLS is every function's default behavior.
+            return self.window_function(node.this)
+        if isinstance(node, exp.IgnoreNulls):
+            return self.ignore_nulls(node)
         if isinstance(node, exp.Window):
             # SQLGlot represents Oracle's MAX(x) KEEP (...) as a nested window.
             self.unsupported("KEEP (DENSE_RANK FIRST/LAST ...)", node)
@@ -1307,6 +1352,12 @@ class _Translator:
                 self.unsupported(f"{ranking.name} with arguments", node)
                 return None
             return ranking
+        if isinstance(node, exp.Lag | exp.Lead):
+            return self.offset_function(node)
+        if isinstance(node, exp.FirstValue | exp.LastValue):
+            return self.value_function(node, ignore_nulls=False)
+        if isinstance(node, exp.Ntile):
+            return self.ntile(node)
         aggregate = _AGGREGATE_FUNCTIONS.get(type(node))
         if aggregate is not None:
             if isinstance(node.this, exp.Distinct):
@@ -1321,6 +1372,153 @@ class _Translator:
         name = node.sql_name() if isinstance(node, exp.Func) else node.key
         self.unsupported(f"window function {name.upper()}", node)
         return None
+
+    def ignore_nulls(self, node: exp.IgnoreNulls) -> ir.FunctionCall | None:
+        """FIRST_VALUE and LAST_VALUE can skip NULLs; PySpark's lag and lead
+        cannot."""
+        inner = node.this
+        if isinstance(inner, exp.FirstValue | exp.LastValue):
+            return self.value_function(inner, ignore_nulls=True)
+        name = inner.sql_name() if isinstance(inner, exp.Func) else inner.key
+        self.unsupported(f"IGNORE NULLS on {name.upper()}", node)
+        return None
+
+    def offset_function(self, node: exp.Lag | exp.Lead) -> ir.FunctionCall | None:
+        """``LAG(x, offset, default)``: x from the row ``offset`` rows before
+        (LEAD: after), or ``default`` when there is no such row."""
+        name = "lag" if isinstance(node, exp.Lag) else "lead"
+        if not self.check_parts(node, {"this", "offset", "default"}, name.upper()):
+            return None
+        value = self.expression(node.this)
+        offset_node = node.args.get("offset")
+        offset = 1 if offset_node is None else _integer_literal(offset_node)
+        if offset is None or offset < 0:
+            self.unsupported(
+                f"{name.upper()} offset that is not a non-negative integer",
+                offset_node,
+            )
+            return None
+        default_node = node.args.get("default")
+        default = None if default_node is None else self.constant(default_node)
+        if default_node is not None and default is None:
+            self.unsupported(
+                f"{name.upper()} default that is not a constant", default_node
+            )
+            return None
+        if value is None:
+            return None
+        arguments: list[ir.Expression] = [value]
+        if default is not None and default.value is not None:
+            arguments += [ir.Literal(offset), default]
+        elif offset != 1:
+            arguments.append(ir.Literal(offset))
+        return ir.FunctionCall(name, tuple(arguments))
+
+    def value_function(
+        self, node: exp.FirstValue | exp.LastValue, ignore_nulls: bool
+    ) -> ir.FunctionCall | None:
+        name = "first_value" if isinstance(node, exp.FirstValue) else "last_value"
+        if not self.check_parts(node, {"this"}, name.upper()):
+            return None
+        value = self.expression(node.this)
+        if value is None:
+            return None
+        if ignore_nulls:
+            return ir.FunctionCall(name, (value, ir.Literal(True)))
+        return ir.FunctionCall(name, (value,))
+
+    def ntile(self, node: exp.Ntile) -> ir.FunctionCall | None:
+        """``NTILE(n)``: split the ordered rows into n buckets as evenly as
+        possible, the first buckets taking one extra row each."""
+        if not self.check_parts(node, {"this"}, "NTILE"):
+            return None
+        buckets = _integer_literal(node.this)
+        if buckets is None or buckets < 1:
+            self.unsupported(
+                "NTILE with a bucket count that is not a positive integer",
+                node.this,
+            )
+            return None
+        return ir.FunctionCall("ntile", (ir.Literal(buckets),))
+
+    def constant(self, node: exp.Expression) -> ir.Literal | None:
+        """A literal value, including a negative number, or None."""
+        if isinstance(node, exp.Literal | exp.Boolean | exp.Null):
+            return self.literal(node)
+        if (
+            isinstance(node, exp.Neg)
+            and isinstance(node.this, exp.Literal)
+            and not node.this.is_string
+        ):
+            value = self.literal(node.this).value
+            assert isinstance(value, int | Decimal | float)
+            return ir.Literal(-value)
+        return None
+
+    def window_frame(
+        self, spec: exp.WindowSpec, ordered: bool
+    ) -> ir.WindowFrame | None:
+        """Translate ``ROWS``/``RANGE BETWEEN start AND end``. A frame with only
+        a start, such as ``ROWS 3 PRECEDING``, ends at the current row.
+
+        Returns None, with no issue, for a whole-window frame without ORDER
+        BY: that is already the default. Other problems are reported."""
+        if not self.check_parts(
+            spec, {"kind", "start", "start_side", "end", "end_side"}, "window frame"
+        ):
+            return None
+        kind = spec.args.get("kind")
+        if kind not in ("ROWS", "RANGE"):
+            self.unsupported(f"{kind} window frame", spec)
+            return None
+        rows = kind == "ROWS"
+        issues_before = len(self.issues)
+        start = self.frame_bound(spec, "start", rows)
+        end = 0 if spec.args.get("end") is None else self.frame_bound(spec, "end", rows)
+        if len(self.issues) > issues_before:
+            return None
+        if not ordered:
+            if start is None and end is None:
+                return None
+            self.unsupported(
+                "window frame without ORDER BY",
+                spec,
+                hint="Without ORDER BY, which rows a frame covers is arbitrary.",
+            )
+            return None
+        if start is not None and end is not None and start > end:
+            self.unsupported("window frame that ends before it starts", spec)
+            return None
+        return ir.WindowFrame(rows, start, end)
+
+    def frame_bound(self, spec: exp.WindowSpec, which: str, rows: bool) -> int | None:
+        """One end of a frame as a row offset; None for UNBOUNDED. Problems
+        are reported as issues."""
+        bound = spec.args.get(which)
+        side = spec.args.get(f"{which}_side")
+        if bound == "CURRENT ROW":
+            return 0
+        if bound == "UNBOUNDED":
+            expected = "PRECEDING" if which == "start" else "FOLLOWING"
+            if side != expected:
+                self.unsupported(f"window frame {which} at UNBOUNDED {side}", spec)
+            return None
+        if not rows:
+            self.unsupported(
+                "RANGE frame with an offset",
+                spec,
+                hint="A RANGE offset is measured in the ORDER BY column's type "
+                "(a number, or an interval for dates), which only the schema "
+                "would tell. Use ROWS, or UNBOUNDED and CURRENT ROW.",
+            )
+            return None
+        count = _integer_literal(bound) if isinstance(bound, exp.Expression) else None
+        if count is None or count < 0:
+            self.unsupported(
+                "window frame offset that is not a non-negative integer", spec
+            )
+            return None
+        return -count if side == "PRECEDING" else count
 
     def window_sort_key(self, node: exp.Ordered) -> ir.SortKey | None:
         """Translate a window's ORDER BY key. SQLGlot sets ``nulls_first``
@@ -2122,6 +2320,16 @@ def _calls_function(expression: ir.Expression) -> bool:
     if isinstance(expression, ir.FunctionCall | ir.Interval):
         return True
     return any(_calls_function(child) for child in ir.children(expression))
+
+
+def _window_function_name(
+    function: ir.WindowFunction | ir.AggregateCall | ir.FunctionCall,
+) -> str:
+    if isinstance(function, ir.WindowFunction):
+        return function.name
+    if isinstance(function, ir.AggregateCall):
+        return function.function.name
+    return function.name.upper()
 
 
 def _has_window(expression: ir.Expression) -> bool:
