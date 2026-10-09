@@ -99,6 +99,11 @@ class _Emitter:
         self.table_variables: dict[tuple[str, ...], str] = {}
         self.table_uses: Counter[tuple[str, ...]] = Counter()
         self.window_variables: dict[_WindowKey, str] = {}
+        self.named_variables: dict[ir.Named, str] = {}
+        # Variable declarations for named relations, in the order the code
+        # needs them, so each comes after the ones it uses.
+        self.declarations: list[str] = []
+        self.taken_names: set[str] = set(_RESERVED_NAMES)
 
     def program(self, plan: ir.Relation) -> str:
         self.table_uses = Counter(
@@ -111,6 +116,8 @@ class _Emitter:
         self.window_variables = window_variables(
             plan, set(self.table_variables.values())
         )
+        self.taken_names |= {*self.table_variables.values()}
+        self.taken_names |= {*self.window_variables.values()}
 
         statement = f"{RESULT_VARIABLE} = {self.relation(plan)}\n"
         windows = [
@@ -137,8 +144,21 @@ class _Emitter:
         if windows:
             sections.append("\n".join(windows))
         # Standard-library imports, third-party imports, table variables,
-        # windows, and the result are separated by blank lines.
-        return "\n\n".join([*sections, statement])
+        # windows, each named relation, and the result are separated by blank
+        # lines.
+        return "\n\n".join([*sections, *self.declarations, statement])
+
+    def named_variable(self, node: ir.Named) -> str:
+        """The variable holding a named relation. It is declared the first time
+        the code uses it, after any named relations it uses itself."""
+        name = self.named_variables.get(node)
+        if name is None:
+            code = self.relation(node.source)
+            name = _unique_name(_python_name(node.name), self.taken_names)
+            self.taken_names.add(name)
+            self.named_variables[node] = name
+            self.declarations.append(f"{name} = {code}")
+        return name
 
     def window_variable(self, name: str, key: "_WindowKey") -> str:
         """``name = Window.partitionBy(...).orderBy(...)``, on one line if it
@@ -196,6 +216,12 @@ class _Emitter:
         match plan:
             case ir.TableScan(name_parts=parts):
                 return self.table_variables.get(parts, _spark_table(parts)), []
+            case ir.Named():
+                return self.named_variable(plan), []
+            case ir.RenameColumns(source=source, names=names):
+                start, calls = self.chain(source)
+                renamed = self.call("toDF", [python_string(name) for name in names])
+                return start, [*calls, renamed]
             case ir.RelationAlias(source=source, name=name):
                 if self.is_redundant_alias(source, name):
                     return self.chain(source)
@@ -615,24 +641,46 @@ def _python_name(text: str) -> str:
 
 
 def _walk(plan: ir.Relation) -> Iterator[ir.Relation]:
-    """Yield every relation in the plan, left side before right side."""
-    yield plan
-    match plan:
-        case ir.TableScan():
-            return
-        case ir.Join(left=left, right=right):
-            yield from _walk(left)
-            yield from _walk(right)
-        case (
-            ir.RelationAlias(source=source)
-            | ir.Filter(source=source)
-            | ir.Aggregate(source=source)
-            | ir.Project(source=source)
-            | ir.Distinct(source=source)
-            | ir.Sort(source=source)
-            | ir.Limit(source=source)
-        ):
-            yield from _walk(source)
+    """Yield every relation in the plan, left side before right side. A named
+    relation used several times is computed once, so its body is visited
+    once."""
+    seen: set[ir.Named] = set()
+
+    def walk(node: ir.Relation) -> Iterator[ir.Relation]:
+        yield node
+        match node:
+            case ir.TableScan():
+                return
+            case ir.Named(source=source):
+                if node not in seen:
+                    seen.add(node)
+                    yield from walk(source)
+            case ir.Join(left=left, right=right):
+                yield from walk(left)
+                yield from walk(right)
+            case (
+                ir.RenameColumns(source=source)
+                | ir.RelationAlias(source=source)
+                | ir.Filter(source=source)
+                | ir.Aggregate(source=source)
+                | ir.Project(source=source)
+                | ir.Distinct(source=source)
+                | ir.Sort(source=source)
+                | ir.Limit(source=source)
+            ):
+                yield from walk(source)
+
+    return walk(plan)
+
+
+def _unique_name(name: str, taken: set[str]) -> str:
+    """``name``, or ``name_2``, ``name_3``, ... if it is already taken."""
+    if name not in taken:
+        return name
+    suffix = 2
+    while f"{name}_{suffix}" in taken:
+        suffix += 1
+    return f"{name}_{suffix}"
 
 
 _WindowKey: TypeAlias = tuple[

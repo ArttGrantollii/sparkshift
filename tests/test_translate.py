@@ -242,11 +242,12 @@ def test_tsql_subtraction_is_supported() -> None:
 
 def test_all_unsupported_constructs_are_reported_together() -> None:
     issues = unsupported_issues(
-        "WITH x AS (SELECT 1) SELECT name FROM customers LIMIT 5 OFFSET 2"
+        "WITH RECURSIVE x AS (SELECT a FROM t) SELECT name FROM customers "
+        "LIMIT 5 OFFSET 2"
     )
 
     assert issues == [
-        ("WITH clause", "WITH x AS (SELECT 1)"),
+        ("WITH RECURSIVE", "WITH RECURSIVE x AS (SELECT a FROM t)"),
         ("OFFSET clause", "OFFSET 2"),
     ]
 
@@ -288,7 +289,7 @@ def test_issues_inside_one_expression_are_all_reported() -> None:
         (
             "WITH x AS (SELECT 1) SELECT * FROM x",
             None,
-            ("WITH clause", "WITH x AS (SELECT 1)"),
+            ("SELECT without FROM", "SELECT 1"),
         ),
         ("SELECT * FROM t WITH (NOLOCK)", "tsql", ("table hint", "t WITH (NOLOCK)")),
         (
@@ -299,7 +300,7 @@ def test_issues_inside_one_expression_are_all_reported() -> None:
         (
             "SELECT * FROM (SELECT 1) s",
             None,
-            ("FROM source other than a table", "(SELECT 1) AS s"),
+            ("SELECT without FROM", "SELECT 1"),
         ),
         (
             "SELECT * FROM UNNEST([1, 2])",
@@ -610,11 +611,6 @@ def test_join_then_where_then_select() -> None:
         (
             "SELECT * FROM a JOIN LATERAL (SELECT 1) s ON TRUE",
             "postgres",
-            "JOIN source other than a table",
-        ),
-        (
-            "SELECT * FROM a JOIN (SELECT * FROM b) s ON a.id = s.id",
-            None,
             "JOIN source other than a table",
         ),
         (
@@ -2488,3 +2484,216 @@ def test_unknown_parts_of_window_functions_are_rejected(
         translate(tree)
 
     assert [issue.message for issue in caught.value.issues] == [message]
+
+
+# --- CTEs and subqueries in FROM ---------------------------------------------
+
+T_A = Project(T, (A,))
+
+
+def test_cte_becomes_a_named_relation() -> None:
+    plan = translate_sql("WITH c AS (SELECT a FROM t) SELECT a FROM c")
+
+    assert plan == Project(ir.Named("c", T_A), (A,))
+
+
+def test_ctes_can_use_earlier_ctes_and_be_used_twice() -> None:
+    plan = translate_sql(
+        "WITH x AS (SELECT a FROM t), y AS (SELECT a FROM x) "
+        "SELECT p.a FROM y p JOIN y q ON p.a = q.a"
+    )
+
+    y = ir.Named("y", Project(ir.Named("x", T_A), (A,)))
+    assert plan == Project(
+        ir.Join(
+            ir.RelationAlias(y, "p"),
+            ir.RelationAlias(y, "q"),
+            ir.JoinKind.INNER,
+            BinaryOp(BinaryOperator.EQUAL, Column(("p", "a")), Column(("q", "a"))),
+        ),
+        (Column(("p", "a")),),
+    )
+
+
+def test_cte_hides_a_table_of_the_same_name_but_not_inside_itself() -> None:
+    plan = translate_sql("WITH t AS (SELECT a FROM t WHERE b > 1) SELECT * FROM t")
+
+    filtered = ir.Filter(T, BinaryOp(BinaryOperator.GREATER, B, Literal(1)))
+    assert plan == ir.Named("t", Project(filtered, (A,)))
+
+
+def test_cte_names_are_case_insensitive() -> None:
+    plan = translate_sql("WITH Recent AS (SELECT a FROM t) SELECT * FROM RECENT")
+
+    assert plan == ir.Named("Recent", T_A)
+
+
+def test_schema_qualified_name_is_never_a_cte() -> None:
+    plan = translate_sql("WITH t AS (SELECT a FROM u) SELECT * FROM s.t")
+
+    assert plan == TableScan(("s", "t"))
+
+
+def test_cte_column_list_renames_columns() -> None:
+    plan = translate_sql("WITH c (x, y) AS (SELECT a, b FROM t) SELECT x FROM c")
+
+    renamed = ir.RenameColumns(Project(T, (A, B)), ("x", "y"))
+    assert plan == Project(ir.Named("c", renamed), (Column(("x",)),))
+
+
+def test_materialized_cte_is_computed_the_same_way() -> None:
+    plan = translate_sql(
+        "WITH c AS MATERIALIZED (SELECT a FROM t) SELECT * FROM c", "postgres"
+    )
+
+    assert plan == ir.Named("c", T_A)
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        # Qualified columns need the CTE's name as an alias.
+        (
+            "WITH c AS (SELECT a FROM t) SELECT c.a FROM c",
+            Project(ir.RelationAlias(ir.Named("c", T_A), "c"), (Column(("c", "a")),)),
+        ),
+        # An explicit alias is always kept.
+        (
+            "WITH c AS (SELECT a FROM t) SELECT a FROM c AS x",
+            Project(ir.RelationAlias(ir.Named("c", T_A), "x"), (A,)),
+        ),
+        # Unqualified use needs no alias.
+        (
+            "WITH c AS (SELECT a FROM t) SELECT a FROM c",
+            Project(ir.Named("c", T_A), (A,)),
+        ),
+    ],
+)
+def test_ctes_are_aliased_only_when_needed(sql: str, expected: ir.Relation) -> None:
+    assert translate_sql(sql) == expected
+
+
+def test_cte_inside_a_subquery_is_not_visible_outside() -> None:
+    plan = translate_sql(
+        "SELECT s.a FROM (WITH c AS (SELECT a FROM t) SELECT a FROM c) s "
+        "JOIN c ON s.a = c.a"
+    )
+
+    assert isinstance(plan, Project) and isinstance(plan.source, ir.Join)
+    assert plan.source.right == ir.RelationAlias(TableScan(("c",)), "c")
+
+
+def test_inner_cte_hides_an_outer_one() -> None:
+    plan = translate_sql(
+        "WITH c AS (SELECT a FROM t) "
+        "SELECT * FROM (WITH c AS (SELECT b FROM t) SELECT * FROM c) s"
+    )
+
+    assert plan == ir.Named("s", ir.Named("c", Project(T, (B,))))
+
+
+@pytest.mark.parametrize(
+    ("sql", "dialect", "expected"),
+    [
+        (
+            "SELECT s.a FROM (SELECT a FROM t) AS s",
+            None,
+            Project(ir.RelationAlias(ir.Named("s", T_A), "s"), (Column(("s", "a")),)),
+        ),
+        ("SELECT a FROM (SELECT a FROM t) s", None, Project(ir.Named("s", T_A), (A,))),
+        ("SELECT * FROM (SELECT a FROM t)", "postgres", ir.Named("subquery", T_A)),
+        (
+            "SELECT y FROM (SELECT a FROM t) s (y)",
+            "postgres",
+            Project(ir.Named("s", ir.RenameColumns(T_A, ("y",))), (Column(("y",)),)),
+        ),
+    ],
+)
+def test_subqueries_in_from(
+    sql: str, dialect: str | None, expected: ir.Relation
+) -> None:
+    assert translate_sql(sql, dialect) == expected
+
+
+def test_joined_subquery_is_aliased() -> None:
+    plan = translate_sql("SELECT * FROM t JOIN (SELECT a FROM t) s ON t.a = s.a")
+
+    assert isinstance(plan, ir.Join)
+    assert plan.right == ir.RelationAlias(ir.Named("s", T_A), "s")
+
+
+@pytest.mark.parametrize(
+    ("sql", "message"),
+    [
+        (
+            "WITH RECURSIVE r AS (SELECT a FROM t) SELECT * FROM r",
+            "WITH RECURSIVE",
+        ),
+        (
+            "WITH c AS (SELECT a FROM t), C AS (SELECT b FROM t) SELECT * FROM c",
+            "CTE name defined twice",
+        ),
+        (
+            "SELECT * FROM (SELECT a FROM t UNION SELECT a FROM u) s",
+            "UNION in a subquery",
+        ),
+        (
+            "WITH c AS (SELECT a FROM t UNION SELECT a FROM u) SELECT * FROM c",
+            "UNION in a subquery",
+        ),
+        ("WITH c AS (SELECT my_udf(a) AS x FROM t) SELECT * FROM c", "function MY_UDF"),
+    ],
+)
+def test_unsupported_cte_or_subquery(sql: str, message: str) -> None:
+    assert message in [issue for issue, _ in unsupported_issues(sql)]
+
+
+def test_issues_in_ctes_and_the_main_query_are_reported_together() -> None:
+    issues = unsupported_issues(
+        "WITH c AS (SELECT my_udf(a) AS x FROM t) SELECT other_udf(x) AS y FROM c"
+    )
+
+    assert issues == [
+        ("function MY_UDF", "MY_UDF(a)"),
+        ("function OTHER_UDF", "OTHER_UDF(x)"),
+    ]
+
+
+def test_nested_select_without_columns_is_a_parse_error() -> None:
+    with pytest.raises(SQLParseError, match="SELECT has no columns"):
+        translate_sql("SELECT * FROM (SELECT FROM t) s")
+
+
+@pytest.mark.parametrize(
+    ("sql", "find", "part", "message"),
+    [
+        (
+            "WITH c AS (SELECT a FROM t) SELECT * FROM c",
+            exp.With,
+            "search",
+            "WITH SEARCH",
+        ),
+        (
+            "WITH c AS (SELECT a FROM t) SELECT * FROM c",
+            exp.CTE,
+            "scalar",
+            "CTE with SCALAR",
+        ),
+        (
+            "SELECT * FROM (SELECT a FROM t) s",
+            exp.Subquery,
+            "where",
+            "subquery with WHERE",
+        ),
+    ],
+)
+def test_unknown_parts_of_ctes_and_subqueries_are_rejected(
+    sql: str, find: type[exp.Expression], part: str, message: str
+) -> None:
+    tree = parse_sql(sql)
+    tree.find(find).set(part, exp.true())
+
+    with pytest.raises(UnsupportedSQLError) as caught:
+        translate(tree)
+
+    assert message in [issue.message for issue in caught.value.issues]

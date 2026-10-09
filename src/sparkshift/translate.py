@@ -68,6 +68,7 @@ _WINDOW_FUNCTIONS: dict[type[exp.Expression], ir.WindowFunction] = {
 
 # Parts of an OVER clause SparkShift does not handle yet.
 _WINDOW_PART_NAMES = {"alias": "named window"}
+_WINDOW_OUTSIDE_SELECT_LIST = "window function outside the SELECT list"
 
 # Window functions Spark only computes over an ordered window without a
 # frame, and the ones whose result depends on the frame's last row.
@@ -350,7 +351,10 @@ class _Translator:
         self.no_aggregates_in: str | None = None
         # Why window functions are not allowed here, as a diagnostic message;
         # None only while translating a SELECT list that may contain them.
-        self.no_windows: str | None = "window function outside the SELECT list"
+        self.no_windows: str | None = _WINDOW_OUTSIDE_SELECT_LIST
+        # CTEs visible to the query being translated, innermost WITH last,
+        # by lower-case name.
+        self.scopes: list[dict[str, ir.Named]] = []
 
     def statement(self, tree: exp.Expression) -> ir.Relation:
         if not isinstance(tree, exp.Select):
@@ -372,7 +376,85 @@ class _Translator:
 
     # --- Queries ---------------------------------------------------------
 
+    def query(self, node: exp.Expression) -> ir.Relation | None:
+        """Translate a nested query, such as a CTE's or a subquery's."""
+        if not isinstance(node, exp.Select):
+            self.unsupported(
+                f"{node.key.upper()} in a subquery",
+                node,
+                hint="Only SELECT queries can be nested so far.",
+            )
+            return None
+        if not node.expressions:
+            raise SQLParseError("SELECT has no columns.")
+        # A nested query starts with no outer context: its own SELECT list
+        # decides where aggregates and windows are allowed.
+        outside = self.no_aggregates_in, self.no_windows
+        self.no_aggregates_in, self.no_windows = None, _WINDOW_OUTSIDE_SELECT_LIST
+        try:
+            return self.select(node)
+        finally:
+            self.no_aggregates_in, self.no_windows = outside
+
     def select(self, select: exp.Select) -> ir.Relation | None:
+        """Translate a SELECT, with the CTEs of its WITH clause in scope."""
+        with_ = select.args.get("with_")
+        if with_ is None:
+            return self.select_clauses(select)
+        scope: dict[str, ir.Named] = {}
+        self.scopes.append(scope)
+        try:
+            defined = self.common_tables(with_, scope)
+            relation = self.select_clauses(select)
+        finally:
+            self.scopes.pop()
+        return relation if defined else None
+
+    def common_tables(self, with_: exp.With, scope: dict[str, ir.Named]) -> bool:
+        """Translate each CTE into ``scope``, where the CTEs after it can use
+        it. A CTE cannot use itself: its own name means the table of that name.
+        Returns whether every CTE translated."""
+        ok = True
+        for part, value in with_.args.items():
+            if value and part != "expressions":
+                recursive = part == "recursive"
+                self.unsupported(
+                    "WITH RECURSIVE" if recursive else f"WITH {part.upper()}",
+                    with_,
+                    hint="Recursive queries are not supported." if recursive else None,
+                )
+                ok = False
+        for cte in with_.expressions:
+            # MATERIALIZED only tells PostgreSQL how to compute the CTE; the
+            # result is the same.
+            ok &= self.check_parts(cte, {"this", "alias", "materialized"}, "CTE")
+            name = cte.alias
+            if name.lower() in scope:
+                self.unsupported("CTE name defined twice", cte.args["alias"])
+                ok = False
+                continue
+            relation = self.query(cte.this)
+            if relation is None:
+                ok = False
+                continue
+            columns = tuple(column.name for column in cte.args["alias"].columns)
+            if columns:
+                relation = ir.RenameColumns(relation, columns)
+            scope[name.lower()] = ir.Named(name, relation)
+        return ok
+
+    def common_table(self, node: exp.Table) -> ir.Named | None:
+        """The CTE a table name refers to, if any: the innermost one in scope
+        with that name. A CTE hides a table of the same name."""
+        if node.args.get("db") or node.args.get("catalog"):
+            return None
+        for scope in reversed(self.scopes):
+            named = scope.get(node.name.lower())
+            if named is not None:
+                return named
+        return None
+
+    def select_clauses(self, select: exp.Select) -> ir.Relation | None:
         source: ir.Relation | None = None
         items: tuple[ir.Expression, ...] | None = None
         condition: ir.Expression | None = None
@@ -400,7 +482,8 @@ class _Translator:
                 self.no_windows = outside
             elif part == "from_":
                 source = self.from_(select)
-            elif not value:
+            elif not value or part == "with_":
+                # The WITH clause is already in scope (see select).
                 continue
             elif part == "joins":
                 source = self.joins(source, value)
@@ -725,12 +808,33 @@ class _Translator:
             return None
         # A joined table always gets a name, so qualified columns resolve.
         has_joins = bool(select.args.get("joins"))
-        return self.table(from_.this, "FROM", always_alias=has_joins)
+        # Names this query's columns are qualified with, such as "s" in s.x.
+        qualifiers = {
+            column.table.lower()
+            for column in select.find_all(exp.Column)
+            if column.table and column.find_ancestor(exp.Select) is select
+        }
+        return self.table(
+            from_.this, "FROM", always_alias=has_joins, qualifiers=qualifiers
+        )
 
     def table(
-        self, node: exp.Expression, clause: str, *, always_alias: bool
+        self,
+        node: exp.Expression,
+        clause: str,
+        *,
+        always_alias: bool,
+        qualifiers: frozenset[str] | set[str] = frozenset(),
     ) -> ir.Relation | None:
-        """Translate a table reference, with its alias if it has one."""
+        """Translate a table reference, a CTE reference, or a subquery, with
+        its alias if it has one.
+
+        A CTE or a subquery becomes a variable with no name Spark knows, so it
+        is aliased when the query joins it or qualifies columns with its name.
+        """
+        if isinstance(node, exp.Subquery) and isinstance(node.this, exp.Query):
+            aliased = always_alias or node.alias.lower() in qualifiers
+            return self.derived_table(node, aliased)
         if not isinstance(node, exp.Table) or not isinstance(node.this, exp.Identifier):
             self.unsupported(f"{clause} source other than a table", node)
             return None
@@ -747,12 +851,34 @@ class _Translator:
         if not supported:
             return None
 
+        named = self.common_table(node)
+        if named is not None:
+            if node.alias:
+                return ir.RelationAlias(named, node.alias)
+            if always_alias or node.name.lower() in qualifiers:
+                return ir.RelationAlias(named, node.name)
+            return named
         scan = ir.TableScan(tuple(identifier.name for identifier in node.parts))
         if node.alias:
             return ir.RelationAlias(scan, node.alias)
         if always_alias:
             return ir.RelationAlias(scan, node.name)
         return scan
+
+    def derived_table(self, node: exp.Subquery, aliased: bool) -> ir.Relation | None:
+        """Translate ``(SELECT ...) AS name``, optionally with a column list."""
+        supported = self.check_parts(node, {"this", "alias"}, "subquery")
+        relation = self.query(node.this)
+        if relation is None or not supported:
+            return None
+        alias = node.args.get("alias")
+        columns = tuple(column.name for column in alias.columns) if alias else ()
+        if columns:
+            relation = ir.RenameColumns(relation, columns)
+        named = ir.Named(node.alias or "subquery", relation)
+        if node.alias and aliased:
+            return ir.RelationAlias(named, node.alias)
+        return named
 
     def joins(
         self, left: ir.Relation | None, joins: list[exp.Join]

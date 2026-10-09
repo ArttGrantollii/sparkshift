@@ -332,6 +332,29 @@ class TableScan:
 
 
 @dataclass(frozen=True)
+class Named:
+    """A relation the query gives a name, as a CTE (``WITH name AS (...)``) or
+    a subquery in FROM (``(SELECT ...) AS name``) does. It is computed once
+    and can be used several times; equal Named nodes are the same relation."""
+
+    name: str
+    source: "Relation"
+
+
+@dataclass(frozen=True)
+class RenameColumns:
+    """Give the source's columns new names, by position, as a CTE's or a
+    subquery's column list does: ``WITH t (a, b) AS (...)``."""
+
+    source: "Relation"
+    names: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.names:
+            raise ValueError("RenameColumns needs at least one name")
+
+
+@dataclass(frozen=True)
 class RelationAlias:
     """Give a relation a name that qualified columns can refer to, as in
     ``FROM customers c`` followed by ``c.name``."""
@@ -444,6 +467,8 @@ class Limit:
 # Any IR node that produces a DataFrame.
 Relation: TypeAlias = (
     TableScan
+    | Named
+    | RenameColumns
     | RelationAlias
     | Join
     | Filter

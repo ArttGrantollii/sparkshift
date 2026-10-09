@@ -108,6 +108,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `LAST_VALUE` is written out as an explicit frame; BigQuery, whose
   default is undocumented, needs an explicit frame. Rejects `RANGE` offsets,
   `GROUPS` frames, `EXCLUDE`, and frames on ranking and offset functions.
+- CTEs (`WITH`), including chained CTEs, CTEs used several times, CTEs that
+  hide a table of the same name, column lists, and `WITH` inside
+  subqueries; and subqueries in `FROM` and `JOIN`. Each becomes a variable
+  declared once, in the order the code needs it. Rejects `WITH RECURSIVE`
+  and set operations inside them.
 
 ### Fixed
 

@@ -89,7 +89,9 @@ UnsupportedSQLError: 2 unsupported constructs:
 | Window functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, and `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` `OVER (PARTITION BY ... ORDER BY ...)` | Supported in the `SELECT` list of queries without `GROUP BY` |
 | Window frames: `ROWS BETWEEN` with `UNBOUNDED`, `n PRECEDING`, `CURRENT ROW`, `n FOLLOWING`; `RANGE BETWEEN` with `UNBOUNDED` and `CURRENT ROW`; `IGNORE NULLS` for `FIRST_VALUE`/`LAST_VALUE` | Supported |
 | `NTH_VALUE`, `RANGE` frames with offsets, `GROUPS` frames, `EXCLUDE`, `IGNORE NULLS` for `LAG`/`LEAD`, named windows, `QUALIFY`, and windows in aggregate queries | Unsupported — rejected with an error |
-| `NATURAL`, semi, anti, and as-of joins; joins to subqueries; `LATERAL` and `APPLY` | Unsupported — rejected with an error |
+| `WITH` (CTEs, including column lists) and subqueries in `FROM` and `JOIN` | Supported |
+| `NATURAL`, semi, anti, and as-of joins; `LATERAL` and `APPLY` | Unsupported — rejected with an error |
+| `WITH RECURSIVE`, set operations (`UNION`, `INTERSECT`, `EXCEPT`), and subqueries in expressions | Unsupported — rejected with an error |
 | `GROUP BY` expressions, `ROLLUP`, `CUBE`, `GROUPING SETS`, `AVG(DISTINCT ...)` | Unsupported — rejected with an error |
 | `IN (subquery)`, `LIKE ... ESCAPE`, `IS TRUE`/`IS FALSE`, casts to `FLOAT`/`REAL`, `CHAR(n)`/`VARCHAR(n)`, unparameterized `DECIMAL`, and timestamps | Unsupported — rejected with an error |
 | Everything else, including `OFFSET`, user-defined functions, date formatting and parsing, and other functions | Unsupported — rejected with an error |

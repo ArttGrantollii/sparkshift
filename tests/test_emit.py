@@ -1202,3 +1202,97 @@ def test_invalid_window_frames_are_rejected(
 ) -> None:
     with pytest.raises(ValueError, match=r"RANGE frame|cannot end before"):
         ir.WindowFrame(rows, start, end)
+
+
+# --- Named relations: CTEs and subqueries ------------------------------------
+
+FILTERED = ir.Filter(
+    TableScan(("orders",)), BinaryOp(BinaryOperator.GREATER, A, Literal(1))
+)
+
+
+def test_named_relation_is_declared_once_before_the_result() -> None:
+    named = ir.Named("big", FILTERED)
+    plan = ir.Join(
+        ir.RelationAlias(named, "x"), ir.RelationAlias(named, "y"), ir.JoinKind.CROSS
+    )
+
+    assert emit(plan) == (
+        "from pyspark.sql import functions as F\n"
+        "\n"
+        'orders = spark.table("orders")\n'
+        "\n"
+        "big = (\n"
+        "    orders\n"
+        '    .where(F.col("a") > F.lit(1))\n'
+        ")\n"
+        "\n"
+        "result = (\n"
+        '    big.alias("x")\n'
+        '    .crossJoin(big.alias("y"))\n'
+        ")\n"
+    )
+
+
+def test_named_relations_are_declared_after_the_ones_they_use() -> None:
+    inner = ir.Named("first_step", FILTERED)
+    outer = ir.Named("second_step", Project(inner, (A,)))
+
+    code = emit(Project(outer, (A,)))
+
+    assert code.index("first_step = (") < code.index("second_step = (")
+    assert code.index("second_step = (") < code.index("result = (")
+
+
+def test_column_list_renames_with_to_df() -> None:
+    plan = ir.RenameColumns(TableScan(("t",)), ("x", "y"))
+
+    assert emit(plan).endswith('    .toDF(\n        "x",\n        "y",\n    )\n)\n')
+
+
+@pytest.mark.parametrize(
+    ("plan", "declaration"),
+    [
+        # A table variable already uses the name.
+        (
+            ir.Join(
+                ir.RelationAlias(ir.Named("orders", FILTERED), "o"),
+                ir.RelationAlias(TableScan(("t",)), "t"),
+                ir.JoinKind.CROSS,
+            ),
+            "orders_2 = (",
+        ),
+        # The generated code already uses the name.
+        (ir.Named("result", FILTERED), "result_df = ("),
+        (ir.Named("class", FILTERED), "class_df = ("),
+        (ir.Named("2024 sales", FILTERED), "t_2024_sales = ("),
+    ],
+)
+def test_named_relation_names_never_clash(plan: ir.Relation, declaration: str) -> None:
+    assert declaration in emit(plan)
+
+
+def test_different_relations_with_the_same_name_get_different_variables() -> None:
+    first = ir.Named("s", FILTERED)
+    second = ir.Named("s", TableScan(("t",)))
+    third = ir.Named("s", TableScan(("u",)))
+    plan = ir.Join(
+        ir.Join(
+            ir.RelationAlias(first, "a"),
+            ir.RelationAlias(second, "b"),
+            ir.JoinKind.CROSS,
+        ),
+        ir.RelationAlias(third, "c"),
+        ir.JoinKind.CROSS,
+    )
+
+    code = emit(plan)
+
+    assert "s = (\n    orders\n" in code
+    assert "s_2 = t\n" in code
+    assert "s_3 = u\n" in code
+
+
+def test_rename_columns_requires_names() -> None:
+    with pytest.raises(ValueError, match="at least one name"):
+        ir.RenameColumns(TableScan(("t",)), ())

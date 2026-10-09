@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 import test_aggregation
 import test_conditionals
+import test_ctes
 import test_dates
 import test_expressions
 import test_filtering
@@ -33,6 +34,7 @@ MODULES = [
     test_dates,
     test_ordering,
     test_windows,
+    test_ctes,
 ]
 
 

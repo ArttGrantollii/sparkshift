@@ -60,6 +60,9 @@ alias, or their own name when needed) so qualified columns such as `c.name`
 resolve exactly as in SQL, including in self-joins. Each distinct window
 (`PARTITION BY` and `ORDER BY`) is declared once, as a variable named
 `window`, or `window_1`, `window_2`, and so on, that window functions share.
+Each CTE and each subquery in `FROM` becomes a variable named after it,
+declared once, after the variables it uses; a CTE used twice is computed
+from the same variable.
 Parentheses follow
 Python's operator precedence, not SQL's, because PySpark expressions are
 built from Python operators (`&` and `|` bind more tightly than `==`).
