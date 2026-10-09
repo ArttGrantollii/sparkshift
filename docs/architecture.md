@@ -57,9 +57,17 @@ named `result`, and expects a SparkSession named `spark` to exist, as in a
 Databricks notebook. Queries that join tables declare each source table once as
 a variable named after the table; joined tables are aliased (with their SQL
 alias, or their own name when needed) so qualified columns such as `c.name`
-resolve exactly as in SQL, including in self-joins. Parentheses follow Python's operator precedence, not
-SQL's, because PySpark expressions are built from Python operators (`&` and `|`
-bind more tightly than `==`).
+resolve exactly as in SQL, including in self-joins. Parentheses follow
+Python's operator precedence, not SQL's, because PySpark expressions are
+built from Python operators (`&` and `|` bind more tightly than `==`).
+
+Code is laid out to fit 88 columns, the Black and Ruff default. Short code
+stays on one line. A long chain step puts each argument on its own line; a
+long `&`/`|` chain puts one condition per line with the operator leading; a
+long `F.when` chain puts one branch per line; a long function call puts one
+argument per line; and a long expression that needs parentheses before
+`.alias` gets its own lines inside them. Wrapping only adds line breaks and
+grouping parentheses, so the code means exactly the same at any width.
 
 ## Rules for the core
 

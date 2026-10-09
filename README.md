@@ -183,7 +183,6 @@ rejects it rather than guess:
 - An unaliased negation, `BETWEEN`, or `IF` in the `SELECT` list must be given
   an alias, because Spark SQL and PySpark name those output columns
   differently.
-- Long expressions are not wrapped across lines yet.
 - A `JOIN` without `ON` or `USING` (accepted by MySQL) is translated as a cross
   join, because SQLGlot represents it exactly like the comma form `FROM a, b`.
 - When an aggregate query's `SELECT` order differs from the `GROUP BY` order,

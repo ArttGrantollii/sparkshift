@@ -61,9 +61,11 @@ def test_convert_generates_a_projection() -> None:
         "    .select(\n"
         '        F.col("order_id"),\n'
         '        (F.col("amount") * F.lit(Decimal("1.10"))).alias("with_tax"),\n'
-        # Long expressions are not wrapped yet; this line is 99 characters.
-        '        ((F.col("amount") > F.lit(100)) & '
-        '(F.col("status") == F.lit("completed"))).alias("big_sale"),\n'
+        # Too long for one line: the condition moves into its own parentheses.
+        "        (\n"
+        '            (F.col("amount") > F.lit(100)) & '
+        '(F.col("status") == F.lit("completed"))\n'
+        '        ).alias("big_sale"),\n'
         "    )\n"
         ")\n"
     )

@@ -82,3 +82,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Equivalence testing for `LIMIT` without `ORDER BY` (row count plus
   sub-multiset of the unlimited result), and dialect scenarios checked against
   hand-written Spark SQL references.
+- Long expressions are wrapped to fit 88 columns: one condition per line
+  for `&`/`|` chains, one branch per line for `F.when`, one argument per
+  line for long calls, and Black-style parentheses before `.alias`.
+  Tests check that every equivalence scenario's code fits, and that
+  wrapping never changes the Python syntax tree.

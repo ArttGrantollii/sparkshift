@@ -87,7 +87,8 @@ def test_long_single_argument_moves_to_its_own_line() -> None:
     long_name = "a_rather_long_column_name_that_does_not_fit_on_one_line_with_the_call"
     plan = Project(TableScan(("t",)), (Column((long_name,)),))
 
-    assert f'    .select(\n        F.col("{long_name}"),\n    )' in emit(plan)
+    # A single argument gets no trailing comma, as Black formats it.
+    assert f'    .select(\n        F.col("{long_name}")\n    )' in emit(plan)
 
 
 def test_decimal_literals_import_decimal() -> None:
@@ -722,3 +723,165 @@ def test_date_code(expression: ir.Expression, expected: str) -> None:
 def test_interval_rejects_unknown_units() -> None:
     with pytest.raises(ValueError, match="Unsupported interval unit"):
         ir.Interval("hours", Literal(1))
+
+
+# --- Wrapping long expressions -----------------------------------------------
+
+
+def _condition(name: str, value: str) -> ir.Expression:
+    return BinaryOp(BinaryOperator.EQUAL, Column((name,)), Literal(value))
+
+
+LONG_AND = BinaryOp(
+    BinaryOperator.AND,
+    BinaryOp(
+        BinaryOperator.AND,
+        _condition("status", "completed"),
+        _condition("country", "Spain"),
+    ),
+    _condition("channel", "online"),
+)
+
+
+def test_long_condition_wraps_one_condition_per_line() -> None:
+    code = emit(ir.Filter(TableScan(("orders",)), LONG_AND))
+
+    assert code.endswith(
+        "    .where(\n"
+        '        (F.col("status") == F.lit("completed"))\n'
+        '        & (F.col("country") == F.lit("Spain"))\n'
+        '        & (F.col("channel") == F.lit("online"))\n'
+        "    )\n"
+        ")\n"
+    )
+
+
+def test_long_case_wraps_one_branch_per_line() -> None:
+    case = ir.Case(
+        (
+            (_condition("status", "completed"), Literal("done")),
+            (_condition("status", "pending"), Literal("waiting")),
+        ),
+        Literal("other"),
+    )
+    plan = Project(TableScan(("orders",)), (Alias(case, "state"),))
+
+    assert (
+        "    .select(\n"
+        '        F.when(F.col("status") == F.lit("completed"), F.lit("done"))\n'
+        '        .when(F.col("status") == F.lit("pending"), F.lit("waiting"))\n'
+        '        .otherwise(F.lit("other"))\n'
+        '        .alias("state")\n'
+        "    )\n"
+    ) in emit(plan)
+
+
+def test_long_function_call_wraps_one_argument_per_line() -> None:
+    names = ("first_name", "middle_name", "last_name", "street", "city")
+    call_ = ir.FunctionCall("concat_ws", (Literal(" "), *(Column((n,)) for n in names)))
+    plan = Project(TableScan(("people",)), (Alias(call_, "label"),))
+
+    assert (
+        "        F.concat_ws(\n"
+        '            " ",\n'
+        '            F.col("first_name"),\n'
+        '            F.col("middle_name"),\n'
+        '            F.col("last_name"),\n'
+        '            F.col("street"),\n'
+        '            F.col("city"),\n'
+        '        ).alias("label")\n'
+    ) in emit(plan)
+
+
+def test_nested_boolean_chains_get_their_own_parentheses() -> None:
+    expression = BinaryOp(BinaryOperator.OR, LONG_AND, _condition("vip", "yes"))
+    plan = ir.Filter(TableScan(("orders",)), expression)
+
+    code = emit(plan)
+
+    assert (
+        "    .where(\n"
+        "        (\n"
+        '            (F.col("status") == F.lit("completed"))\n'
+        '            & (F.col("country") == F.lit("Spain"))\n'
+        '            & (F.col("channel") == F.lit("online"))\n'
+        "        )\n"
+        '        | (F.col("vip") == F.lit("yes"))\n'
+        "    )\n"
+    ) in code
+
+
+def test_short_expressions_are_not_wrapped() -> None:
+    plan = ir.Filter(TableScan(("t",)), _condition("a", "x"))
+
+    assert '    .where(F.col("a") == F.lit("x"))\n' in emit(plan)
+
+
+@pytest.mark.parametrize("line_length", [88, 40, 10])
+def test_wrapping_never_changes_the_python_syntax_tree(line_length: int) -> None:
+    # Every operator pairing from the precedence round trip, inside a long
+    # boolean chain and a long function call, at several widths.
+    expressions = []
+    for outer, inner in itertools.product(BinaryOperator, repeat=2):
+        expressions.append(BinaryOp(outer, BinaryOp(inner, B, C), A))
+        expressions.append(BinaryOp(outer, A, BinaryOp(inner, B, C)))
+    filler = [_condition(f"column_{i}", "value") for i in range(3)]
+    for expression in expressions:
+        condition = BinaryOp(BinaryOperator.AND, filler[0], expression)
+        condition = BinaryOp(BinaryOperator.OR, condition, filler[1])
+        call_ = ir.FunctionCall("coalesce", (expression, *filler))
+        plan = Project(ir.Filter(TableScan(("t",)), condition), (Alias(call_, "x"),))
+
+        wrapped = emit(plan, line_length=line_length)
+        one_line = emit(plan, line_length=10**6)
+
+        assert ast.dump(ast.parse(wrapped)) == ast.dump(ast.parse(one_line))
+
+
+def test_long_aliased_arithmetic_moves_into_its_own_parentheses() -> None:
+    total = BinaryOp(
+        BinaryOperator.ADD,
+        Column(("shipping_cost_in_euros",)),
+        Column(("handling_fee_in_euros",)),
+    )
+    plan = Project(TableScan(("orders",)), (Alias(total, "total_extra_cost"),))
+
+    assert (
+        "        (\n"
+        '            F.col("shipping_cost_in_euros") + F.col("handling_fee_in_euros")\n'
+        '        ).alias("total_extra_cost")\n'
+    ) in emit(plan)
+
+
+def test_long_negated_between_wraps_its_bounds() -> None:
+    between = ir.Between(
+        Column(("order_date",)),
+        ir.Cast(Literal("2024-01-10"), "date"),
+        ir.Cast(Literal("2024-02-29"), "date"),
+    )
+    negated = UnaryOp(UnaryOperator.NOT, between)
+    plan = Project(TableScan(("orders",)), (Alias(negated, "outside"),))
+
+    assert (
+        "        (\n"
+        '            ~F.col("order_date").between(\n'
+        '                F.lit("2024-01-10").cast("date"),\n'
+        '                F.lit("2024-02-29").cast("date"),\n'
+        "            )\n"
+        '        ).alias("outside")\n'
+    ) in emit(plan)
+
+
+@pytest.mark.parametrize("line_length", [88, 30, 10])
+def test_wrapping_negations_keeps_the_python_syntax_tree(line_length: int) -> None:
+    negated_chain = UnaryOp(UnaryOperator.NOT, LONG_AND)
+    negated_call = UnaryOp(UnaryOperator.NEGATE, ir.FunctionCall("greatest", (A, B, C)))
+    plan = Project(
+        ir.Filter(TableScan(("t",)), negated_chain),
+        (Alias(negated_call, "x"), Alias(negated_chain, "y")),
+    )
+
+    wrapped = emit(plan, line_length=line_length)
+    one_line = emit(plan, line_length=10**6)
+
+    assert ast.dump(ast.parse(wrapped)) == ast.dump(ast.parse(one_line))

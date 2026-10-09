@@ -9,6 +9,7 @@ the original SQL. That claim is checked by executing both on real Apache Spark.
 |---|---|---|---|
 | Unit | `tests/test_*.py` | Parsing, translation decisions, error messages | No |
 | Golden output | `tests/test_emit.py`, `tests/test_api.py` | The exact generated code, so readability changes are deliberate | No |
+| Formatting | `tests/equivalence/test_formatting.py` | Every scenario's generated code fits 88 columns, and wrapping at any width leaves the Python syntax tree unchanged | No |
 | Architecture | `tests/test_architecture.py` | Dependency rules: no PySpark in the core, SQLGlot only in the frontend | No |
 | Equivalence | `tests/equivalence/` | Original SQL and generated PySpark return equivalent results | Yes |
 

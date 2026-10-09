@@ -9,7 +9,7 @@ Generated code is deterministic: the same IR always produces the same text.
 import keyword
 import re
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from decimal import Decimal
 from typing import assert_never
 
@@ -22,6 +22,8 @@ _RESERVED_NAMES = frozenset({RESULT_VARIABLE, "spark", "F", "Decimal"})
 
 _INDENT = "    "
 _MAX_LINE_LENGTH = 88
+# Chain steps start at column 4 and their arguments at column 8.
+_ARGUMENT_COLUMN = 8
 
 # Identifier parts Spark accepts without backtick quoting.
 _PLAIN_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -60,12 +62,13 @@ _PRECEDENCE = {
 }
 
 
-def emit(plan: ir.Relation) -> str:
+def emit(plan: ir.Relation, *, line_length: int = _MAX_LINE_LENGTH) -> str:
     """Return PySpark code that assigns the plan's DataFrame to ``result``.
 
     The code imports what it uses and expects a SparkSession named ``spark``.
+    Expressions longer than ``line_length`` are wrapped across lines.
     """
-    return _Emitter().program(plan)
+    return _Emitter(line_length).program(plan)
 
 
 def emit_expression(expression: ir.Expression) -> str:
@@ -74,7 +77,8 @@ def emit_expression(expression: ir.Expression) -> str:
 
 
 class _Emitter:
-    def __init__(self) -> None:
+    def __init__(self, line_length: int = _MAX_LINE_LENGTH) -> None:
+        self.line_length = line_length
         self.uses_functions = False
         self.uses_decimal = False
         self.table_variables: dict[tuple[str, ...], str] = {}
@@ -134,34 +138,29 @@ class _Emitter:
                 other = self.inline_relation(right)
                 if kind is ir.JoinKind.CROSS:
                     return start, [*calls, self.call("crossJoin", [other])]
+                on: ir.Expression | str
                 if plan.condition is not None:
-                    on = self.expression(plan.condition)
+                    on = plan.condition
                 else:
                     on = "[" + ", ".join(python_string(c) for c in plan.using) + "]"
                 arguments = [other, on, python_string(kind.value)]
                 return start, [*calls, self.call("join", arguments)]
             case ir.Filter(source=source, condition=condition):
                 start, calls = self.chain(source)
-                return start, [*calls, self.call("where", [self.expression(condition)])]
+                return start, [*calls, self.call("where", [condition])]
             case ir.Aggregate(source=source, keys=keys, aggregates=aggregates):
                 start, calls = self.chain(source)
-                key_code = [self.expression(key) for key in keys]
-                aggregate_code = [self.expression(item) for item in aggregates]
                 if not aggregates:
                     # Grouping without aggregates is the distinct key values.
-                    steps = [self.call("select", key_code), self.call("distinct", [])]
+                    steps = [self.call("select", keys), self.call("distinct", [])]
                 elif not keys:
-                    steps = [self.call("agg", aggregate_code)]
+                    steps = [self.call("agg", aggregates)]
                 else:
-                    steps = [
-                        self.call("groupBy", key_code),
-                        self.call("agg", aggregate_code),
-                    ]
+                    steps = [self.call("groupBy", keys), self.call("agg", aggregates)]
                 return start, [*calls, *steps]
             case ir.Project(source=source, items=items):
                 start, calls = self.chain(source)
-                arguments = [self.expression(item) for item in items]
-                return start, [*calls, self.call("select", arguments)]
+                return start, [*calls, self.call("select", items)]
             case ir.Distinct(source=source):
                 start, calls = self.chain(source)
                 return start, [*calls, self.call("distinct", [])]
@@ -185,15 +184,155 @@ class _Emitter:
         start, calls = self.chain(plan)
         return start + "".join(calls)
 
-    def call(self, method: str, arguments: list[str]) -> str:
-        """Render a method call: inline if it is short and has at most one
-        argument, otherwise with one argument per line."""
-        inline = f".{method}({', '.join(arguments)})"
-        fits = len(_INDENT + inline) <= _MAX_LINE_LENGTH
-        if len(arguments) <= 1 and fits and "\n" not in inline:
+    def call(self, method: str, arguments: Sequence[ir.Expression | str]) -> str:
+        """Render a chain step such as ``.select(...)``: inline if it is short
+        and has at most one argument; otherwise each argument on its own line,
+        wrapped further if it is still too long."""
+        one_line = [self.code(argument) for argument in arguments]
+        inline = f".{method}({', '.join(one_line)})"
+        if len(arguments) <= 1 and len(_INDENT + inline) <= self.line_length:
             return inline
-        body = "".join(_indent(f"{argument},") + "\n" for argument in arguments)
+        codes = [self.argument(argument, _ARGUMENT_COLUMN) for argument in arguments]
+        if len(codes) == 1:
+            return f".{method}(\n{_indent(codes[0])}\n)"
+        body = "".join(_indent(f"{code},") + "\n" for code in codes)
         return f".{method}(\n{body})"
+
+    # --- Layout of long expressions ------------------------------------------
+    #
+    # Wrapping only changes line breaks and grouping parentheses, never the
+    # expression: tests check that wrapped and one-line code parse to the same
+    # Python syntax tree. Continuation lines are indented relative to the
+    # expression's first line; ``column`` is where that first line starts.
+
+    def code(self, value: ir.Expression | str) -> str:
+        return value if isinstance(value, str) else self.expression(value)
+
+    def argument(self, value: ir.Expression | str, column: int) -> str:
+        """Code for a value starting at ``column``, wrapped if it does not fit
+        (leaving room for a trailing comma)."""
+        code = self.code(value)
+        if isinstance(value, str) or column + len(code) + 1 <= self.line_length:
+            return code
+        return self.wrapped(value, column) or code
+
+    def wrapped(self, expression: ir.Expression, column: int) -> str | None:
+        """Multi-line code for an expression, or None if it has no good break."""
+        match expression:
+            case ir.Alias(expression=inner, name=name):
+                suffix = f".alias({python_string(name)})"
+                if self.render(inner)[1] < _ATOM:
+                    # Already needs parentheses before .alias: give it
+                    # its own lines inside them, as Black does.
+                    return f"{self.parenthesized(inner, column)}{suffix}"
+                inner_code = self.wrapped(inner, column)
+                if inner_code is None:
+                    return None
+                separator = "\n" if isinstance(inner, ir.Case) else ""
+                return f"{inner_code}{separator}{suffix}"
+            case ir.BinaryOp(op=op) if op in _BOOLEAN_OPERATORS:
+                return self.boolean_chain(expression, column)
+            case ir.UnaryOp(op=op, operand=operand):
+                if self.render(operand)[1] < _ATOM:
+                    return f"{op.value}{self.parenthesized(operand, column)}"
+                inner_code = self.wrapped(operand, column)
+                return None if inner_code is None else f"{op.value}{inner_code}"
+            case ir.Case(branches=branches, default=default):
+                self.uses_functions = True
+                steps = [
+                    self.call_text(
+                        "F.when" if i == 0 else ".when", [when, then], column
+                    )
+                    for i, (when, then) in enumerate(branches)
+                ]
+                if default is not None:
+                    steps.append(self.call_text(".otherwise", [default], column))
+                return "\n".join(steps)
+            case ir.FunctionCall(name=name, arguments=arguments):
+                self.uses_functions = True
+                values = self.function_arguments(name, arguments)
+                return self.wrapped_call(f"F.{name}", values, column)
+            case ir.AggregateCall(arguments=arguments) if arguments:
+                code = self.expression(expression)
+                return self.wrapped_call(
+                    code[: code.index("(")], list(arguments), column
+                )
+            case ir.InList(expression=inner, values=values):
+                receiver = f"{self.operand(inner, _ATOM)}.isin"
+                return self.wrapped_call(receiver, list(values), column)
+            case ir.Between(expression=inner, low=low, high=high):
+                receiver = f"{self.operand(inner, _ATOM)}.between"
+                return self.wrapped_call(receiver, [low, high], column)
+        return None
+
+    def call_text(
+        self, prefix: str, arguments: Sequence[ir.Expression | str], column: int
+    ) -> str:
+        """A call on one line if it fits, otherwise one argument per line."""
+        inline = f"{prefix}({', '.join(self.code(argument) for argument in arguments)})"
+        if column + len(inline) <= self.line_length:
+            return inline
+        return self.wrapped_call(prefix, arguments, column)
+
+    def wrapped_call(
+        self, prefix: str, arguments: Sequence[ir.Expression | str], column: int
+    ) -> str:
+        inner = column + len(_INDENT)
+        body = "".join(
+            _indent(f"{self.argument(argument, inner)},") + "\n"
+            for argument in arguments
+        )
+        return f"{prefix}(\n{body})"
+
+    def boolean_chain(self, expression: ir.BinaryOp, column: int) -> str:
+        """``a & b & c`` as one condition per line, operators leading."""
+        op = expression.op
+        operands = _flatten_left(expression)
+        first_min, rest_min = _boolean_operand_minimums(op)
+        lines = []
+        for position, operand in enumerate(operands):
+            minimum = first_min if position == 0 else rest_min
+            text = self.boolean_operand(operand, minimum, column)
+            lines.append(text if position == 0 else f"{op.value} {text}")
+        return "\n".join(lines)
+
+    def parenthesized(self, expression: ir.Expression, column: int) -> str:
+        """An expression in its own parentheses: on one line inside them if
+        that fits, otherwise wrapped further (a boolean chain gets one
+        condition per line)."""
+        inner = column + len(_INDENT)
+        body = self.expression(expression)
+        if inner + len(body) > self.line_length:
+            body = self.wrapped(expression, inner) or body
+        return f"(\n{_indent(body)}\n)"
+
+    def boolean_operand(self, operand: ir.Expression, minimum: int, column: int) -> str:
+        code = self.operand(operand, minimum)
+        if column + len(code) + 2 <= self.line_length:
+            return code
+        _, precedence = self.render(operand)
+        if (
+            precedence < minimum
+            and isinstance(operand, ir.BinaryOp)
+            and operand.op in _BOOLEAN_OPERATORS
+        ):
+            return self.parenthesized(operand, column)
+        if precedence >= minimum:
+            return self.wrapped(operand, column) or code
+        return code
+
+    def function_arguments(
+        self, name: str, arguments: tuple[ir.Expression, ...]
+    ) -> list[ir.Expression | str]:
+        """Arguments of a pyspark function, with plain-value parameters rendered
+        as Python values: F.round(col, 2), not F.round(col, F.lit(2))."""
+        plain = _PLAIN_VALUE_PARAMETERS.get(name, frozenset())
+        return [
+            self.python_value(argument.value)
+            if position in plain and isinstance(argument, ir.Literal)
+            else argument
+            for position, argument in enumerate(arguments)
+        ]
 
     # --- Expressions -----------------------------------------------------
 
@@ -262,13 +401,8 @@ class _Emitter:
                 return code, _ATOM
             case ir.FunctionCall(name=name, arguments=arguments):
                 self.uses_functions = True
-                plain = _PLAIN_VALUE_PARAMETERS.get(name, frozenset())
-                code = ", ".join(
-                    self.python_value(argument.value)
-                    if position in plain and isinstance(argument, ir.Literal)
-                    else self.expression(argument)
-                    for position, argument in enumerate(arguments)
-                )
+                values = self.function_arguments(name, arguments)
+                code = ", ".join(self.code(value) for value in values)
                 return f"F.{name}({code})", _ATOM
             case ir.Interval(unit=unit, amount=amount):
                 # make_interval keeps the input type when added: a date stays
@@ -404,3 +538,26 @@ def _walk(plan: ir.Relation) -> Iterator[ir.Relation]:
 
 def _spark_table(parts: tuple[str, ...]) -> str:
     return f"spark.table({python_string(spark_identifier(parts))})"
+
+
+_BOOLEAN_OPERATORS = frozenset({ir.BinaryOperator.AND, ir.BinaryOperator.OR})
+
+
+def _flatten_left(expression: ir.BinaryOp) -> list[ir.Expression]:
+    """Turn ((a & b) & c) into [a, b, c]. Only the left side is flattened, so
+    the operands keep the tree's left-to-right grouping."""
+    operands = []
+    node: ir.Expression = expression
+    while isinstance(node, ir.BinaryOp) and node.op is expression.op:
+        operands.append(node.right)
+        node = node.left
+    operands.append(node)
+    return operands[::-1]
+
+
+def _boolean_operand_minimums(op: ir.BinaryOperator) -> tuple[int, int]:
+    """The precedence each operand of a boolean chain needs to avoid
+    parentheses, matching ``_Emitter.render``: the first operand, then the rest."""
+    if op is ir.BinaryOperator.OR:
+        return _AND + 1, _AND + 1
+    return _AND, _AND + 1
