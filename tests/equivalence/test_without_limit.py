@@ -35,3 +35,10 @@ def test_query_without_limit_is_left_alone() -> None:
 )
 def test_has_order_by(sql: str, expected: bool) -> None:
     assert has_order_by(sql) is expected
+
+
+def test_set_operations_have_their_own_order_by_and_limit() -> None:
+    sql = "SELECT a FROM t UNION SELECT a FROM u ORDER BY a LIMIT 3"
+
+    assert has_order_by(sql) is True
+    assert without_limit(sql) == "SELECT a FROM t UNION SELECT a FROM u ORDER BY a"

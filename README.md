@@ -91,7 +91,8 @@ UnsupportedSQLError: 2 unsupported constructs:
 | `NTH_VALUE`, `RANGE` frames with offsets, `GROUPS` frames, `EXCLUDE`, `IGNORE NULLS` for `LAG`/`LEAD`, named windows, `QUALIFY`, and windows in aggregate queries | Unsupported — rejected with an error |
 | `WITH` (CTEs, including column lists) and subqueries in `FROM` and `JOIN` | Supported |
 | `NATURAL`, semi, anti, and as-of joins; `LATERAL` and `APPLY` | Unsupported — rejected with an error |
-| `WITH RECURSIVE`, set operations (`UNION`, `INTERSECT`, `EXCEPT`), and subqueries in expressions | Unsupported — rejected with an error |
+| `UNION [ALL]`, `INTERSECT [ALL]`, `EXCEPT [ALL]` and `MINUS`, with `ORDER BY`/`LIMIT` on the result | Supported |
+| `WITH RECURSIVE`, `UNION BY NAME`, `ORDER BY` expressions on a set operation, and subqueries in expressions | Unsupported — rejected with an error |
 | `GROUP BY` expressions, `ROLLUP`, `CUBE`, `GROUPING SETS`, `AVG(DISTINCT ...)` | Unsupported — rejected with an error |
 | `IN (subquery)`, `LIKE ... ESCAPE`, `IS TRUE`/`IS FALSE`, casts to `FLOAT`/`REAL`, `CHAR(n)`/`VARCHAR(n)`, unparameterized `DECIMAL`, and timestamps | Unsupported — rejected with an error |
 | Everything else, including `OFFSET`, user-defined functions, date formatting and parsing, and other functions | Unsupported — rejected with an error |
@@ -175,6 +176,7 @@ rejects it rather than guess:
 | `ROWNUM`, `ROWID` | Oracle | Pseudo-columns with no Spark equivalent; use `FETCH FIRST n ROWS ONLY`. |
 | `(+)` outer-join marker | Oracle | Ignoring it would turn an outer join into an inner join; use `LEFT`/`RIGHT JOIN`. |
 | `TOP n PERCENT`, `WITH TIES`, `OFFSET` | T-SQL, Oracle, others | Not equivalent to a plain row limit. |
+| `INTERSECT` mixed with `UNION` or `EXCEPT` without parentheses | All | Standard SQL and Spark run `INTERSECT` first; Oracle runs set operators left to right. Add parentheses. |
 | `GROUP BY 1` | Oracle, T-SQL | Oracle groups by the constant 1; T-SQL does not allow positions. |
 | `GROUP BY` or `HAVING` naming a `SELECT` alias | All | Databases differ on whether a same-named column wins, and only the schema would tell. |
 | A `SELECT` alias inside an `ORDER BY` expression (`ORDER BY total * 2`) | All | Some databases, such as PostgreSQL, read the name as a table column instead. |

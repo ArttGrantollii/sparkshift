@@ -337,7 +337,6 @@ def test_each_unsupported_join_is_reported_separately() -> None:
         ("UPDATE t SET a = 1", "UPDATE statement"),
         ("DELETE FROM t", "DELETE statement"),
         ("CREATE TABLE t (a INT)", "CREATE statement"),
-        ("SELECT * FROM a UNION SELECT * FROM b", "UNION statement"),
     ],
 )
 def test_non_select_statements_are_rejected_with_a_hint(sql: str, message: str) -> None:
@@ -2634,12 +2633,14 @@ def test_joined_subquery_is_aliased() -> None:
             "CTE name defined twice",
         ),
         (
-            "SELECT * FROM (SELECT a FROM t UNION SELECT a FROM u) s",
-            "UNION in a subquery",
+            "SELECT * FROM (SELECT a FROM t UNION SELECT a FROM u "
+            "INTERSECT SELECT a FROM v) s",
+            "INTERSECT combined with UNION or EXCEPT without parentheses",
         ),
+        # SQLGlot reads a VALUES CTE as SELECT * FROM (VALUES ...).
         (
-            "WITH c AS (SELECT a FROM t UNION SELECT a FROM u) SELECT * FROM c",
-            "UNION in a subquery",
+            "WITH c AS (VALUES (1, 2)) SELECT * FROM c",
+            "FROM source other than a table",
         ),
         ("WITH c AS (SELECT my_udf(a) AS x FROM t) SELECT * FROM c", "function MY_UDF"),
     ],
@@ -2697,3 +2698,232 @@ def test_unknown_parts_of_ctes_and_subqueries_are_rejected(
         translate(tree)
 
     assert message in [issue.message for issue in caught.value.issues]
+
+
+# --- Set operations ----------------------------------------------------------
+
+U = TableScan(("u",))
+U_A = Project(U, (A,))
+
+
+@pytest.mark.parametrize(
+    ("sql", "dialect", "operator", "distinct"),
+    [
+        ("SELECT a FROM t UNION SELECT a FROM u", None, ir.SetOperator.UNION, True),
+        (
+            "SELECT a FROM t UNION ALL SELECT a FROM u",
+            None,
+            ir.SetOperator.UNION,
+            False,
+        ),
+        (
+            "SELECT a FROM t UNION DISTINCT SELECT a FROM u",
+            "bigquery",
+            ir.SetOperator.UNION,
+            True,
+        ),
+        (
+            "SELECT a FROM t INTERSECT SELECT a FROM u",
+            None,
+            ir.SetOperator.INTERSECT,
+            True,
+        ),
+        (
+            "SELECT a FROM t INTERSECT ALL SELECT a FROM u",
+            None,
+            ir.SetOperator.INTERSECT,
+            False,
+        ),
+        ("SELECT a FROM t EXCEPT SELECT a FROM u", None, ir.SetOperator.EXCEPT, True),
+        (
+            "SELECT a FROM t EXCEPT ALL SELECT a FROM u",
+            None,
+            ir.SetOperator.EXCEPT,
+            False,
+        ),
+        (
+            "SELECT a FROM t MINUS SELECT a FROM u",
+            "oracle",
+            ir.SetOperator.EXCEPT,
+            True,
+        ),
+    ],
+)
+def test_set_operators(
+    sql: str, dialect: str | None, operator: ir.SetOperator, distinct: bool
+) -> None:
+    assert translate_sql(sql, dialect) == ir.SetOperation(operator, T_A, U_A, distinct)
+
+
+def test_set_operations_run_left_to_right() -> None:
+    plan = translate_sql("SELECT a FROM t UNION SELECT a FROM u EXCEPT SELECT a FROM t")
+
+    union = ir.SetOperation(ir.SetOperator.UNION, T_A, U_A, True)
+    assert plan == ir.SetOperation(ir.SetOperator.EXCEPT, union, T_A, True)
+
+
+def test_parentheses_group_set_operations() -> None:
+    plan = translate_sql(
+        "SELECT a FROM t UNION (SELECT a FROM u INTERSECT SELECT a FROM t)"
+    )
+
+    intersect = ir.SetOperation(ir.SetOperator.INTERSECT, U_A, T_A, True)
+    assert plan == ir.SetOperation(ir.SetOperator.UNION, T_A, intersect, True)
+
+
+def test_order_by_and_limit_apply_to_the_whole_result() -> None:
+    plan = translate_sql(
+        "SELECT a AS x, b FROM t UNION ALL SELECT a, c FROM u "
+        "ORDER BY x DESC, 2 LIMIT 5"
+    )
+
+    first = Project(T, (Alias(A, "x"), B))
+    union = ir.SetOperation(ir.SetOperator.UNION, first, Project(U, (A, C)), False)
+    assert plan == ir.Limit(
+        ir.Sort(union, (descending(Column(("x",))), ascending(B))), 5
+    )
+
+
+def test_set_operation_order_follows_the_dialects_null_placement() -> None:
+    plan = translate_sql("SELECT a FROM t UNION SELECT a FROM u ORDER BY a", "postgres")
+
+    assert isinstance(plan, ir.Sort)
+    assert plan.keys == (ascending(A, nulls_first=False),)
+
+
+def test_set_operation_of_star_queries_orders_by_name() -> None:
+    plan = translate_sql("SELECT * FROM t UNION SELECT * FROM u ORDER BY a")
+
+    union = ir.SetOperation(ir.SetOperator.UNION, T, U, True)
+    assert plan == ir.Sort(union, (ascending(A),))
+
+
+def test_set_operation_with_ctes() -> None:
+    plan = translate_sql(
+        "WITH c AS (SELECT a FROM t) SELECT a FROM c UNION SELECT a FROM u"
+    )
+
+    left = Project(ir.Named("c", T_A), (A,))
+    assert plan == ir.SetOperation(ir.SetOperator.UNION, left, U_A, True)
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        (
+            "SELECT * FROM (SELECT a FROM t UNION SELECT a FROM u) s",
+            ir.Named("s", ir.SetOperation(ir.SetOperator.UNION, T_A, U_A, True)),
+        ),
+        (
+            "WITH c AS (SELECT a FROM t EXCEPT SELECT a FROM u) SELECT * FROM c",
+            ir.Named("c", ir.SetOperation(ir.SetOperator.EXCEPT, T_A, U_A, True)),
+        ),
+    ],
+)
+def test_set_operations_in_subqueries_and_ctes(sql: str, expected: ir.Relation) -> None:
+    assert translate_sql(sql) == expected
+
+
+@pytest.mark.parametrize(
+    ("sql", "message"),
+    [
+        (
+            "SELECT a FROM t UNION SELECT a FROM u INTERSECT SELECT a FROM t",
+            "INTERSECT combined with UNION or EXCEPT without parentheses",
+        ),
+        (
+            "SELECT a FROM t INTERSECT SELECT a FROM u EXCEPT SELECT a FROM t",
+            "INTERSECT combined with UNION or EXCEPT without parentheses",
+        ),
+        (
+            "SELECT a, b FROM t UNION SELECT a FROM u",
+            "UNION of queries with 2 and 1 columns",
+        ),
+        (
+            "SELECT a FROM t UNION SELECT a FROM u ORDER BY a + 1",
+            "ORDER BY expression on a set operation",
+        ),
+        (
+            "SELECT a FROM t UNION SELECT a FROM u ORDER BY 2",
+            "ORDER BY position out of range",
+        ),
+        (
+            "SELECT * FROM t UNION SELECT * FROM u ORDER BY 1",
+            "ORDER BY position out of range",
+        ),
+        (
+            "SELECT a FROM t UNION SELECT a FROM u ORDER BY b",
+            "ORDER BY name that is not a column of the set operation",
+        ),
+        (
+            "SELECT a + 1 FROM t UNION SELECT a FROM u ORDER BY 1",
+            "ORDER BY position of an unnamed column",
+        ),
+    ],
+)
+def test_unsupported_set_operation(sql: str, message: str) -> None:
+    assert message in [issue for issue, _ in unsupported_issues(sql)]
+
+
+def test_issues_in_every_branch_are_reported() -> None:
+    issues = unsupported_issues(
+        "SELECT my_udf(a) AS x FROM t UNION SELECT other_udf(a) AS x FROM u"
+    )
+
+    assert issues == [
+        ("function MY_UDF", "MY_UDF(a)"),
+        ("function OTHER_UDF", "OTHER_UDF(a)"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("sql", "find", "part", "message"),
+    [
+        (
+            "SELECT a FROM t UNION SELECT a FROM u",
+            exp.Union,
+            "by_name",
+            "UNION BY NAME",
+        ),
+        (
+            "SELECT a FROM t UNION (SELECT a FROM u)",
+            exp.Subquery,
+            "where",
+            "parenthesized query with WHERE",
+        ),
+        (
+            "SELECT a FROM t UNION SELECT a FROM u ORDER BY a",
+            exp.Ordered,
+            "with_fill",
+            "ORDER BY with WITH_FILL",
+        ),
+        (
+            "SELECT a FROM t UNION SELECT a FROM u ORDER BY a",
+            exp.Order,
+            "siblings",
+            "ORDER BY with SIBLINGS",
+        ),
+    ],
+)
+def test_unknown_parts_of_set_operations_are_rejected(
+    sql: str, find: type[exp.Expression], part: str, message: str
+) -> None:
+    tree = parse_sql(sql)
+    tree.find(find).set(part, exp.true())
+
+    with pytest.raises(UnsupportedSQLError) as caught:
+        translate(tree)
+
+    assert message in [issue.message for issue in caught.value.issues]
+
+
+def test_only_queries_can_be_combined_or_nested() -> None:
+    # SQLGlot turns VALUES lists into queries; anything else that is not a
+    # query must be rejected rather than translated.
+    tree = parse_sql("SELECT a FROM t UNION SELECT a FROM u")
+    tree.set("expression", exp.to_table("u"))
+
+    with pytest.raises(UnsupportedSQLError) as caught:
+        translate(tree)
+
+    assert [issue.message for issue in caught.value.issues] == ["TABLE in a subquery"]

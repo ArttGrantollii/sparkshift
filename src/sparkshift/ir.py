@@ -432,6 +432,28 @@ class Aggregate:
             raise ValueError("Aggregate needs keys or aggregates")
 
 
+class SetOperator(Enum):
+    UNION = "union"
+    INTERSECT = "intersect"
+    EXCEPT = "except"
+
+
+@dataclass(frozen=True)
+class SetOperation:
+    """Combine the rows of two relations with the same number of columns,
+    matched by position; the output takes the left relation's column names.
+
+    With ``distinct``, duplicate rows are removed from the result (SQL's
+    default); otherwise duplicates count, as with ``UNION ALL``. NULLs compare
+    as equal.
+    """
+
+    operator: SetOperator
+    left: "Relation"
+    right: "Relation"
+    distinct: bool
+
+
 @dataclass(frozen=True)
 class Distinct:
     """Remove duplicate rows; NULLs compare as equal, as in SQL's DISTINCT."""
@@ -474,6 +496,7 @@ Relation: TypeAlias = (
     | Filter
     | Aggregate
     | Project
+    | SetOperation
     | Distinct
     | Sort
     | Limit

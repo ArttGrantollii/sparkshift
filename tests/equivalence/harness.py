@@ -80,7 +80,12 @@ def assert_equivalent(
 
 def has_order_by(spark_sql: str) -> bool:
     tree = sqlglot.parse_one(spark_sql, read="spark")
-    return isinstance(tree, exp.Select) and tree.args.get("order") is not None
+    return _is_query(tree) and tree.args.get("order") is not None
+
+
+def _is_query(tree: exp.Expression) -> bool:
+    """A SELECT or a set operation: both can have ORDER BY and LIMIT."""
+    return isinstance(tree, exp.Select | exp.SetOperation)
 
 
 def without_limit(spark_sql: str) -> str | None:
@@ -91,7 +96,7 @@ def without_limit(spark_sql: str) -> str | None:
     ``limited_differences`` and ``ordered_differences``).
     """
     tree = sqlglot.parse_one(spark_sql, read="spark")
-    if not isinstance(tree, exp.Select) or tree.args.get("limit") is None:
+    if not _is_query(tree) or tree.args.get("limit") is None:
         return None
     unlimited = tree.copy()
     unlimited.set("limit", None)

@@ -113,6 +113,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subqueries; and subqueries in `FROM` and `JOIN`. Each becomes a variable
   declared once, in the order the code needs it. Rejects `WITH RECURSIVE`
   and set operations inside them.
+- Set operations: `UNION`, `INTERSECT`, and `EXCEPT` (and `MINUS`), in
+  their distinct and `ALL` forms, matched by position, with `ORDER BY` and
+  `LIMIT` on the combined result, and inside CTEs and subqueries. Rejects
+  `INTERSECT` mixed with `UNION` or `EXCEPT` without parentheses, since
+  databases disagree on which runs first, and queries with different
+  numbers of columns.
 
 ### Fixed
 

@@ -11,7 +11,7 @@ from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from sqlglot import exp
 
@@ -59,6 +59,17 @@ _AGGREGATE_FUNCTIONS: dict[type[exp.Expression], ir.AggregateFunction] = {
     exp.Min: ir.AggregateFunction.MIN,
     exp.Max: ir.AggregateFunction.MAX,
 }
+
+_SET_OPERATORS: dict[type[exp.Expression], ir.SetOperator] = {
+    exp.Union: ir.SetOperator.UNION,
+    exp.Intersect: ir.SetOperator.INTERSECT,
+    exp.Except: ir.SetOperator.EXCEPT,
+}
+_INTERSECT = ir.SetOperator.INTERSECT
+# Parts of a set operation SparkShift handles; anything else is rejected.
+_SET_OPERATION_PARTS = frozenset(
+    {"with_", "this", "expression", "distinct", "order", "limit"}
+)
 
 _WINDOW_FUNCTIONS: dict[type[exp.Expression], ir.WindowFunction] = {
     exp.RowNumber: ir.WindowFunction.ROW_NUMBER,
@@ -357,18 +368,15 @@ class _Translator:
         self.scopes: list[dict[str, ir.Named]] = []
 
     def statement(self, tree: exp.Expression) -> ir.Relation:
-        if not isinstance(tree, exp.Select):
+        if not isinstance(tree, exp.Select | exp.SetOperation):
             self.unsupported(
                 f"{tree.key.upper()} statement",
                 tree,
                 hint="Only SELECT queries can be converted.",
             )
             raise UnsupportedSQLError(self.issues)
-        if not tree.expressions:
-            # SQLGlot's grammar accepts "SELECT FROM t"; SQL does not.
-            raise SQLParseError("SELECT has no columns.")
 
-        relation = self.select(tree)
+        relation = self.query(tree)
         if self.issues:
             raise UnsupportedSQLError(self.issues)
         assert relation is not None  # every failure path records an issue
@@ -377,38 +385,164 @@ class _Translator:
     # --- Queries ---------------------------------------------------------
 
     def query(self, node: exp.Expression) -> ir.Relation | None:
-        """Translate a nested query, such as a CTE's or a subquery's."""
-        if not isinstance(node, exp.Select):
+        """Translate a query: a SELECT or a set operation such as UNION, at
+        the top level or nested in a CTE or a subquery."""
+        if isinstance(node, exp.Select):
+            if not node.expressions:
+                # SQLGlot's grammar accepts "SELECT FROM t"; SQL does not.
+                raise SQLParseError("SELECT has no columns.")
+            translate: Callable[[Any], ir.Relation | None] = self.select_clauses
+        elif isinstance(node, exp.SetOperation):
+            translate = self.set_operation
+        else:
             self.unsupported(
                 f"{node.key.upper()} in a subquery",
                 node,
-                hint="Only SELECT queries can be nested so far.",
+                hint="Only SELECT queries and set operations can be nested.",
             )
             return None
-        if not node.expressions:
-            raise SQLParseError("SELECT has no columns.")
-        # A nested query starts with no outer context: its own SELECT list
-        # decides where aggregates and windows are allowed.
+        # A query starts with no outer context: its own SELECT list decides
+        # where aggregates and windows are allowed.
         outside = self.no_aggregates_in, self.no_windows
         self.no_aggregates_in, self.no_windows = None, _WINDOW_OUTSIDE_SELECT_LIST
         try:
-            return self.select(node)
+            return self.with_scope(node, translate)
         finally:
             self.no_aggregates_in, self.no_windows = outside
 
-    def select(self, select: exp.Select) -> ir.Relation | None:
-        """Translate a SELECT, with the CTEs of its WITH clause in scope."""
-        with_ = select.args.get("with_")
+    def with_scope(
+        self,
+        node: exp.Select | exp.SetOperation,
+        translate: Callable[[Any], ir.Relation | None],
+    ) -> ir.Relation | None:
+        """Translate a query with the CTEs of its WITH clause in scope."""
+        with_ = node.args.get("with_")
         if with_ is None:
-            return self.select_clauses(select)
+            return translate(node)
         scope: dict[str, ir.Named] = {}
         self.scopes.append(scope)
         try:
             defined = self.common_tables(with_, scope)
-            relation = self.select_clauses(select)
+            relation = translate(node)
         finally:
             self.scopes.pop()
         return relation if defined else None
+
+    def set_operation(self, node: exp.SetOperation) -> ir.Relation | None:
+        """Translate UNION, INTERSECT, or EXCEPT (MINUS), with the ORDER BY and
+        LIMIT that apply to the combined result."""
+        operator = _SET_OPERATORS[type(node)]
+        name = operator.name
+        issues_before = len(self.issues)
+        for part, value in node.args.items():
+            if value and part not in _SET_OPERATION_PARTS:
+                label = "BY NAME" if part == "by_name" else part.upper()
+                self.unsupported(f"{name} {label}", node)
+        for operand in (node.this, node.expression):
+            # SQLGlot reads unparenthesized set operators left to right, as
+            # Oracle does; standard SQL and Spark evaluate INTERSECT first.
+            inner = _SET_OPERATORS.get(type(operand))
+            if inner is not None and (inner is _INTERSECT) != (operator is _INTERSECT):
+                self.unsupported(
+                    "INTERSECT combined with UNION or EXCEPT without parentheses",
+                    node,
+                    hint="Databases disagree on which runs first; add parentheses.",
+                )
+        left = self.set_operand(node.this)
+        right = self.set_operand(node.expression)
+        counts = _column_count(node.this), _column_count(node.expression)
+        if None not in counts and counts[0] != counts[1]:
+            self.unsupported(
+                f"{name} of queries with {counts[0]} and {counts[1]} columns", node
+            )
+        order = node.args.get("order")
+        keys = None if order is None else self.set_operation_order(order, node)
+        limit_node = node.args.get("limit")
+        limit = None if limit_node is None else self.limit(limit_node)
+        if len(self.issues) > issues_before or left is None or right is None:
+            return None
+
+        distinct = bool(node.args.get("distinct"))
+        relation: ir.Relation = ir.SetOperation(operator, left, right, distinct)
+        if keys:
+            relation = ir.Sort(relation, keys)
+        if limit is not None:
+            relation = ir.Limit(relation, limit)
+        return relation
+
+    def set_operand(self, node: exp.Expression) -> ir.Relation | None:
+        """One side of a set operation, possibly in parentheses."""
+        if isinstance(node, exp.Subquery):
+            if not self.check_parts(node, {"this"}, "parenthesized query"):
+                return None
+            node = node.this
+        return self.query(node)
+
+    def set_operation_order(
+        self, order: exp.Order, node: exp.SetOperation
+    ) -> tuple[ir.SortKey, ...] | None:
+        """ORDER BY on a set operation's result, by output column name or
+        position. The output columns are named after the first query's."""
+        names = _first_query_names(node)
+        issues_before = len(self.issues)
+        self.check_parts(order, {"expressions"}, "ORDER BY")
+        keys = []
+        for ordered in order.expressions:
+            if not self.check_parts(
+                ordered, {"this", "desc", "nulls_first"}, "ORDER BY"
+            ):
+                continue
+            column = self.set_operation_column(ordered.this, names)
+            if column is not None:
+                keys.append(
+                    ir.SortKey(
+                        ir.Column((column,)),
+                        descending=bool(ordered.args.get("desc")),
+                        nulls_first=bool(ordered.args.get("nulls_first")),
+                    )
+                )
+        return None if len(self.issues) > issues_before else tuple(keys)
+
+    def set_operation_column(
+        self, term: exp.Expression, names: list[str | None] | None
+    ) -> str | None:
+        """The output column an ORDER BY key of a set operation names.
+        ``names`` are the output column names, or None when the first query
+        selects * and they are unknown."""
+        if isinstance(term, exp.Literal) and not term.is_string and term.this.isdigit():
+            position = int(term.this)
+            if names is None or not 1 <= position <= len(names):
+                self.unsupported("ORDER BY position out of range", term)
+                return None
+            name = names[position - 1]
+            if name is None:
+                self.unsupported(
+                    "ORDER BY position of an unnamed column",
+                    term,
+                    hint="Give the column an alias in the first query.",
+                )
+            return name
+        if (
+            isinstance(term, exp.Column)
+            and not term.table
+            and not isinstance(term.this, exp.Star)
+        ):
+            if names is None:
+                return term.name
+            for name in names:
+                if name is not None and name.lower() == term.name.lower():
+                    return name
+            self.unsupported(
+                "ORDER BY name that is not a column of the set operation",
+                term,
+            )
+            return None
+        self.unsupported(
+            "ORDER BY expression on a set operation",
+            term,
+            hint="Order by an output column's name or position.",
+        )
+        return None
 
     def common_tables(self, with_: exp.With, scope: dict[str, ir.Named]) -> bool:
         """Translate each CTE into ``scope``, where the CTEs after it can use
@@ -2446,6 +2580,42 @@ def _calls_function(expression: ir.Expression) -> bool:
     if isinstance(expression, ir.FunctionCall | ir.Interval):
         return True
     return any(_calls_function(child) for child in ir.children(expression))
+
+
+def _column_count(node: exp.Expression) -> int | None:
+    """The number of columns a query outputs, or None if it selects *."""
+    while isinstance(node, exp.Subquery | exp.SetOperation):
+        node = node.this
+    if not isinstance(node, exp.Select):
+        return None
+    if any(_is_star(item) for item in node.expressions):
+        return None
+    return len(node.expressions)
+
+
+def _first_query_names(node: exp.Expression) -> list[str | None] | None:
+    """The output column names of a set operation: those of its first
+    query, by alias or column name (None for other unaliased items), or
+    None if it selects *."""
+    while isinstance(node, exp.Subquery | exp.SetOperation):
+        node = node.this
+    if not isinstance(node, exp.Select) or any(
+        _is_star(item) for item in node.expressions
+    ):
+        return None
+    names: list[str | None] = []
+    for item in node.expressions:
+        if isinstance(item, exp.Alias | exp.Column):
+            names.append(item.alias_or_name)
+        else:
+            names.append(None)
+    return names
+
+
+def _is_star(item: exp.Expression) -> bool:
+    return isinstance(item, exp.Star) or (
+        isinstance(item, exp.Column) and isinstance(item.this, exp.Star)
+    )
 
 
 def _window_function_name(

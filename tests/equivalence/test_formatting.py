@@ -18,6 +18,7 @@ import test_filtering
 import test_functions
 import test_joins
 import test_ordering
+import test_set_operations
 import test_windows
 
 from sparkshift.emit import emit
@@ -35,6 +36,7 @@ MODULES = [
     test_ordering,
     test_windows,
     test_ctes,
+    test_set_operations,
 ]
 
 

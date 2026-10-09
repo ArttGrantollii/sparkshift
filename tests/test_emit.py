@@ -1296,3 +1296,82 @@ def test_different_relations_with_the_same_name_get_different_variables() -> Non
 def test_rename_columns_requires_names() -> None:
     with pytest.raises(ValueError, match="at least one name"):
         ir.RenameColumns(TableScan(("t",)), ())
+
+
+# --- Set operations ----------------------------------------------------------
+
+T_ONLY = TableScan(("t",))
+U_FILTERED = ir.Filter(
+    TableScan(("u",)), BinaryOp(BinaryOperator.GREATER, A, Literal(1))
+)
+
+
+@pytest.mark.parametrize(
+    ("operator", "distinct", "steps"),
+    [
+        (ir.SetOperator.UNION, False, ".union("),
+        (ir.SetOperator.UNION, True, ".union("),
+        (ir.SetOperator.INTERSECT, True, ".intersect("),
+        (ir.SetOperator.INTERSECT, False, ".intersectAll("),
+        (ir.SetOperator.EXCEPT, True, ".subtract("),
+        (ir.SetOperator.EXCEPT, False, ".exceptAll("),
+    ],
+)
+def test_set_operation_methods(
+    operator: ir.SetOperator, distinct: bool, steps: str
+) -> None:
+    code = emit(ir.SetOperation(operator, T_ONLY, U_FILTERED, distinct))
+
+    assert f"    {steps}\n" in code
+    # Only UNION needs an extra step to remove duplicates.
+    removes_duplicates = operator is ir.SetOperator.UNION and distinct
+    assert ("    .distinct()\n" in code) is removes_duplicates
+
+
+def test_other_branch_is_a_nested_chain() -> None:
+    plan = ir.SetOperation(ir.SetOperator.UNION, T_ONLY, U_FILTERED, True)
+
+    assert emit(plan) == (
+        "from pyspark.sql import functions as F\n"
+        "\n"
+        "result = (\n"
+        '    spark.table("t")\n'
+        "    .union(\n"
+        '        spark.table("u")\n'
+        '        .where(F.col("a") > F.lit(1))\n'
+        "    )\n"
+        "    .distinct()\n"
+        ")\n"
+    )
+
+
+def test_branch_without_steps_stays_on_one_line() -> None:
+    plan = ir.SetOperation(ir.SetOperator.UNION, U_FILTERED, T_ONLY, False)
+
+    assert '    .union(spark.table("t"))\n' in emit(plan)
+
+
+def test_nested_branches_respect_the_line_length() -> None:
+    long_names = tuple(Column((f"a_rather_long_column_name_{i}",)) for i in range(3))
+    deep = Project(TableScan(("u",)), long_names)
+    plan = ir.SetOperation(
+        ir.SetOperator.UNION,
+        T_ONLY,
+        ir.SetOperation(ir.SetOperator.INTERSECT, T_ONLY, deep, True),
+        True,
+    )
+
+    code = emit(plan)
+
+    assert max(len(line) for line in code.splitlines()) <= 88
+    assert '                F.col("a_rather_long_column_name_0"),\n' in code
+
+
+def test_named_relation_first_used_in_a_branch_is_declared_unindented() -> None:
+    named = ir.Named("recent", U_FILTERED)
+    plan = ir.SetOperation(ir.SetOperator.UNION, T_ONLY, Project(named, (A,)), True)
+
+    code = emit(plan)
+
+    assert "recent = (\n    spark.table" in code
+    assert "    .union(\n        recent\n" in code

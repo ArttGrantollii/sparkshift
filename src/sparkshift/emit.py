@@ -47,6 +47,17 @@ _PLAIN_VALUE_PARAMETERS = {
     "ntile": frozenset({0}),
 }
 
+# DataFrame methods for set operations, by operator and whether duplicates
+# are removed. UNION removes them with an extra .distinct().
+_SET_OPERATION_METHODS = {
+    (ir.SetOperator.UNION, True): "union",
+    (ir.SetOperator.UNION, False): "union",
+    (ir.SetOperator.INTERSECT, True): "intersect",
+    (ir.SetOperator.INTERSECT, False): "intersectAll",
+    (ir.SetOperator.EXCEPT, True): "subtract",
+    (ir.SetOperator.EXCEPT, False): "exceptAll",
+}
+
 # Flags passed by keyword, so the code says what they mean:
 # F.first_value(col, ignoreNulls=True).
 _KEYWORD_PARAMETERS = {
@@ -104,6 +115,9 @@ class _Emitter:
         # needs them, so each comes after the ones it uses.
         self.declarations: list[str] = []
         self.taken_names: set[str] = set(_RESERVED_NAMES)
+        # Extra indentation of the chain being rendered, for a chain nested
+        # inside a call such as .union(...).
+        self.nesting = 0
 
     def program(self, plan: ir.Relation) -> str:
         self.table_uses = Counter(
@@ -153,7 +167,10 @@ class _Emitter:
         the code uses it, after any named relations it uses itself."""
         name = self.named_variables.get(node)
         if name is None:
+            # Declarations are not nested, whatever the code that uses them.
+            nesting, self.nesting = self.nesting, 0
             code = self.relation(node.source)
+            self.nesting = nesting
             name = _unique_name(_python_name(node.name), self.taken_names)
             self.taken_names.add(name)
             self.named_variables[node] = name
@@ -258,6 +275,16 @@ class _Emitter:
             case ir.Project(source=source, items=items):
                 start, calls = self.chain(source)
                 return start, [*calls, self.call("select", items)]
+            case ir.SetOperation(
+                operator=operator, left=left, right=right, distinct=distinct
+            ):
+                start, calls = self.chain(left)
+                method = _SET_OPERATION_METHODS[operator, distinct]
+                steps = [self.call(method, [self.nested_relation(right)])]
+                if operator is ir.SetOperator.UNION and distinct:
+                    # PySpark's union keeps duplicates, like UNION ALL.
+                    steps.append(self.call("distinct", []))
+                return start, [*calls, *steps]
             case ir.Distinct(source=source):
                 start, calls = self.chain(source)
                 return start, [*calls, self.call("distinct", [])]
@@ -279,6 +306,17 @@ class _Emitter:
             and self.table_uses[source.name_parts] == 1
         )
 
+    def nested_relation(self, plan: ir.Relation) -> str:
+        """A relation used as an argument, as a chain with one call per line
+        (indented by the call it is passed to), or a single line if it has no
+        calls."""
+        self.nesting += len(_INDENT)
+        try:
+            start, calls = self.chain(plan)
+        finally:
+            self.nesting -= len(_INDENT)
+        return "\n".join([start, *calls])
+
     def inline_relation(self, plan: ir.Relation) -> str:
         """Render a relation used as an argument, such as the right side of a join."""
         start, calls = self.chain(plan)
@@ -290,9 +328,15 @@ class _Emitter:
         wrapped further if it is still too long."""
         one_line = [self.code(argument) for argument in arguments]
         inline = f".{method}({', '.join(one_line)})"
-        if len(arguments) <= 1 and len(_INDENT + inline) <= self.line_length:
+        step_column = len(_INDENT) + self.nesting
+        if (
+            len(arguments) <= 1
+            and "\n" not in inline
+            and step_column + len(inline) <= self.line_length
+        ):
             return inline
-        codes = [self.argument(argument, _ARGUMENT_COLUMN) for argument in arguments]
+        column = _ARGUMENT_COLUMN + self.nesting
+        codes = [self.argument(argument, column) for argument in arguments]
         if len(codes) == 1:
             return f".{method}(\n{_indent(codes[0])}\n)"
         body = "".join(_indent(f"{code},") + "\n" for code in codes)
@@ -655,7 +699,10 @@ def _walk(plan: ir.Relation) -> Iterator[ir.Relation]:
                 if node not in seen:
                     seen.add(node)
                     yield from walk(source)
-            case ir.Join(left=left, right=right):
+            case (
+                ir.Join(left=left, right=right)
+                | ir.SetOperation(left=left, right=right)
+            ):
                 yield from walk(left)
                 yield from walk(right)
             case (
