@@ -68,6 +68,7 @@ sparkshift convert query.sql                    # print the PySpark code
 sparkshift convert query.sql --dialect tsql     # SQL in a specific dialect
 sparkshift convert query.sql -o query.py        # write the code to a file
 cat query.sql | sparkshift convert -            # read standard input
+sparkshift convert queries/ -o pyspark/         # every .sql file in a directory
 ```
 
 For example:
@@ -91,10 +92,16 @@ result = (
 <!-- fmt: on -->
 
 The code goes to standard output and every message to standard error, so
-`> query.py` never captures an error. The exit status is 0 when the query is
-converted, 1 when it cannot be (every issue is listed), and 2 for a usage
-error such as a missing file or an unknown dialect. `python -m sparkshift`
-works the same way. In a development checkout, run it as `uv run sparkshift`.
+`> query.py` never captures an error. For a directory, each `.sql` file,
+including those in subdirectories, becomes a `.py` file at the same relative
+path under the output directory; files that cannot be converted are listed
+with their issues, followed by a summary such as
+`converted 8 of 10 files; 2 could not be converted`.
+
+The exit status is 0 when every query is converted, 1 when any cannot be,
+and 2 for a usage error such as a missing file or an unknown dialect.
+`python -m sparkshift` works the same way. In a development checkout, run it
+as `uv run sparkshift`.
 
 ## Supported SQL
 

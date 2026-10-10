@@ -127,9 +127,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value (Spark returns false where SQL returns NULL), `ANY`/`ALL`, and
   row-value `IN`.
 - Command line: `sparkshift convert` (also `python -m sparkshift`) converts
-  a SQL file or standard input, with `--dialect` and `--output`. Code goes
-  to standard output and messages to standard error; the exit status is 0
-  when converted, 1 when the SQL cannot be, and 2 for usage errors.
+  a SQL file, standard input, or every `.sql` file in a directory into a
+  matching tree of `.py` files, with `--dialect` and `--output`. Code goes
+  to standard output and messages to standard error, ending with a summary
+  for a directory; the exit status is 0 when everything is converted, 1
+  when anything cannot be, and 2 for usage errors.
 
 ### Changed
 

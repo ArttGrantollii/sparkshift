@@ -2,6 +2,7 @@
 
 import importlib
 import io
+import os
 import runpy
 import shutil
 import subprocess
@@ -134,7 +135,10 @@ def test_warnings_go_to_standard_error(
 
     out, err = capsys.readouterr()
     assert out == "result = x\n"
-    assert err == "sparkshift: warning: fallback used: x. Hint: Review it.\n"
+    assert (
+        err
+        == f"sparkshift: warning in {sql_file}: fallback used: x. Hint: Review it.\n"
+    )
 
 
 @pytest.mark.parametrize(
@@ -220,3 +224,150 @@ def test_importing_main_does_not_run_the_command_line(
     importlib.import_module("sparkshift.__main__")
 
     assert capsys.readouterr() == ("", "")
+
+
+# --- Converting a directory --------------------------------------------------
+
+
+@pytest.fixture
+def queries(tmp_path: Path) -> Path:
+    """A directory of queries: two convertible (one nested), one not, one
+    not UTF-8, and a file that is not SQL."""
+    root = tmp_path / "queries"
+    (root / "reports").mkdir(parents=True)
+    (root / "a_orders.sql").write_text(SQL, encoding="utf-8")
+    (root / "reports" / "b_customers.sql").write_text(
+        "SELECT name FROM customers", encoding="utf-8"
+    )
+    (root / "c_bad.sql").write_text("SELECT my_udf(a) AS x FROM t", encoding="utf-8")
+    (root / "d_latin1.sql").write_bytes("SELECT 'café' AS x FROM t".encode("latin-1"))
+    (root / "notes.txt").write_text("not a query", encoding="utf-8")
+    return root
+
+
+def test_directory_converts_each_sql_file_into_the_output_directory(
+    queries: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "pyspark"
+
+    assert main(["convert", str(queries), "-o", str(output)]) == EXIT_NOT_CONVERTED
+
+    written = sorted(path.relative_to(output) for path in output.rglob("*"))
+    assert written == [
+        Path("a_orders.py"),
+        Path("reports"),
+        Path("reports/b_customers.py"),
+    ]
+    assert (output / "a_orders.py").read_text(encoding="utf-8") == CODE
+    assert (output / "reports" / "b_customers.py").read_text(
+        encoding="utf-8"
+    ) == sparkshift.convert("SELECT name FROM customers").code
+
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err == (
+        f"sparkshift: cannot convert {queries / 'c_bad.sql'}: "
+        "1 unsupported construct:\n"
+        "  - function MY_UDF: MY_UDF(a)\n"
+        f"sparkshift: cannot read {queries / 'd_latin1.sql'}: it is not UTF-8 text\n"
+        "sparkshift: converted 2 of 4 files; 2 could not be converted\n"
+    )
+
+
+def test_directory_where_everything_converts_exits_with_0(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = tmp_path / "queries"
+    source.mkdir()
+    (source / "only.sql").write_text(SQL, encoding="utf-8")
+
+    assert main(["convert", str(source), "-o", str(tmp_path / "out")]) == EXIT_CONVERTED
+
+    assert capsys.readouterr().err == "sparkshift: converted 1 of 1 file\n"
+
+
+def test_directory_applies_the_dialect_to_every_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = tmp_path / "queries"
+    source.mkdir()
+    (source / "top.sql").write_text(
+        "SELECT TOP 2 name FROM customers", encoding="utf-8"
+    )
+    output = tmp_path / "out"
+
+    assert main(["convert", str(source), "-o", str(output), "-d", "tsql"]) == 0
+
+    assert (output / "top.py").read_text(encoding="utf-8") == sparkshift.convert(
+        "SELECT TOP 2 name FROM customers", dialect="tsql"
+    ).code
+
+
+def test_unreadable_file_in_a_directory_is_counted_as_not_converted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = tmp_path / "queries"
+    source.mkdir()
+    locked = source / "locked.sql"
+    locked.write_text(SQL, encoding="utf-8")
+    locked.chmod(0)
+    try:
+        if os.access(locked, os.R_OK):
+            pytest.skip("this user can read files without read permission")
+        exit_code = main(["convert", str(source), "-o", str(tmp_path / "out")])
+    finally:
+        locked.chmod(0o644)
+
+    assert exit_code == EXIT_NOT_CONVERTED
+    assert f"cannot read {locked}: Permission denied" in capsys.readouterr().err
+
+
+def usage_error(arguments: list[str], capsys: pytest.CaptureFixture[str]) -> str:
+    """Run the command line, check it exits with a usage error, and return
+    what it printed on standard error."""
+    with pytest.raises(SystemExit) as caught:
+        main(arguments)
+    assert caught.value.code == EXIT_USAGE
+    return capsys.readouterr().err
+
+
+def test_directory_needs_an_output_directory(
+    queries: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    err = usage_error(["convert", str(queries)], capsys)
+
+    assert "needs --output DIRECTORY" in err
+
+
+def test_directory_output_cannot_be_a_file(
+    queries: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "out.py"
+    output.write_text("", encoding="utf-8")
+
+    err = usage_error(["convert", str(queries), "-o", str(output)], capsys)
+
+    assert f"--output {output} must be a directory, not a file" in err
+
+
+def test_directory_without_sql_files(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    err = usage_error(["convert", str(empty), "-o", str(tmp_path / "out")], capsys)
+
+    assert f"no .sql files in {empty}" in err
+
+
+def test_unwritable_output_directory_is_a_usage_error(
+    queries: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "a_orders.py").mkdir()  # a directory where a file must go
+
+    err = usage_error(["convert", str(queries), "-o", str(output)], capsys)
+
+    assert f"cannot write {output / 'a_orders.py'}" in err
