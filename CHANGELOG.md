@@ -167,6 +167,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MySQL scenarios and examples run on a real MySQL 8.4 server in CI too,
   through the same runner. The test database compares strings exactly, as
   Spark does, and MySQL's 0 and 1 compare as booleans.
+- SAS front end (in progress; ADR 0005): `convert(program, dialect="sas")`
+  and `sparkshift convert job.sas --dialect sas` convert DATA steps that read
+  one data set with `SET`, filter it with `WHERE` or `WHERE=`, and keep, drop,
+  or rename variables, in SAS's documented order. Conditions follow SAS's
+  rules: a missing number is smaller than every number, a comparison is never
+  missing, and trailing blanks do not count in text. Each data set becomes a
+  DataFrame variable; `result` is the last. Everything else is rejected with
+  every issue listed. SAS scenarios check the generated code on Spark against
+  expected rows written by hand from the documented rules (docs/sas.md).
+- `SASParseError`, a subclass of `SQLParseError`, for invalid SAS programs.
 
 ### Changed
 

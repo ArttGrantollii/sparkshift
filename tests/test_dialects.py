@@ -1,6 +1,12 @@
 import pytest
 
-from sparkshift.dialects import SUPPORTED_DIALECTS, resolve_dialect
+from sparkshift.dialects import (
+    DIALECT_CHOICES,
+    SAS,
+    SUPPORTED_DIALECTS,
+    is_sas,
+    resolve_dialect,
+)
 from sparkshift.errors import UnsupportedDialectError
 
 
@@ -29,6 +35,19 @@ def test_unknown_dialect_is_rejected_with_the_supported_list(dialect: str) -> No
         resolve_dialect(dialect)
 
     assert caught.value.dialect == dialect
-    assert caught.value.supported == SUPPORTED_DIALECTS
-    for name in SUPPORTED_DIALECTS:
+    assert caught.value.supported == DIALECT_CHOICES
+    for name in DIALECT_CHOICES:
         assert name in str(caught.value)
+
+
+def test_sas_is_a_choice_but_not_a_sql_dialect() -> None:
+    assert (*SUPPORTED_DIALECTS, SAS) == DIALECT_CHOICES
+    assert SAS not in SUPPORTED_DIALECTS
+
+
+@pytest.mark.parametrize(
+    ("dialect", "expected"),
+    [("sas", True), (" SAS ", True), (None, False), ("tsql", False)],
+)
+def test_is_sas(dialect: str | None, expected: bool) -> None:
+    assert is_sas(dialect) is expected

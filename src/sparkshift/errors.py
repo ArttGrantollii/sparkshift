@@ -47,6 +47,14 @@ class SQLParseError(SparkShiftError):
         super().__init__(f"{message}{location}")
 
 
+class SASParseError(SQLParseError):
+    """The input is empty or is not a valid SAS program.
+
+    It is an SQLParseError too, so callers that handle invalid input handle
+    both languages the same way.
+    """
+
+
 class UnsupportedSQLError(SparkShiftError):
     """The SQL is valid but uses constructs SparkShift cannot translate safely.
 

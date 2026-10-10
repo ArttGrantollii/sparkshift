@@ -25,7 +25,7 @@ from pathlib import Path
 from sparkshift import __version__
 from sparkshift.api import convert
 from sparkshift.diagnostics import ConversionResult
-from sparkshift.dialects import SUPPORTED_DIALECTS
+from sparkshift.dialects import DIALECT_CHOICES, SUPPORTED_DIALECTS
 from sparkshift.errors import SparkShiftError
 from sparkshift.report import Report, assess, to_json, to_markdown, to_text, unreadable
 
@@ -77,8 +77,9 @@ def _parser() -> argparse.ArgumentParser:
         "-d",
         "--dialect",
         type=str.lower,
-        choices=SUPPORTED_DIALECTS,
-        help="SQL dialect of the input; omit it for generic SQL",
+        choices=DIALECT_CHOICES,
+        help="SQL dialect of the input, or sas for a SAS program; omit it for "
+        "generic SQL",
     )
     convert_command.add_argument(
         "-o",

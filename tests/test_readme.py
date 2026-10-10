@@ -43,6 +43,20 @@ def test_coverage_report_example_matches_real_output(
     assert f"```text\n{capsys.readouterr().out}```" in README
 
 
+def test_sas_example_matches_real_output() -> None:
+    program = (
+        "data low_scores;\n"
+        "    set customers (keep=customer_id name score);\n"
+        "    where score < 3;\n"
+        "    rename name = customer_name;\n"
+        "run;\n"
+    )
+
+    assert f"```sas\n{program}```" in README
+    code = sparkshift.convert(program, dialect="sas").code
+    assert f"```python\n{code}```" in README
+
+
 def test_unsupported_example_matches_real_error() -> None:
     with pytest.raises(sparkshift.UnsupportedSQLError) as caught:
         sparkshift.convert(

@@ -19,12 +19,15 @@ import test_functions
 import test_joins
 import test_ordering
 import test_qualify
+import test_sas
 import test_set_operations
 import test_subqueries
 import test_windows
 
-from sparkshift.emit import emit
+from sparkshift.emit import emit, emit_datasets
 from sparkshift.parsing import parse_sql
+from sparkshift.sas_parser import parse_sas
+from sparkshift.sas_translate import translate_sas
 from sparkshift.translate import translate
 
 MODULES = [
@@ -132,6 +135,26 @@ def test_generated_lines_fit_the_line_length(dialect: str | None, sql: str) -> N
 
     too_long = [line for line in code.splitlines() if len(line) > 88]
     assert too_long == []
+
+
+SAS_PROGRAMS = [program for program, _ in test_sas.SAS_SCENARIOS.values()]
+
+
+@pytest.mark.parametrize("program", SAS_PROGRAMS)
+def test_sas_wrapping_keeps_the_syntax_tree(program: str) -> None:
+    datasets = translate_sas(parse_sas(program), program).datasets
+    one_line = ast.dump(ast.parse(emit_datasets(datasets, line_length=10**6)))
+
+    for line_length in (88, 30):
+        code = emit_datasets(datasets, line_length=line_length)
+        assert ast.dump(ast.parse(code)) == one_line
+
+
+@pytest.mark.parametrize("program", SAS_PROGRAMS)
+def test_sas_lines_fit_the_line_length(program: str) -> None:
+    code = emit_datasets(translate_sas(parse_sas(program), program).datasets)
+
+    assert [line for line in code.splitlines() if len(line) > 88] == []
 
 
 def test_formatting_covers_every_equivalence_module() -> None:

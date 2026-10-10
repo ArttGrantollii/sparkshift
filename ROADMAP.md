@@ -14,7 +14,7 @@ Status legend: **Done** · **In progress** · **Planned**
 | 2 | CLI (`sparkshift convert`), packaging polish, verified examples | Done |
 | 6 | Public browser-based playground (live demo) | Done |
 | 3 | Advanced SQL: QUALIFY, multi-dialect testing, coverage reporting | Done |
-| 4 | SAS → PySpark for a documented subset (DATA step, PROC SQL/SORT/MEANS/FREQ) | Planned |
+| 4 | SAS → PySpark for a documented subset (DATA step, PROC SQL/SORT/MEANS/FREQ) | In progress |
 | 5 | Databricks notebook generation and deployment | Planned |
 | 7 | Documentation polish and 1.0 release on PyPI | Planned |
 

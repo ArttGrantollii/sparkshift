@@ -59,6 +59,20 @@ def test_convert_honors_the_dialect(
     assert capsys.readouterr().out == sparkshift.convert(sql, dialect=dialect).code
 
 
+def test_convert_a_sas_program_with_its_warnings(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    program = "data us; set customers(keep=id name); where country = 'US'; run;"
+    path = tmp_path / "job.sas"
+    path.write_text(program, encoding="utf-8")
+
+    assert main(["convert", str(path), "-d", "sas"]) == EXIT_CONVERTED
+
+    out, err = capsys.readouterr()
+    assert out == sparkshift.convert(program, dialect="sas").code
+    assert err.startswith(f"sparkshift: warning in {path}: KEEP of several variables")
+
+
 def test_convert_reads_standard_input(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

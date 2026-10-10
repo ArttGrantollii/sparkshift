@@ -9,7 +9,7 @@ Generated code is deterministic: the same IR always produces the same text.
 import keyword
 import re
 from collections import Counter
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from decimal import Decimal
 from typing import TypeAlias, assert_never
 
@@ -96,6 +96,17 @@ def emit(plan: ir.Relation, *, line_length: int = _MAX_LINE_LENGTH) -> str:
     return _Emitter(line_length).program(plan)
 
 
+def emit_datasets(
+    datasets: Sequence[ir.Named], *, line_length: int = _MAX_LINE_LENGTH
+) -> str:
+    """Return PySpark code that assigns each data set to its own variable, in
+    order, whether or not a later one uses it, and the last one to ``result``,
+    as a SAS program creates its data sets one step at a time."""
+    if not datasets:
+        raise ValueError("emit_datasets needs at least one data set")
+    return _Emitter(line_length).datasets(datasets)
+
+
 def emit_expression(expression: ir.Expression) -> str:
     """Return the PySpark code for a single expression."""
     return _Emitter().expression(expression)
@@ -120,20 +131,34 @@ class _Emitter:
         self.nesting = 0
 
     def program(self, plan: ir.Relation) -> str:
+        return self.assemble([plan], lambda: self.relation(plan))
+
+    def datasets(self, outputs: Sequence[ir.Named]) -> str:
+        def last_dataset() -> str:
+            for output in outputs:
+                self.named_variable(output)
+            return self.named_variable(outputs[-1])
+
+        return self.assemble(outputs, last_dataset)
+
+    def assemble(self, roots: Sequence[ir.Relation], result: Callable[[], str]) -> str:
+        """The whole program: imports, shared variables, the declarations
+        ``result`` makes while rendering, then ``result = ...``."""
+        nodes = [node for root in roots for node in _walk(root)]
         self.table_uses = Counter(
-            node.name_parts for node in _walk(plan) if isinstance(node, ir.TableScan)
+            node.name_parts for node in nodes if isinstance(node, ir.TableScan)
         )
         # Queries that combine tables declare each source table once, up front.
-        if any(isinstance(node, ir.Join) for node in _walk(plan)):
-            self.table_variables = table_variables(plan)
+        if any(isinstance(node, ir.Join) for node in nodes):
+            self.table_variables = table_variables(*roots)
         # Each distinct window is declared once, so calls can share it.
         self.window_variables = window_variables(
-            plan, set(self.table_variables.values())
+            roots, set(self.table_variables.values())
         )
         self.taken_names |= {*self.table_variables.values()}
         self.taken_names |= {*self.window_variables.values()}
 
-        statement = f"{RESULT_VARIABLE} = {self.relation(plan)}\n"
+        statement = f"{RESULT_VARIABLE} = {result()}\n"
         windows = [
             self.window_variable(name, key)
             for key, name in self.window_variables.items()
@@ -239,6 +264,18 @@ class _Emitter:
                 start, calls = self.chain(source)
                 renamed = self.call("toDF", [python_string(name) for name in names])
                 return start, [*calls, renamed]
+            case ir.RenameByName(source=source, renames=renames):
+                # One rename at a time is safe: the renames never overlap.
+                start, calls = self.chain(source)
+                steps = [
+                    self.call(
+                        "withColumnRenamed",
+                        [python_string(old), python_string(new)],
+                        short=True,
+                    )
+                    for old, new in renames
+                ]
+                return start, [*calls, *steps]
             case ir.DropColumns(source=source, names=names):
                 start, calls = self.chain(source)
                 dropped = self.call("drop", [python_string(name) for name in names])
@@ -329,15 +366,18 @@ class _Emitter:
         start, calls = self.chain(plan)
         return start + "".join(calls)
 
-    def call(self, method: str, arguments: Sequence[_Argument]) -> str:
+    def call(
+        self, method: str, arguments: Sequence[_Argument], *, short: bool = False
+    ) -> str:
         """Render a chain step such as ``.select(...)``: inline if it is short
-        and has at most one argument; otherwise each argument on its own line,
-        wrapped further if it is still too long."""
+        and has at most one argument (any number, for a ``short`` call such as
+        ``.withColumnRenamed("a", "b")``); otherwise each argument on its own
+        line, wrapped further if it is still too long."""
         one_line = [self.code(argument) for argument in arguments]
         inline = f".{method}({', '.join(one_line)})"
         step_column = len(_INDENT) + self.nesting
         if (
-            len(arguments) <= 1
+            (len(arguments) <= 1 or short)
             and "\n" not in inline
             and step_column + len(inline) <= self.line_length
         ):
@@ -652,16 +692,16 @@ def _indent(text: str) -> str:
     return "\n".join(_INDENT + line if line else line for line in text.split("\n"))
 
 
-def table_variables(plan: ir.Relation) -> dict[tuple[str, ...], str]:
+def table_variables(*plans: ir.Relation) -> dict[tuple[str, ...], str]:
     """Choose a Python variable name for each distinct table, in the order the
-    tables appear.
+    tables appear in the plans.
 
     Names come from the table name (``sales.customers`` becomes ``customers``),
     made into valid identifiers that do not shadow names the generated code
     uses. Different tables that would get the same name use their full name.
     """
     tables: list[tuple[str, ...]] = []
-    for node in _walk(plan):
+    for node in (node for plan in plans for node in _walk(plan)):
         if isinstance(node, ir.TableScan) and node.name_parts not in tables:
             tables.append(node.name_parts)
 
@@ -710,6 +750,7 @@ def _walk(plan: ir.Relation) -> Iterator[ir.Relation]:
                 yield from walk(right)
             case (
                 ir.RenameColumns(source=source)
+                | ir.RenameByName(source=source)
                 | ir.DropColumns(source=source)
                 | ir.RelationAlias(source=source)
                 | ir.Filter(source=source)
@@ -758,12 +799,15 @@ def _frame_bound(offset: int | None, unbounded: str) -> str:
     return "Window.currentRow" if offset == 0 else str(offset)
 
 
-def window_variables(plan: ir.Relation, taken: set[str]) -> dict[_WindowKey, str]:
+def window_variables(
+    plans: Sequence[ir.Relation], taken: set[str]
+) -> dict[_WindowKey, str]:
     """Name each distinct window in the order the code uses them: ``window``
     if there is one, ``window_1``, ``window_2``, ... if there are several.
     Names already ``taken`` by table variables get a ``_spec`` suffix."""
     keys: list[_WindowKey] = []
-    for expression in _expressions(plan):
+    expressions = (expression for plan in plans for expression in _expressions(plan))
+    for expression in expressions:
         if isinstance(expression, ir.WindowCall):
             key = _window_key(expression)
             if key not in keys:

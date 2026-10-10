@@ -37,12 +37,14 @@ flowchart LR
 | Frontend | `translate.py` | Syntax tree → IR. Works from an allowlist: anything it does not explicitly handle is reported as unsupported, and all issues are collected before failing |
 | Middle | `ir.py` | SparkShift's own description of DataFrame operations ([ADR 0003](adr/0003-introduce-a-small-ir.md)) |
 | Backend | `emit.py` | IR → readable PySpark source |
-| Entry point | `api.py` | `convert(sql, dialect)` runs the stages in order |
+| SAS frontend | `sas_lexer.py`, `sas_parser.py`, `sas_translate.py` | SAS program → tokens → a small syntax tree → IR, one named relation per data set, following SAS's documented rules ([ADR 0005](adr/0005-sas-has-its-own-front-end.md), [sas.md](sas.md)) |
+| Entry point | `api.py` | `convert(sql, dialect)` runs the stages in order; with `dialect="sas"`, the SAS frontend's |
 | Analysis | `report.py` | Calls `convert` for many files and summarizes the outcomes: pure functions and data, with text, Markdown, and JSON formats; it reads no files |
 | Command line | `cli.py` | Reads and writes files, and calls `convert` or `report` |
 
-Only `parsing.py` and `translate.py` may import SQLGlot; the IR and emitter
-never depend on it. Both rules are enforced by `tests/test_architecture.py`.
+Only `parsing.py` and `translate.py` may import SQLGlot; the IR, the emitter,
+and the SAS frontend never depend on it. Both rules are enforced by
+`tests/test_architecture.py`.
 
 ### Errors and warnings
 

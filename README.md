@@ -10,7 +10,8 @@ never leaves your browser.
 
 > **Status: pre-release.** SparkShift converts `SELECT` queries, including
 > joins, aggregation, ordering, window functions and `QUALIFY`, CTEs, set
-> operations, and subqueries, from generic SQL and six dialects (see below). Everything else
+> operations, and subqueries, from generic SQL and six dialects (see below).
+> SAS support is in progress. Everything else
 > is rejected with a clear error. See [ROADMAP.md](ROADMAP.md) for what is
 > planned.
 
@@ -158,6 +159,52 @@ blocker's hint, an example file, and every file's status. The JSON has a
 
 The exit status is 0 when the report is produced, whatever it finds; 1 only
 when `--fail-under` is given and fewer files convert; and 2 for a usage error.
+
+## SAS (in progress)
+
+SparkShift is learning to convert SAS programs too. So far it converts DATA
+steps that read a data set, filter it with `WHERE`, and keep, drop, or rename
+variables:
+
+```bash
+sparkshift convert low_scores.sas --dialect sas
+```
+
+```sas
+data low_scores;
+    set customers (keep=customer_id name score);
+    where score < 3;
+    rename name = customer_name;
+run;
+```
+
+<!-- Exact SparkShift output, checked by tests/test_readme.py. Not reformatted. -->
+<!-- fmt: off -->
+```python
+from pyspark.sql import functions as F
+
+low_scores = (
+    spark.table("customers")
+    .select(
+        F.col("customer_id"),
+        F.col("name"),
+        F.col("score"),
+    )
+    .where(F.col("score").isNull() | (F.col("score") < F.lit(3)))
+    .withColumnRenamed("name", "customer_name")
+)
+
+result = low_scores
+```
+<!-- fmt: on -->
+
+In SAS a missing number is smaller than every number, so `score < 3` keeps
+rows whose score is missing; in SQL and Spark it would drop them, so the code
+says so explicitly. Each data set becomes a DataFrame variable, and `result`
+is the last one. No SAS installation is available to test against: SAS
+support is verified against SAS's documented rules, with expected results
+written by hand. [docs/sas.md](docs/sas.md) lists what is supported, each rule
+with its source, and the limitations.
 
 ## Playground
 

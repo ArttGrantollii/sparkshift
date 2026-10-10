@@ -15,8 +15,11 @@ PACKAGE_DIR = Path(sparkshift.__file__).parent
 SQLGLOT_FRONTEND = frozenset({"parsing", "translate"})
 
 # Modules that must not depend on SQLGlot at all, even indirectly. The emitter
-# and IR are shared by every frontend, including the planned SAS frontend.
-SQLGLOT_FREE = frozenset({"ir", "emit", "diagnostics", "errors"})
+# and IR are shared by every frontend; the SAS frontend has its own parser
+# (see ADR 0005).
+SQLGLOT_FREE = frozenset(
+    {"ir", "emit", "diagnostics", "errors", "sas_lexer", "sas_parser", "sas_translate"}
+)
 
 
 def imported_modules(module: str) -> set[str]:

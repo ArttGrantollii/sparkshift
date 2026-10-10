@@ -4,6 +4,7 @@ from sparkshift.api import convert
 from sparkshift.diagnostics import ConversionResult, Diagnostic
 from sparkshift.errors import (
     MultipleStatementsError,
+    SASParseError,
     SparkShiftError,
     SQLParseError,
     UnsupportedDialectError,
@@ -16,6 +17,7 @@ __all__ = [
     "ConversionResult",
     "Diagnostic",
     "MultipleStatementsError",
+    "SASParseError",
     "SQLParseError",
     "SparkShiftError",
     "UnsupportedDialectError",

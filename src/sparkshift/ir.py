@@ -394,6 +394,23 @@ class RenameColumns:
 
 
 @dataclass(frozen=True)
+class RenameByName:
+    """Give columns new names, as (old, new) pairs, as SAS's RENAME does.
+    Columns not named keep their names and places."""
+
+    source: "Relation"
+    renames: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        if not self.renames:
+            raise ValueError("RenameByName needs at least one rename")
+        olds = [old.lower() for old, _ in self.renames]
+        news = [new.lower() for _, new in self.renames]
+        if len(set(olds)) < len(olds) or set(olds) & set(news):
+            raise ValueError("RenameByName renames must not overlap")
+
+
+@dataclass(frozen=True)
 class DropColumns:
     """Remove columns by name, such as helper columns a filter needed."""
 
@@ -542,6 +559,7 @@ Relation: TypeAlias = (
     TableScan
     | Named
     | RenameColumns
+    | RenameByName
     | DropColumns
     | RelationAlias
     | Join

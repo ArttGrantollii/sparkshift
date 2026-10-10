@@ -7,6 +7,7 @@ import pytest
 from sparkshift import ir
 from sparkshift.emit import (
     emit,
+    emit_datasets,
     emit_expression,
     python_string,
     spark_identifier,
@@ -1410,6 +1411,67 @@ def test_dropped_columns_are_named() -> None:
 def test_drop_columns_requires_names() -> None:
     with pytest.raises(ValueError, match="at least one name"):
         ir.DropColumns(TableScan(("t",)), ())
+
+
+def test_renames_by_name_are_one_call_each() -> None:
+    plan = ir.RenameByName(
+        TableScan(("t",)), (("name", "customer_name"), ("id", "key"))
+    )
+
+    assert emit(plan).endswith(
+        '    .withColumnRenamed("name", "customer_name")\n'
+        '    .withColumnRenamed("id", "key")\n'
+        ")\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "renames",
+    [
+        (),
+        (("a", "b"), ("A", "c")),
+        (("a", "b"), ("b", "a")),
+        (("a", "b"), ("c", "A")),
+    ],
+)
+def test_renames_by_name_must_not_overlap(renames: tuple[tuple[str, str], ...]) -> None:
+    with pytest.raises(ValueError, match="RenameByName"):
+        ir.RenameByName(TableScan(("t",)), renames)
+
+
+def test_datasets_are_declared_in_order_and_the_last_is_the_result() -> None:
+    first = ir.Named("first", TableScan(("t",)))
+    unused = ir.Named("unused", ir.DropColumns(TableScan(("u",)), ("x",)))
+    last = ir.Named("last", ir.Filter(first, A))
+
+    assert emit_datasets([first, unused, last]) == (
+        "from pyspark.sql import functions as F\n"
+        "\n"
+        'first = spark.table("t")\n'
+        "\n"
+        "unused = (\n"
+        '    spark.table("u")\n'
+        '    .drop("x")\n'
+        ")\n"
+        "\n"
+        "last = (\n"
+        "    first\n"
+        '    .where(F.col("a"))\n'
+        ")\n"
+        "\n"
+        "result = last\n"
+    )
+
+
+def test_a_dataset_named_result_does_not_clash() -> None:
+    code = emit_datasets([ir.Named("result", TableScan(("t",)))])
+
+    assert code == 'result_df = spark.table("t")\n\nresult = result_df\n'
+
+
+def test_emit_datasets_needs_a_dataset() -> None:
+    with pytest.raises(ValueError, match="at least one data set"):
+        emit_datasets([])
 
 
 # --- Set operations ----------------------------------------------------------

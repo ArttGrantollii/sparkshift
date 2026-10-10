@@ -78,6 +78,8 @@ def test_convert_generates_a_projection() -> None:
         ("SELECT (a FROM t", None, sparkshift.SQLParseError),
         ("SELECT 1; SELECT 2", None, sparkshift.MultipleStatementsError),
         ("DELETE FROM t", None, sparkshift.UnsupportedSQLError),
+        ("data a; set b", "sas", sparkshift.SASParseError),
+        ("data a; set b; total = 1; run;", "sas", sparkshift.UnsupportedSQLError),
     ],
 )
 def test_every_failure_is_a_sparkshift_error(
@@ -87,3 +89,33 @@ def test_every_failure_is_a_sparkshift_error(
         sparkshift.convert(sql, dialect=dialect)
 
     assert isinstance(caught.value, sparkshift.SparkShiftError)
+
+
+def test_convert_a_sas_program() -> None:
+    result = sparkshift.convert(
+        "data us; set sales.customers(keep=id name); where country = 'US'; run;",
+        dialect="SAS",
+    )
+
+    assert result.code == (
+        "from pyspark.sql import functions as F\n"
+        "\n"
+        "us = (\n"
+        '    spark.table("sales.customers")\n'
+        "    .select(\n"
+        '        F.col("id"),\n'
+        '        F.col("name"),\n'
+        "    )\n"
+        '    .where(F.coalesce(F.rtrim(F.col("country")), F.lit("")) == F.lit("US"))\n'
+        ")\n"
+        "\n"
+        "result = us\n"
+    )
+    assert [warning.message for warning in result.warnings] == [
+        "KEEP of several variables"
+    ]
+
+
+def test_a_sas_parse_error_is_an_sql_parse_error() -> None:
+    # Callers that handle invalid input handle both languages.
+    assert issubclass(sparkshift.SASParseError, sparkshift.SQLParseError)

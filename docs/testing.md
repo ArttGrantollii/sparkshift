@@ -13,6 +13,7 @@ the original SQL. That claim is checked by executing both on real Apache Spark.
 | Browser | `tests/playground/` | The playground, in headless Chromium, converts every example exactly as the command line does | No (needs Chromium and network) |
 | Architecture | `tests/test_architecture.py` | Dependency rules: no PySpark in the core, SQLGlot only in the frontend | No |
 | Equivalence | `tests/equivalence/` | Original SQL and generated PySpark return equivalent results | Yes |
+| SAS scenarios | `tests/equivalence/test_sas.py` | SAS programs' generated PySpark returns rows written by hand from SAS's documented rules (no SAS is available; see [sas.md](sas.md)) | Yes |
 | Real databases | `tests/equivalence/test_postgres.py`, `test_mysql.py` | PostgreSQL and MySQL queries, run on real servers, return what the generated PySpark returns | Yes (and a database server) |
 
 Run everything with `uv run pytest`, or skip Spark with `uv run pytest -m "not spark"`.
