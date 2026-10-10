@@ -160,3 +160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `ROW_NUMBER`, `RANK`, and `DENSE_RANK` without `ORDER BY` in the window are
   now rejected; they produced code that Spark refuses to run.
+- Long comparisons and arithmetic are now wrapped to fit 88 columns, one
+  operand per line with the operator leading; before, a long comparison such
+  as a date filter stayed on one line. A wrapped condition followed by a comma
+  could also run one column over the limit.

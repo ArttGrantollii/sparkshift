@@ -60,6 +60,16 @@ SCENARIOS = {
         "SELECT order_id, -amount AS negative, -(amount + 1) AS negative_plus "
         "FROM orders"
     ),
+    # Long enough to wrap one operand per line; the grouping must survive.
+    "long arithmetic keeps its grouping when wrapped": (
+        "SELECT order_id, amount * (1 - discount) + amount * discount / 2 "
+        "- (amount - amount * discount) - order_id % 7 "
+        "AS adjusted_amount_after_discount FROM orders"
+    ),
+    "long comparison as a value": (
+        "SELECT order_id, amount * (1 - discount) + 10 >= order_id - customer_id * 2 "
+        "+ 5 AS above_the_order_threshold FROM orders"
+    ),
 }
 
 

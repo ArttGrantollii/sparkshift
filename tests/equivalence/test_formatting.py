@@ -48,15 +48,71 @@ def _sql(scenario: str | tuple[str, ...]) -> str:
     return scenario if isinstance(scenario, str) else scenario[0]
 
 
-CASES = [
-    (None, _sql(scenario))
-    for module in MODULES
-    for scenario in module.SCENARIOS.values()
-] + [
-    (dialect, sql)
-    for module in MODULES
-    for dialect, sql, *_ in getattr(module, "DIALECT_SCENARIOS", {}).values()
+# Queries written the way people paste them into the playground, with longer
+# names than the test tables. Formatting only: their tables are not in the
+# equivalence datasets.
+SAMPLE_QUERIES = [
+    (
+        None,
+        "SELECT region, COUNT(*) AS orders, SUM(amount) AS revenue, "
+        "AVG(amount) AS avg_order FROM sales WHERE order_date >= DATE '2024-01-01' "
+        "GROUP BY region HAVING SUM(amount) > 10000 ORDER BY revenue DESC",
+    ),
+    (
+        "tsql",
+        "SELECT TOP 10 c.customer_name, SUM(o.total) AS spent FROM dbo.customers c "
+        "JOIN dbo.orders o ON o.customer_id = c.customer_id "
+        "WHERE o.order_date >= DATEADD(day, -30, CAST(GETDATE() AS DATE)) "
+        "GROUP BY c.customer_name ORDER BY spent DESC",
+    ),
+    (
+        "postgres",
+        "SELECT customer_id, order_date, amount, SUM(amount) OVER (PARTITION BY "
+        "customer_id ORDER BY order_date ROWS BETWEEN UNBOUNDED PRECEDING AND "
+        "CURRENT ROW) AS running_total, LAG(amount) OVER (PARTITION BY customer_id "
+        "ORDER BY order_date) AS previous_amount FROM orders",
+    ),
+    (
+        "snowflake",
+        "WITH customer_spend AS (SELECT customer_id, SUM(amount) AS total "
+        "FROM orders GROUP BY customer_id) SELECT customer_id, total, "
+        "CASE WHEN total >= 1000 THEN 'gold' WHEN total >= 500 THEN 'silver' "
+        "ELSE 'bronze' END AS tier FROM customer_spend",
+    ),
+    (
+        "mysql",
+        "SELECT p.product_name, p.price FROM products p WHERE NOT EXISTS "
+        "(SELECT 1 FROM order_items oi WHERE oi.product_id = p.product_id) "
+        "ORDER BY p.price DESC LIMIT 5",
+    ),
+    (
+        "oracle",
+        "SELECT employee_id, NVL(commission, 0) AS commission, salary "
+        "FROM employees WHERE department_id IN (SELECT department_id "
+        "FROM departments WHERE location = 'London') "
+        "ORDER BY salary DESC FETCH FIRST 3 ROWS ONLY",
+    ),
+    (
+        None,
+        "SELECT invoice_id FROM invoices WHERE invoice_total_amount * "
+        "(1 - customer_discount_rate) + shipping_cost_amount - loyalty_credit_amount "
+        "> minimum_billable_amount_for_region * exchange_rate_to_euro",
+    ),
 ]
+
+CASES = (
+    [
+        (None, _sql(scenario))
+        for module in MODULES
+        for scenario in module.SCENARIOS.values()
+    ]
+    + [
+        (dialect, sql)
+        for module in MODULES
+        for dialect, sql, *_ in getattr(module, "DIALECT_SCENARIOS", {}).values()
+    ]
+    + SAMPLE_QUERIES
+)
 
 
 @pytest.mark.parametrize(("dialect", "sql"), CASES)

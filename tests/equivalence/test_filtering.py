@@ -25,6 +25,10 @@ SCENARIOS = {
         "SELECT order_id FROM orders WHERE amount >= 80.00 AND discount > 0"
     ),
     "empty string is not NULL": "SELECT * FROM customers WHERE name = ''",
+    "long comparison in WHERE": (
+        "SELECT order_id FROM orders "
+        "WHERE amount * (1 - discount) + 10 >= order_id - customer_id * 2 + 5"
+    ),
     # WHERE is evaluated before SELECT, so it sees the source column, not the
     # SELECT alias that reuses its name. Filtering after projecting would see
     # the doubled values and keep different rows.

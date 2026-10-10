@@ -821,8 +821,8 @@ def test_short_expressions_are_not_wrapped() -> None:
 
 @pytest.mark.parametrize("line_length", [88, 40, 10])
 def test_wrapping_never_changes_the_python_syntax_tree(line_length: int) -> None:
-    # Every operator pairing from the precedence round trip, inside a long
-    # boolean chain and a long function call, at several widths.
+    # Every operator pairing from the precedence round trip, on its own, inside
+    # a long boolean chain, and inside a long function call, at several widths.
     expressions = []
     for outer, inner in itertools.product(BinaryOperator, repeat=2):
         expressions.append(BinaryOp(outer, BinaryOp(inner, B, C), A))
@@ -832,7 +832,8 @@ def test_wrapping_never_changes_the_python_syntax_tree(line_length: int) -> None
         condition = BinaryOp(BinaryOperator.AND, filler[0], expression)
         condition = BinaryOp(BinaryOperator.OR, condition, filler[1])
         call_ = ir.FunctionCall("coalesce", (expression, *filler))
-        plan = Project(ir.Filter(TableScan(("t",)), condition), (Alias(call_, "x"),))
+        filtered = ir.Filter(ir.Filter(TableScan(("t",)), condition), expression)
+        plan = Project(filtered, (Alias(call_, "x"), Alias(expression, "y")))
 
         wrapped = emit(plan, line_length=line_length)
         one_line = emit(plan, line_length=10**6)
@@ -853,6 +854,102 @@ def test_long_aliased_arithmetic_moves_into_its_own_parentheses() -> None:
         '            F.col("shipping_cost_in_euros") + F.col("handling_fee_in_euros")\n'
         '        ).alias("total_extra_cost")\n'
     ) in emit(plan)
+
+
+def test_long_arithmetic_wraps_one_operand_per_line() -> None:
+    total = BinaryOp(
+        BinaryOperator.SUBTRACT,
+        BinaryOp(
+            BinaryOperator.ADD,
+            Column(("shipping_cost_in_euros",)),
+            Column(("handling_fee_in_euros",)),
+        ),
+        Column(("loyalty_discount_in_euros",)),
+    )
+    plan = Project(TableScan(("orders",)), (Alias(total, "total_extra_cost"),))
+
+    assert (
+        "        (\n"
+        '            F.col("shipping_cost_in_euros")\n'
+        '            + F.col("handling_fee_in_euros")\n'
+        '            - F.col("loyalty_discount_in_euros")\n'
+        '        ).alias("total_extra_cost")\n'
+    ) in emit(plan)
+
+
+def test_long_comparison_wraps_before_its_operator() -> None:
+    recent = BinaryOp(
+        BinaryOperator.GREATER_EQUAL,
+        Column(("order_date_in_local_time",)),
+        BinaryOp(
+            BinaryOperator.ADD,
+            ir.FunctionCall("current_date", ()),
+            ir.Interval("days", Literal(-30)),
+        ),
+    )
+    plan = ir.Filter(TableScan(("orders",)), recent)
+
+    assert _ends_with_where(
+        emit(plan),
+        '        F.col("order_date_in_local_time")\n'
+        "        >= F.current_date() + F.make_interval(days=F.lit(-30))\n",
+    )
+
+
+def test_wrapped_operand_of_a_comparison_gets_its_own_parentheses() -> None:
+    # Without them, "a\n> b\n+ c" would read as (a > b) + c.
+    over = BinaryOp(
+        BinaryOperator.GREATER,
+        Column(("invoice_total_amount",)),
+        BinaryOp(
+            BinaryOperator.ADD,
+            Column(("minimum_billable_amount",)),
+            Column(("shipping_cost_amount",)),
+        ),
+    )
+    plan = ir.Filter(TableScan(("invoices",)), over)
+
+    assert _ends_with_where(
+        emit(plan, line_length=60),
+        '        F.col("invoice_total_amount")\n'
+        "        > (\n"
+        '            F.col("minimum_billable_amount")\n'
+        '            + F.col("shipping_cost_amount")\n'
+        "        )\n",
+    )
+
+
+@pytest.mark.parametrize("line_length", range(60, 101))
+def test_wrapped_lines_fit_every_line_length(line_length: int) -> None:
+    # Breakable code must fit, including the comma after an argument. Below 60,
+    # the deepest single column reference no longer fits, and nothing can.
+    amount = BinaryOp(
+        BinaryOperator.MULTIPLY,
+        Column(("invoice_total_amount",)),
+        BinaryOp(BinaryOperator.SUBTRACT, Literal(1), Column(("discount_rate",))),
+    )
+    over = BinaryOp(
+        BinaryOperator.GREATER,
+        BinaryOp(BinaryOperator.ADD, amount, Column(("shipping_cost_amount",))),
+        BinaryOp(
+            BinaryOperator.MULTIPLY,
+            Column(("minimum_billable_amount",)),
+            Column(("exchange_rate_to_euro",)),
+        ),
+    )
+    condition = BinaryOp(BinaryOperator.OR, LONG_AND, over)
+    # In a call, a wrapped chain's last line is followed by a comma.
+    checked = ir.FunctionCall("coalesce", (over, condition, Literal(False)))
+    items = (Alias(amount, "net_amount"), Alias(checked, "billable"), A)
+    plan = Project(ir.Filter(TableScan(("invoices",)), condition), items)
+
+    code = emit(plan, line_length=line_length)
+
+    assert [line for line in code.splitlines() if len(line) > line_length] == []
+
+
+def _ends_with_where(code: str, condition: str) -> bool:
+    return code.endswith(f"    .where(\n{condition}    )\n)\n")
 
 
 def test_long_negated_between_wraps_its_bounds() -> None:

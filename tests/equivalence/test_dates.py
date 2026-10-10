@@ -82,6 +82,14 @@ def test_date_scenario(spark_tables: "SparkSession", sql: str) -> None:
 
 # Each dialect mapping, checked against hand-written Spark SQL.
 DIALECT_SCENARIOS = {
+    # The comparison is too long for one line, so it wraps before ">=".
+    "T-SQL DATEADD in a long WHERE comparison": (
+        "tsql",
+        "SELECT o.order_id FROM orders o "
+        "WHERE o.order_date >= DATEADD(day, -30, CAST('2024-03-01' AS DATE))",
+        "SELECT o.order_id FROM orders o "
+        "WHERE o.order_date >= DATE '2024-03-01' - INTERVAL '30' DAY",
+    ),
     # DATEDIFF(day, start, end): the argument order is the reverse of Spark's.
     "T-SQL DATEDIFF, DATEADD, DATEPART, DATETIME2": (
         "tsql",

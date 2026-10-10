@@ -375,8 +375,8 @@ class _Emitter:
         match expression:
             case ir.Alias(expression=inner, name=name):
                 return self.suffixed(inner, f".alias({python_string(name)})", column)
-            case ir.BinaryOp(op=op) if op in _BOOLEAN_OPERATORS:
-                return self.boolean_chain(expression, column)
+            case ir.BinaryOp():
+                return self.operator_chain(expression, column)
             case ir.UnaryOp(op=op, operand=operand):
                 if self.render(operand)[1] < _ATOM:
                     return f"{op.value}{self.parenthesized(operand, column)}"
@@ -447,42 +447,41 @@ class _Emitter:
         )
         return f"{prefix}(\n{body})"
 
-    def boolean_chain(self, expression: ir.BinaryOp, column: int) -> str:
-        """``a & b & c`` as one condition per line, operators leading."""
-        op = expression.op
-        operands = _flatten_left(expression)
-        first_min, rest_min = _boolean_operand_minimums(op)
+    def operator_chain(self, expression: ir.BinaryOp, column: int) -> str:
+        """``a & b & c``, ``a + b - c`` or ``a >= b`` as one operand per line,
+        operators leading."""
+        first_min, rest_min = _operand_minimums(expression.op)
+        # Room for the operator before an operand and a comma after it.
+        margin = len(expression.op.value) + 2
         lines = []
-        for position, operand in enumerate(operands):
-            minimum = first_min if position == 0 else rest_min
-            text = self.boolean_operand(operand, minimum, column)
-            lines.append(text if position == 0 else f"{op.value} {text}")
+        for op, operand in _flatten_left(expression):
+            minimum = first_min if op is None else rest_min
+            text = self.chain_operand(operand, minimum, column, margin)
+            lines.append(text if op is None else f"{op.value} {text}")
         return "\n".join(lines)
 
     def parenthesized(self, expression: ir.Expression, column: int) -> str:
         """An expression in its own parentheses: on one line inside them if
-        that fits, otherwise wrapped further (a boolean chain gets one
-        condition per line)."""
+        that fits, otherwise wrapped further (an operator chain gets one
+        operand per line)."""
         inner = column + len(_INDENT)
         body = self.expression(expression)
         if inner + len(body) > self.line_length:
             body = self.wrapped(expression, inner) or body
         return f"(\n{_indent(body)}\n)"
 
-    def boolean_operand(self, operand: ir.Expression, minimum: int, column: int) -> str:
+    def chain_operand(
+        self, operand: ir.Expression, minimum: int, column: int, margin: int
+    ) -> str:
         code = self.operand(operand, minimum)
-        if column + len(code) + 2 <= self.line_length:
+        if column + len(code) + margin <= self.line_length:
             return code
-        _, precedence = self.render(operand)
-        if (
-            precedence < minimum
-            and isinstance(operand, ir.BinaryOp)
-            and operand.op in _BOOLEAN_OPERATORS
-        ):
+        if isinstance(operand, ir.BinaryOp):
+            # A nested operator gets its own parentheses, so a reader sees
+            # where it starts and ends: "a\n>= b\n+ c" would look like
+            # (a >= b) + c.
             return self.parenthesized(operand, column)
-        if precedence >= minimum:
-            return self.wrapped(operand, column) or code
-        return code
+        return self.wrapped(operand, column) or code
 
     def function_arguments(
         self, name: str, arguments: tuple[ir.Expression, ...]
@@ -594,23 +593,10 @@ class _Emitter:
                 window = self.window_name(expression)
                 return f"{self.window_function(expression)}.over({window})", _ATOM
             case ir.BinaryOp(op=op, left=left, right=right):
-                precedence = _PRECEDENCE[op]
-                if op is ir.BinaryOperator.OR:
-                    # Python would parse "a & b | c" correctly, but explicit
-                    # grouping is easier to read.
-                    left_min = right_min = _AND + 1
-                else:
-                    # Comparisons must never chain ("a == b == c" means
-                    # something else in Python), and the right operand of an
-                    # equal-precedence operator needs grouping to keep the
-                    # tree's shape: a - (b - c).
-                    left_min = (
-                        precedence + 1 if precedence == _COMPARISON else precedence
-                    )
-                    right_min = precedence + 1
+                left_min, right_min = _operand_minimums(op)
                 left_code = self.operand(left, left_min)
                 right_code = self.operand(right, right_min)
-                return f"{left_code} {op.value} {right_code}", precedence
+                return f"{left_code} {op.value} {right_code}", _PRECEDENCE[op]
         assert_never(expression)
 
     def method(self, receiver: ir.Expression, name: str, arguments: str) -> str:
@@ -828,24 +814,37 @@ def _spark_table(parts: tuple[str, ...]) -> str:
     return f"spark.table({python_string(spark_identifier(parts))})"
 
 
-_BOOLEAN_OPERATORS = frozenset({ir.BinaryOperator.AND, ir.BinaryOperator.OR})
-
-
-def _flatten_left(expression: ir.BinaryOp) -> list[ir.Expression]:
-    """Turn ((a & b) & c) into [a, b, c]. Only the left side is flattened, so
-    the operands keep the tree's left-to-right grouping."""
-    operands = []
+def _flatten_left(
+    expression: ir.BinaryOp,
+) -> list[tuple[ir.BinaryOperator | None, ir.Expression]]:
+    """Turn ((a + b) - c) into [(None, a), (+, b), (-, c)]: each operand with
+    the operator before it. Only left operands with the same precedence are
+    flattened, so the operands keep the tree's grouping; comparisons never
+    chain."""
+    precedence = _PRECEDENCE[expression.op]
+    steps: list[tuple[ir.BinaryOperator | None, ir.Expression]] = []
     node: ir.Expression = expression
-    while isinstance(node, ir.BinaryOp) and node.op is expression.op:
-        operands.append(node.right)
+    while isinstance(node, ir.BinaryOp) and _PRECEDENCE[node.op] == precedence:
+        steps.append((node.op, node.right))
         node = node.left
-    operands.append(node)
-    return operands[::-1]
+        if precedence == _COMPARISON:
+            break
+    steps.append((None, node))
+    return steps[::-1]
 
 
-def _boolean_operand_minimums(op: ir.BinaryOperator) -> tuple[int, int]:
-    """The precedence each operand of a boolean chain needs to avoid
-    parentheses, matching ``_Emitter.render``: the first operand, then the rest."""
+def _operand_minimums(op: ir.BinaryOperator) -> tuple[int, int]:
+    """The precedence the left and right operands of ``op`` need to go without
+    parentheses."""
+    precedence = _PRECEDENCE[op]
     if op is ir.BinaryOperator.OR:
+        # Python would parse "a & b | c" correctly, but explicit grouping is
+        # easier to read.
         return _AND + 1, _AND + 1
-    return _AND, _AND + 1
+    if precedence == _COMPARISON:
+        # Comparisons must never chain: "a == b == c" means something else
+        # in Python.
+        return precedence + 1, precedence + 1
+    # The right operand of an equal-precedence operator needs grouping to keep
+    # the tree's shape: a - (b - c).
+    return precedence, precedence + 1

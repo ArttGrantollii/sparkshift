@@ -73,11 +73,15 @@ built from Python operators (`&` and `|` bind more tightly than `==`).
 
 Code is laid out to fit 88 columns, the Black and Ruff default. Short code
 stays on one line. A long chain step puts each argument on its own line; a
-long `&`/`|` chain puts one condition per line with the operator leading; a
-long `F.when` chain puts one branch per line; a long function call puts one
-argument per line; and a long expression that needs parentheses before
-`.alias` gets its own lines inside them. Wrapping only adds line breaks and
-grouping parentheses, so the code means exactly the same at any width.
+long `&`/`|` chain, comparison, or arithmetic expression puts one operand per
+line with the operator leading, and a nested operator expression that still
+does not fit gets its own parentheses, so `a >= (b + c)` cannot be misread as
+`(a >= b) + c`; a long `F.when` chain puts one branch per line; a long
+function call puts one argument per line; and a long expression that needs
+parentheses before `.alias` gets its own lines inside them. Wrapping only adds
+line breaks and grouping parentheses, so the code means exactly the same at any
+width. A single piece that cannot be split, such as a very long column name,
+can still exceed the limit.
 
 ## Rules for the core
 
