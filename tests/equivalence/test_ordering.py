@@ -159,6 +159,14 @@ DIALECT_SCENARIOS = {
         "SELECT customer_id, name FROM customers ORDER BY name NULLS FIRST",
         ["name"],
     ),
+    # Three orders tie at 80.00 for third place; LIMIT 4 keeps two of them,
+    # either two. Descending, NULLs come last in MySQL and Spark.
+    "MySQL LIMIT cuts a group of tied rows": (
+        "mysql",
+        "SELECT order_id, amount FROM orders ORDER BY amount DESC LIMIT 4",
+        "SELECT order_id, amount FROM orders ORDER BY amount DESC LIMIT 4",
+        ["amount"],
+    ),
     # Spark SQL 4.2 rejects an aggregate shared by HAVING and ORDER BY
     # (UNSUPPORTED_EXPR_FOR_OPERATOR), so the reference uses a subquery. The
     # generated code computes the aggregate once, as a helper column.

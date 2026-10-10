@@ -164,6 +164,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in CI, compared with the generated PySpark on Spark, so the hand-written
   Spark SQL references are no longer the only check. The tests skip without
   a configured server, and fail instead of skipping in CI.
+- MySQL scenarios and examples run on a real MySQL 8.4 server in CI too,
+  through the same runner. The test database compares strings exactly, as
+  Spark does, and MySQL's 0 and 1 compare as booleans.
 
 ### Changed
 

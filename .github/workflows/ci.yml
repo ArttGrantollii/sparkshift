@@ -78,8 +78,44 @@ jobs:
           --health-retries 10
     env:
       SPARKSHIFT_POSTGRES_URL: postgresql://postgres@localhost:5432/postgres
-      # Without the URL, fail instead of skipping (see tests/equivalence/test_postgres.py).
-      SPARKSHIFT_DATABASE_REQUIRED: "1"
+      # Without the URL, fail instead of skipping (see tests/equivalence/databases.py).
+      SPARKSHIFT_DATABASE_REQUIRED: postgres
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+
+      - run: uv sync --locked
+
+      - run: uv run pytest -m database -v
+
+  # The same for MySQL: a throwaway container whose root user has no password.
+  mysql:
+    name: MySQL
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4.11
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      SPARKSHIFT_MYSQL_URL: mysql://root@127.0.0.1:3306
+      # Without the URL, fail instead of skipping (see tests/equivalence/databases.py).
+      SPARKSHIFT_DATABASE_REQUIRED: mysql
     steps:
       - uses: actions/checkout@v7
 

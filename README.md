@@ -393,9 +393,10 @@ The test data deliberately includes duplicates, NULLs, empty strings, and
 other edge cases.
 
 For dialects Spark cannot run, the reference is Spark SQL written to mean
-the same thing. PostgreSQL queries are also run on a real PostgreSQL server
-in CI and compared with the generated PySpark; the other dialects are not yet
-checked against their own databases. See [docs/testing.md](docs/testing.md).
+the same thing. PostgreSQL and MySQL queries are also run on real PostgreSQL
+and MySQL servers in CI and compared with the generated PySpark; T-SQL,
+Oracle, Snowflake, and BigQuery are not yet checked against their own
+databases. See [docs/testing.md](docs/testing.md).
 
 ## Development setup
 

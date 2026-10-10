@@ -108,8 +108,15 @@ _POSTGRES_LOGIC = (
     "COALESCE(country, 'none') AS country, NULLIF(country, 'US') AS not_us "
     "FROM customers"
 )
+_MYSQL_COMPARISONS = (
+    "SELECT order_id, amount > 50 AS big, status = 'completed' AS done, "
+    "discount IS NULL AS no_discount, amount BETWEEN 0 AND 100 AS mid "
+    "FROM orders"
+)
 
 DIALECT_SCENARIOS = {
+    # MySQL returns comparisons as 1, 0, or NULL; Spark as booleans.
+    "MySQL comparisons as values": ("mysql", _MYSQL_COMPARISONS, _MYSQL_COMPARISONS),
     # Three-valued logic with NULL booleans; % takes the sign of the dividend.
     "PostgreSQL NULL logic, modulo, COALESCE, NULLIF": (
         "postgres",

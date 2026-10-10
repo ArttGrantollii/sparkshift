@@ -85,8 +85,11 @@ _POSTGRES_STRINGS = (
     "SELECT product_id, LENGTH(name) AS n, name ILIKE '%widget%' AS widget, "
     "category = 'tools' AS lower_case_tools, UPPER(name) AS shout FROM products"
 )
+_MYSQL_CONCAT = "SELECT product_id, CONCAT(name, '-', category) AS label FROM products"
 
 DIALECT_SCENARIOS = {
+    # Unlike PostgreSQL's, MySQL's CONCAT returns NULL if any argument is NULL.
+    "MySQL CONCAT with a NULL argument": ("mysql", _MYSQL_CONCAT, _MYSQL_CONCAT),
     # LENGTH counts characters, including spaces and multi-byte ones; ILIKE
     # ignores case and = does not.
     "PostgreSQL LENGTH, ILIKE, and case-sensitive equality": (
