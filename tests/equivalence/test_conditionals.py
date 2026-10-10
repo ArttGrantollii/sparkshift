@@ -102,7 +102,20 @@ def test_conditional_scenario(spark_tables: "SparkSession", sql: str) -> None:
     assert_equivalent(spark_tables, sql)
 
 
+_POSTGRES_LOGIC = (
+    "SELECT customer_id, is_active AND score > 3 AS both_true, "
+    "NOT is_active AS inactive, -customer_id % 3 AS negative_rest, "
+    "COALESCE(country, 'none') AS country, NULLIF(country, 'US') AS not_us "
+    "FROM customers"
+)
+
 DIALECT_SCENARIOS = {
+    # Three-valued logic with NULL booleans; % takes the sign of the dividend.
+    "PostgreSQL NULL logic, modulo, COALESCE, NULLIF": (
+        "postgres",
+        _POSTGRES_LOGIC,
+        _POSTGRES_LOGIC,
+    ),
     "T-SQL IIF": (
         "tsql",
         "SELECT order_id, IIF(amount > 100, 'big', 'small') AS size FROM orders",

@@ -13,8 +13,10 @@ the original SQL. That claim is checked by executing both on real Apache Spark.
 | Browser | `tests/playground/` | The playground, in headless Chromium, converts every example exactly as the command line does | No (needs Chromium and network) |
 | Architecture | `tests/test_architecture.py` | Dependency rules: no PySpark in the core, SQLGlot only in the frontend | No |
 | Equivalence | `tests/equivalence/` | Original SQL and generated PySpark return equivalent results | Yes |
+| Real databases | `tests/equivalence/test_postgres.py` | PostgreSQL queries, run on a real PostgreSQL server, return what the generated PySpark returns | Yes (and a PostgreSQL server) |
 
 Run everything with `uv run pytest`, or skip Spark with `uv run pytest -m "not spark"`.
+Database tests skip unless a server is configured (see below).
 
 ## Equivalence testing
 
@@ -66,6 +68,44 @@ The reference result comes from running the SQL with `spark.sql`, so it must be
 valid Spark SQL. For dialect syntax Spark cannot run, such as T-SQL `TOP` or
 Oracle `FETCH FIRST`, a scenario supplies a hand-written Spark SQL reference
 (`reference_sql`) that expresses the same query.
+
+A hand-written reference is only as right as its author's reading of the
+dialect. Where a real database is available, the scenarios also run there.
+
+### Real databases
+
+| Dialect | Checked on the real database | How |
+|---|---|---|
+| PostgreSQL | Yes: every PostgreSQL dialect scenario and example | A PostgreSQL 18 container in CI |
+| T-SQL, MySQL, Oracle | Not yet (MySQL is planned) | Spark SQL references only |
+| Snowflake, BigQuery | No: cloud services that need an account | Spark SQL references only |
+
+`tests/equivalence/test_postgres.py` loads the test tables into PostgreSQL
+(`tests/equivalence/databases.py` maps each Spark type to a PostgreSQL type),
+runs each query there exactly as written, and compares the rows with the
+generated PySpark's on Spark, using the rules above with three changes, since
+the two engines name and type results their own way:
+
+- Column names are compared ignoring case (PostgreSQL folds unquoted names to
+  lower case), and column types are not compared; values are.
+- In a column where either side has a float, numbers are compared as floats;
+  otherwise, where either side has a decimal, as decimals.
+- A timestamp with a time zone is compared as the UTC wall-clock time, as Spark
+  returns it in a UTC session. A date never matches a timestamp, even at
+  midnight.
+
+Preparing these tests caught a wrong reference: PostgreSQL's documentation
+says `date + INTERVAL` returns a timestamp, where Spark and the other dialects
+keep a date, and a scenario assumed a date. SparkShift now converts it only
+when the value's type is visible in the query, and the scenario checks both
+forms on PostgreSQL itself.
+
+To run these tests, point `SPARKSHIFT_POSTGRES_URL` at a database they may
+write to (they create and drop the schema `sparkshift_tests`), for example
+`postgresql://postgres@localhost:5432/postgres`, and run
+`uv run pytest -m database`. Without it they skip, except where
+`SPARKSHIFT_DATABASE_REQUIRED` is set, as in CI, where they fail instead, so a
+green CI job always means they ran.
 
 ### Testing the comparator
 

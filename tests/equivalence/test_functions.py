@@ -81,7 +81,19 @@ def test_function_scenario(spark_tables: "SparkSession", sql: str) -> None:
 
 
 # Each emulation of a dialect's semantics, checked against hand-written Spark SQL.
+_POSTGRES_STRINGS = (
+    "SELECT product_id, LENGTH(name) AS n, name ILIKE '%widget%' AS widget, "
+    "category = 'tools' AS lower_case_tools, UPPER(name) AS shout FROM products"
+)
+
 DIALECT_SCENARIOS = {
+    # LENGTH counts characters, including spaces and multi-byte ones; ILIKE
+    # ignores case and = does not.
+    "PostgreSQL LENGTH, ILIKE, and case-sensitive equality": (
+        "postgres",
+        _POSTGRES_STRINGS,
+        _POSTGRES_STRINGS,
+    ),
     # T-SQL LEN ignores trailing spaces; T-SQL CONCAT skips NULLs.
     "T-SQL LEN and CONCAT": (
         "tsql",

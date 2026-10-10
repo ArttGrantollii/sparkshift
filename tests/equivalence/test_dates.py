@@ -128,14 +128,20 @@ DIALECT_SCENARIOS = {
         "TRUNC(order_date, 'MONTH') AS m FROM orders",
     ),
     # PostgreSQL's DATE_TRUNC returns a timestamp; its TIMESTAMP is wall-clock.
-    "PostgreSQL DATE_TRUNC, interval, TIMESTAMP": (
+    # Adding days keeps a date, but adding an interval to a date gives a
+    # timestamp (Jan 31 + 1 month is Feb 29 at midnight).
+    "PostgreSQL DATE_TRUNC, date arithmetic, TIMESTAMP": (
         "postgres",
         "SELECT order_id, DATE_TRUNC('month', order_date) AS m, "
-        "order_date + INTERVAL '3 days' AS later, "
+        "order_date + 3 AS d3, "
+        "CAST(order_date AS TIMESTAMP) + INTERVAL '3 days' AS later, "
+        "DATE '2024-01-31' + INTERVAL '1 month' AS feb, "
         "CAST(created_at AS TIMESTAMP) AS wall, "
         "CAST(created_at AS TIMESTAMPTZ) AS instant FROM orders",
         "SELECT order_id, DATE_TRUNC('MONTH', order_date) AS m, "
-        "order_date + INTERVAL '3' DAY AS later, "
+        "order_date + 3 AS d3, "
+        "CAST(order_date AS TIMESTAMP_NTZ) + INTERVAL '3' DAY AS later, "
+        "CAST(DATE '2024-01-31' AS TIMESTAMP_NTZ) + INTERVAL '1' MONTH AS feb, "
         "CAST(created_at AS TIMESTAMP_NTZ) AS wall, "
         "CAST(created_at AS TIMESTAMP) AS instant FROM orders",
     ),

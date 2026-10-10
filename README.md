@@ -237,7 +237,8 @@ behavior:
 | `a \|\| b` | Oracle | Treats NULL as an empty string | `F.concat_ws("", a, b)` |
 | `a \|\| b` | MySQL | Logical OR, not concatenation | `a \| b` |
 | `DATEDIFF(day, start, end)` | T-SQL, Snowflake | Arguments in the opposite order to Spark | `F.datediff(end, start)` |
-| `x + INTERVAL '3' DAY`, `DATEADD(day, 3, x)` | All | Keeps the input type (a timestamp keeps its time of day) | `x + F.make_interval(days=...)` |
+| `x + INTERVAL '3' DAY`, `DATEADD(day, 3, x)` | All except PostgreSQL | Keeps the input type (a timestamp keeps its time of day) | `x + F.make_interval(days=...)` |
+| `CAST(x AS DATE) + INTERVAL '1 month'`, `CURRENT_DATE + INTERVAL ...` | PostgreSQL | A date plus an interval is a timestamp at midnight | `x.cast("timestamp_ntz") + F.make_interval(...)` |
 | `DATE_TRUNC('month', x)` | PostgreSQL | Returns a timestamp | `F.date_trunc("month", x)` |
 | `DATE_TRUNC(x, MONTH)` | BigQuery | Returns a date | `F.trunc(x, "month")` |
 | `FIRST_VALUE`, `LAST_VALUE` without a frame | Snowflake | Cover the whole window | `.rowsBetween(Window.unboundedPreceding, Window.unboundedFollowing)` |
@@ -341,6 +342,7 @@ rejects it rather than guess:
 | `RANGE BETWEEN 5 PRECEDING AND ...` | All | The offset is measured in the `ORDER BY` column's type (a number, or an interval for dates), which only the schema would tell. |
 | `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `LAG`, `LEAD` without `ORDER BY` | PostgreSQL, MySQL, others | The result depends on an arbitrary row order, and Spark requires an `ORDER BY`. |
 | `QUALIFY` | T-SQL, PostgreSQL, MySQL, Oracle | These databases have no `QUALIFY` clause. |
+| `column + INTERVAL ...` | PostgreSQL | The result is a timestamp if the column is a date, and keeps the column's type otherwise; only the schema would tell. Write `order_date + 3` to keep a date, or `CAST(order_date AS TIMESTAMP) + INTERVAL '3 days'`. |
 | `QUALIFY` referring to a `SELECT` alias (`QUALIFY rn = 1`) | Snowflake | Snowflake reads the name as a table column when the table has one, which only the schema would tell; repeat the window function instead. Spark reports a name that could be both as ambiguous, and BigQuery's documentation filters on aliases, so there the name means the alias. |
 | A `SELECT` alias inside a window function in `QUALIFY` | All | The window is computed before the `SELECT` list's aliases exist. |
 
@@ -388,7 +390,12 @@ real Apache Spark, then compare the results with SQL semantics in mind: row
 order is ignored unless the query orders it, duplicate rows must match in
 number, column names and types must match, and NULLs are compared as values.
 The test data deliberately includes duplicates, NULLs, empty strings, and
-other edge cases. See [docs/testing.md](docs/testing.md).
+other edge cases.
+
+For dialects Spark cannot run, the reference is Spark SQL written to mean
+the same thing. PostgreSQL queries are also run on a real PostgreSQL server
+in CI and compared with the generated PySpark; the other dialects are not yet
+checked against their own databases. See [docs/testing.md](docs/testing.md).
 
 ## Development setup
 

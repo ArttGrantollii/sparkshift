@@ -4,7 +4,13 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import sqlglot
-from compare import differences, limited_differences, ordered_differences, snapshot
+from compare import (
+    Snapshot,
+    differences,
+    limited_differences,
+    ordered_differences,
+    snapshot,
+)
 from sqlglot import exp
 
 import sparkshift
@@ -64,12 +70,7 @@ def assert_equivalent(
     else:
         expected = snapshot(spark.sql(unlimited))
         expected_count = spark.sql(reference).count()
-    if order_keys is not None:
-        problems = ordered_differences(expected, actual, order_keys, expected_count)
-    elif expected_count is not None:
-        problems = limited_differences(expected, actual, expected_count)
-    else:
-        problems = differences(expected, actual)
+    problems = result_differences(expected, actual, order_keys, expected_count)
 
     context = [f"SQL:\n{sql}"]
     if reference != sql:
@@ -78,8 +79,27 @@ def assert_equivalent(
     assert not problems, "\n\n".join([*context, *problems])
 
 
-def has_order_by(spark_sql: str) -> bool:
-    tree = sqlglot.parse_one(spark_sql, read="spark")
+def result_differences(
+    expected: Snapshot,
+    actual: Snapshot,
+    order_keys: Sequence[str] | None,
+    expected_count: int | None,
+) -> list[str]:
+    """Compare a reference result with the generated code's result.
+
+    ``expected`` is the reference without its LIMIT, if it has one, and
+    ``expected_count`` the number of rows the query returns with it (None
+    without a LIMIT).
+    """
+    if order_keys is not None:
+        return ordered_differences(expected, actual, order_keys, expected_count)
+    if expected_count is not None:
+        return limited_differences(expected, actual, expected_count)
+    return differences(expected, actual)
+
+
+def has_order_by(sql: str, dialect: str = "spark") -> bool:
+    tree = sqlglot.parse_one(sql, read=dialect)
     return _is_query(tree) and tree.args.get("order") is not None
 
 
@@ -88,16 +108,16 @@ def _is_query(tree: exp.Expression) -> bool:
     return isinstance(tree, exp.Select | exp.SetOperation)
 
 
-def without_limit(spark_sql: str) -> str | None:
+def without_limit(sql: str, dialect: str = "spark") -> str | None:
     """Return the query without its LIMIT, or None if it has none.
 
     A LIMIT may cut a group of tied rows, or without ORDER BY keep any rows,
     so limited results are checked against the unlimited result (see
     ``limited_differences`` and ``ordered_differences``).
     """
-    tree = sqlglot.parse_one(spark_sql, read="spark")
+    tree = sqlglot.parse_one(sql, read=dialect)
     if not _is_query(tree) or tree.args.get("limit") is None:
         return None
     unlimited = tree.copy()
     unlimited.set("limit", None)
-    return unlimited.sql(dialect="spark")
+    return unlimited.sql(dialect=dialect)

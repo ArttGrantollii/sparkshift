@@ -292,6 +292,15 @@ _SYSDATE_HINT = (
     "Oracle's SYSDATE has no fractional seconds and uses the database server's "
     "time zone; use CURRENT_TIMESTAMP."
 )
+_POSTGRES_INTERVAL_HINT = (
+    "PostgreSQL returns a timestamp when the value is a date, and only the "
+    "schema would tell. Add a number of days to keep a date (order_date + 3), "
+    "or cast the value: CAST(order_date AS TIMESTAMP) + INTERVAL '3 days'."
+)
+_POSTGRES_TIMESTAMP_TYPES = (
+    exp.DataType.Type.TIMESTAMP,
+    exp.DataType.Type.TIMESTAMPTZ,
+)
 _ADD_MONTHS_HINT = (
     "ADD_MONTHS keeps the last day of the month in Oracle and Snowflake "
     "(Feb 29 + 1 month = Mar 31) but not in Spark; use + INTERVAL '1' MONTH."
@@ -2684,6 +2693,19 @@ class _Translator:
         base = self.expression(base_node)
         if interval is None or base is None:
             return None
+        if self.dialect == "postgres":
+            # PostgreSQL returns a timestamp for date + interval, and the
+            # input's own type otherwise; Spark keeps a date a date.
+            kind = _postgres_datetime_kind(base_node)
+            if kind is None:
+                self.unsupported(
+                    "INTERVAL arithmetic on a value that may be a date",
+                    node,
+                    _POSTGRES_INTERVAL_HINT,
+                )
+                return None
+            if kind == "date":
+                base = ir.Cast(base, "timestamp_ntz")
         return ir.BinaryOp(operator, base, interval)
 
     def interval(
@@ -3003,6 +3025,28 @@ def _has_window(expression: ir.Expression) -> bool:
     if isinstance(expression, ir.WindowCall):
         return True
     return any(_has_window(child) for child in ir.children(expression))
+
+
+def _postgres_datetime_kind(node: exp.Expression) -> str | None:
+    """Whether a PostgreSQL value is visibly a "date" or a "timestamp" (with or
+    without a time zone), or None when only the schema would tell, as for a
+    column."""
+    node = node.unnest()
+    if isinstance(node, exp.CurrentDate):
+        return "date"
+    if isinstance(node, exp.CurrentTimestamp):
+        return "timestamp"
+    if isinstance(node, exp.Cast):
+        if node.to.is_type(exp.DataType.Type.DATE):
+            return "date"
+        if node.to.is_type(*_POSTGRES_TIMESTAMP_TYPES):
+            return "timestamp"
+    if isinstance(node, exp.Add | exp.Sub) and any(
+        isinstance(side, exp.Interval) for side in (node.this, node.expression)
+    ):
+        # Interval arithmetic always returns a timestamp in PostgreSQL.
+        return "timestamp"
+    return None
 
 
 def _without_implicit_time_cast(node: exp.Expression) -> exp.Expression:

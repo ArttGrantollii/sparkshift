@@ -1545,7 +1545,11 @@ def plus(base: ir.Expression, unit: str, amount: int) -> ir.BinaryOp:
         ("DATE_DIFF(a, b, DAY)", "bigquery", call("datediff", A, B)),
         ("d + INTERVAL '3' DAY", None, plus(D, "days", 3)),
         ("INTERVAL '3' DAY + d", None, plus(D, "days", 3)),
-        ("d + INTERVAL '3 days'", "postgres", plus(D, "days", 3)),
+        (
+            "CAST(d AS TIMESTAMP) + INTERVAL '3 days'",
+            "postgres",
+            plus(ir.Cast(D, "timestamp_ntz"), "days", 3),
+        ),
         (
             "d - INTERVAL '1' MONTH",
             None,
@@ -3400,3 +3404,71 @@ def test_every_qualify_issue_is_reported() -> None:
         "QUALIFY reference to a SELECT alias",
         "function MY_UDF",
     ]
+
+
+# --- PostgreSQL interval arithmetic --------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("sql_expression", "expected"),
+    [
+        # A date plus an interval is a timestamp at midnight in PostgreSQL.
+        (
+            "CAST(d AS DATE) + INTERVAL '1 month'",
+            plus(ir.Cast(ir.Cast(D, "date"), "timestamp_ntz"), "months", 1),
+        ),
+        (
+            "CURRENT_DATE + INTERVAL '1 day'",
+            plus(ir.Cast(call("current_date"), "timestamp_ntz"), "days", 1),
+        ),
+        # A timestamp keeps its type, with or without a time zone.
+        ("NOW() + INTERVAL '1 day'", plus(call("current_timestamp"), "days", 1)),
+        (
+            "d::timestamptz - INTERVAL '2 weeks'",
+            BinaryOp(
+                BinaryOperator.SUBTRACT,
+                ir.Cast(D, "timestamp"),
+                ir.Interval("weeks", Literal(2)),
+            ),
+        ),
+        # So does the result of interval arithmetic, which is a timestamp.
+        (
+            "(CAST(d AS TIMESTAMP) + INTERVAL '1 day') + INTERVAL '1 day'",
+            plus(plus(ir.Cast(D, "timestamp_ntz"), "days", 1), "days", 1),
+        ),
+    ],
+)
+def test_postgres_interval_arithmetic_returns_postgres_types(
+    sql_expression: str, expected: ir.Expression
+) -> None:
+    assert only_item(f"SELECT {sql_expression} AS x FROM t", "postgres") == Alias(
+        expected, "x"
+    )
+
+
+@pytest.mark.parametrize(
+    "sql_expression",
+    [
+        "d + INTERVAL '3 days'",
+        "INTERVAL '1 day' + d",
+        "d - INTERVAL '1 month'",
+        "(d + INTERVAL '1 day') + INTERVAL '1 day'",
+        # A cast to another type says nothing about dates.
+        "CAST(d AS VARCHAR) + INTERVAL '1 day'",
+    ],
+)
+def test_postgres_interval_on_a_value_of_unknown_type_is_rejected(
+    sql_expression: str,
+) -> None:
+    issues = unsupported_issues(f"SELECT {sql_expression} AS x FROM t", "postgres")
+
+    assert [message for message, _ in issues] == [
+        "INTERVAL arithmetic on a value that may be a date"
+    ]
+
+
+@pytest.mark.parametrize("dialect", [None, "mysql", "snowflake", "bigquery", "oracle"])
+def test_interval_on_a_column_keeps_its_type_elsewhere(dialect: str | None) -> None:
+    item = only_item("SELECT d + INTERVAL '3' DAY AS x FROM t", dialect)
+
+    assert item == Alias(plus(D, "days", 3), "x")

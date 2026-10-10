@@ -160,13 +160,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constructs that block conversion by the number of files they block, with
   hints and example files. `--fail-under PERCENT` makes it usable as a CI
   gate. A sample workload is in `examples/coverage`.
+- PostgreSQL scenarios and examples also run on a real PostgreSQL 18 server
+  in CI, compared with the generated PySpark on Spark, so the hand-written
+  Spark SQL references are no longer the only check. The tests skip without
+  a configured server, and fail instead of skipping in CI.
 
 ### Changed
 
 - `IN (subquery)` where no subquery is allowed, such as in `QUALIFY` or a
   join condition, now reports where subqueries are supported instead of
   "used as a value".
-
 - Aggregation without `GROUP BY` is generated as `.select(...)` instead of
   `.agg(...)`: the same one-row result, and it also works in correlated
   subqueries, where Spark cannot resolve `.agg(...)`.
@@ -181,3 +184,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operand per line with the operator leading; before, a long comparison such
   as a date filter stayed on one line. A wrapped condition followed by a comma
   could also run one column over the limit.
+- PostgreSQL `date + INTERVAL ...` was converted to a date; PostgreSQL returns
+  a timestamp. It is now converted to a timestamp when the value is visibly a
+  date (`CAST(x AS DATE)`, `DATE '...'`, `CURRENT_DATE`), keeps its type when
+  visibly a timestamp, and is rejected for a column, whose type only the
+  schema would tell.
