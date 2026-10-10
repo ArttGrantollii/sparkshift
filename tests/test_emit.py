@@ -575,10 +575,12 @@ def test_grouped_aggregation_golden_output() -> None:
     )
 
 
-def test_global_aggregation_has_no_group_by() -> None:
+def test_global_aggregation_selects_the_aggregates() -> None:
+    # select(...) of aggregates is one row for the whole input, like agg(...),
+    # and also works in subqueries that refer to their enclosing query.
     plan = ir.Aggregate(TableScan(("orders",)), (), (COUNT_ROWS,))
 
-    assert '    spark.table("orders")\n    .agg(F.count(F.lit(1)))\n' in emit(plan)
+    assert '    spark.table("orders")\n    .select(F.count(F.lit(1)))\n' in emit(plan)
 
 
 def test_grouping_without_aggregates_selects_distinct_keys() -> None:
@@ -1375,3 +1377,63 @@ def test_named_relation_first_used_in_a_branch_is_declared_unindented() -> None:
 
     assert "recent = (\n    spark.table" in code
     assert "    .union(\n        recent\n" in code
+
+
+# --- Subqueries in expressions -----------------------------------------------
+
+ORDERS_SCAN = TableScan(("orders",))
+SUBQUERY = ir.Named("subquery", Project(ORDERS_SCAN, (Column(("customer_id",)),)))
+
+
+@pytest.mark.parametrize(
+    ("expression", "code"),
+    [
+        (ir.OuterColumn(("c", "customer_id")), 'F.col("c.customer_id").outer()'),
+        (ir.InSubquery(A, SUBQUERY), 'F.col("a").isin(subquery)'),
+        (
+            UnaryOp(UnaryOperator.NOT, ir.InSubquery(A, SUBQUERY)),
+            '~F.col("a").isin(subquery)',
+        ),
+        (ir.Exists(SUBQUERY), "subquery.exists()"),
+        (ir.ScalarSubquery(SUBQUERY), "subquery.scalar()"),
+    ],
+)
+def test_subquery_expressions(expression: ir.Expression, code: str) -> None:
+    plan = ir.Filter(TableScan(("customers",)), expression)
+
+    assert f"    .where({code})\n" in emit(plan)
+
+
+def test_subquery_is_declared_before_the_query_that_uses_it() -> None:
+    plan = ir.Filter(TableScan(("customers",)), ir.Exists(SUBQUERY))
+
+    assert emit(plan) == (
+        "from pyspark.sql import functions as F\n"
+        "\n"
+        "subquery = (\n"
+        '    spark.table("orders")\n'
+        '    .select(F.col("customer_id"))\n'
+        ")\n"
+        "\n"
+        "result = (\n"
+        '    spark.table("customers")\n'
+        "    .where(subquery.exists())\n"
+        ")\n"
+    )
+
+
+def test_windows_and_joins_inside_subqueries_are_declared() -> None:
+    ranked = ir.WindowCall(ir.WindowFunction.RANK, (), (ir.SortKey(A, False, True),))
+    joined = ir.Join(
+        ir.RelationAlias(ORDERS_SCAN, "o"),
+        ir.RelationAlias(TableScan(("items",)), "i"),
+        ir.JoinKind.CROSS,
+    )
+    inner = ir.Named("subquery", Project(joined, (Alias(ranked, "r"),)))
+    plan = ir.Filter(TableScan(("customers",)), ir.Exists(inner))
+
+    code = emit(plan)
+
+    assert 'window = Window.orderBy(F.col("a").asc())\n' in code
+    assert 'orders = spark.table("orders")\n' in code
+    assert 'items = spark.table("items")\n' in code

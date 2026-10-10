@@ -119,6 +119,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `INTERSECT` mixed with `UNION` or `EXCEPT` without parentheses, since
   databases disagree on which runs first, and queries with different
   numbers of columns.
+- Subqueries in expressions: `IN` and `NOT IN` as `WHERE` and `HAVING`
+  conditions, `EXISTS`, `NOT EXISTS`, and subqueries used as values, in
+  `WHERE`, `HAVING`, `ORDER BY`, and the `SELECT` list, including
+  correlated subqueries. Translated with Spark's subquery methods, which
+  keep SQL's NULL rules for `NOT IN`. Rejects `IN (subquery)` used as a
+  value (Spark returns false where SQL returns NULL), `ANY`/`ALL`, and
+  row-value `IN`.
+
+### Changed
+
+- Aggregation without `GROUP BY` is generated as `.select(...)` instead of
+  `.agg(...)`: the same one-row result, and it also works in correlated
+  subqueries, where Spark cannot resolve `.agg(...)`.
 
 ### Fixed
 

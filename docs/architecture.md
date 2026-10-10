@@ -63,7 +63,10 @@ resolve exactly as in SQL, including in self-joins. Each distinct window
 Each CTE and each subquery in `FROM` becomes a variable named after it,
 declared once, after the variables it uses; a CTE used twice is computed
 from the same variable. The other query of a set operation is written as a
-chain nested inside the call, as in `.union(...)`.
+chain nested inside the call, as in `.union(...)`. A subquery in an
+expression becomes a variable used with Spark's subquery methods:
+`.isin(subquery)`, `subquery.exists()`, and `subquery.scalar()`, with
+`F.col(...).outer()` for the enclosing query's columns.
 Parentheses follow
 Python's operator precedence, not SQL's, because PySpark expressions are
 built from Python operators (`&` and `|` bind more tightly than `==`).

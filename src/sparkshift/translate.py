@@ -80,6 +80,10 @@ _WINDOW_FUNCTIONS: dict[type[exp.Expression], ir.WindowFunction] = {
 # Parts of an OVER clause SparkShift does not handle yet.
 _WINDOW_PART_NAMES = {"alias": "named window"}
 _WINDOW_OUTSIDE_SELECT_LIST = "window function outside the SELECT list"
+_SUBQUERY_OUTSIDE = "subquery outside WHERE, HAVING, ORDER BY, and the SELECT list"
+_SUBQUERY_PLACE_HINT = (
+    "Subqueries are supported in WHERE, HAVING, ORDER BY, and the SELECT list."
+)
 
 # Window functions Spark only computes over an ordered window without a
 # frame, and the ones whose result depends on the frame's last row.
@@ -366,6 +370,18 @@ class _Translator:
         # CTEs visible to the query being translated, innermost WITH last,
         # by lower-case name.
         self.scopes: list[dict[str, ir.Named]] = []
+        # Why subqueries are not allowed here, as a diagnostic message; None
+        # where they are: WHERE, HAVING, ORDER BY, and the SELECT list.
+        self.no_subqueries: str | None = _SUBQUERY_OUTSIDE
+        # IN (subquery) predicates that are conditions of a WHERE or HAVING,
+        # by id, where NULL and false both drop the row.
+        self.filtering_in_subqueries: set[int] = set()
+        # The table names and aliases of each SELECT being translated,
+        # innermost last, and whether it is a subquery whose columns may
+        # refer to its parent's.
+        self.qualifier_scopes: list[tuple[frozenset[str], bool]] = []
+        # Whether the SELECT about to be translated may do that.
+        self.correlated = False
 
     def statement(self, tree: exp.Expression) -> ir.Relation:
         if not isinstance(tree, exp.Select | exp.SetOperation):
@@ -384,7 +400,9 @@ class _Translator:
 
     # --- Queries ---------------------------------------------------------
 
-    def query(self, node: exp.Expression) -> ir.Relation | None:
+    def query(
+        self, node: exp.Expression, *, correlated: bool = False
+    ) -> ir.Relation | None:
         """Translate a query: a SELECT or a set operation such as UNION, at
         the top level or nested in a CTE or a subquery."""
         if isinstance(node, exp.Select):
@@ -403,26 +421,33 @@ class _Translator:
             return None
         # A query starts with no outer context: its own SELECT list decides
         # where aggregates and windows are allowed.
-        outside = self.no_aggregates_in, self.no_windows
-        self.no_aggregates_in, self.no_windows = None, _WINDOW_OUTSIDE_SELECT_LIST
+        outside = self.no_aggregates_in, self.no_windows, self.no_subqueries
+        self.no_aggregates_in = None
+        self.no_windows = _WINDOW_OUTSIDE_SELECT_LIST
+        self.no_subqueries = _SUBQUERY_OUTSIDE
         try:
-            return self.with_scope(node, translate)
+            return self.with_scope(node, translate, correlated)
         finally:
-            self.no_aggregates_in, self.no_windows = outside
+            self.no_aggregates_in, self.no_windows, self.no_subqueries = outside
 
     def with_scope(
         self,
         node: exp.Select | exp.SetOperation,
         translate: Callable[[Any], ir.Relation | None],
+        correlated: bool = False,
     ) -> ir.Relation | None:
-        """Translate a query with the CTEs of its WITH clause in scope."""
+        """Translate a query with the CTEs of its WITH clause in scope.
+        ``correlated`` lets the query (not its CTEs) use its parent's
+        columns."""
         with_ = node.args.get("with_")
         if with_ is None:
+            self.correlated = correlated
             return translate(node)
         scope: dict[str, ir.Named] = {}
         self.scopes.append(scope)
         try:
             defined = self.common_tables(with_, scope)
+            self.correlated = correlated
             relation = translate(node)
         finally:
             self.scopes.pop()
@@ -589,6 +614,14 @@ class _Translator:
         return None
 
     def select_clauses(self, select: exp.Select) -> ir.Relation | None:
+        self.qualifier_scopes.append((_local_qualifiers(select), self.correlated))
+        self.correlated = False
+        try:
+            return self.select_body(select)
+        finally:
+            self.qualifier_scopes.pop()
+
+    def select_body(self, select: exp.Select) -> ir.Relation | None:
         source: ir.Relation | None = None
         items: tuple[ir.Expression, ...] | None = None
         condition: ir.Expression | None = None
@@ -606,14 +639,15 @@ class _Translator:
             value = select.args.get(part)
             if part == "expressions":
                 self.no_aggregates_in = None if aggregating else "SELECT"
-                outside = self.no_windows
+                outside = self.no_windows, self.no_subqueries
                 if aggregating:
                     self.no_windows = "window function in an aggregate query"
                 else:
                     self.no_windows = None
+                self.no_subqueries = None
                 items = self.projection(value)
                 self.no_aggregates_in = None
-                self.no_windows = outside
+                self.no_windows, self.no_subqueries = outside
             elif part == "from_":
                 source = self.from_(select)
             elif not value or part == "with_":
@@ -647,7 +681,11 @@ class _Translator:
 
         keys: list[_OrderKey] = []
         if order is not None:
-            resolved = self.order_by(order, select, items, aggregating)
+            outside_subqueries, self.no_subqueries = self.no_subqueries, None
+            try:
+                resolved = self.order_by(order, select, items, aggregating)
+            finally:
+                self.no_subqueries = outside_subqueries
             if resolved is None:
                 return None
             keys = resolved
@@ -663,14 +701,14 @@ class _Translator:
                         hint="With DISTINCT, order by selected columns or aliases.",
                     )
             return None
-        if not sort_output and any(_has_window(item) for item in items):
+        if not sort_output and any(_regroups(item) for item in items):
             # Sorting before the projection would not survive it: computing a
-            # window regroups the rows.
+            # window or a subquery can regroup the rows.
             for key in keys:
                 if key.output is None:
                     self.unsupported(
                         "ORDER BY key that is not selected, in a query with "
-                        "window functions",
+                        "window functions or subqueries",
                         key.node.this,
                         hint="Select the column too, or order by an alias.",
                     )
@@ -866,8 +904,25 @@ class _Translator:
         issues_before = len(self.issues)
         if self.dialect == "snowflake":
             self.check_alias_references(where, select)
-        condition = self.expression_without_aggregates(where.this, "WHERE")
+        condition = self.filter_condition(
+            where.this, lambda: self.expression_without_aggregates(where.this, "WHERE")
+        )
         return None if len(self.issues) > issues_before else condition
+
+    def filter_condition(
+        self,
+        node: exp.Expression,
+        translate: Callable[[], ir.Expression | None],
+    ) -> ir.Expression | None:
+        """Translate a WHERE or HAVING condition, where subqueries are
+        allowed, and IN (subquery) too when it is one of the conditions the
+        AND chain requires."""
+        self.filtering_in_subqueries |= _filtering_in_subqueries(node)
+        outside, self.no_subqueries = self.no_subqueries, None
+        try:
+            return translate()
+        finally:
+            self.no_subqueries = outside
 
     def check_alias_references(self, where: exp.Where, select: exp.Select) -> None:
         """Reject WHERE references to SELECT-list aliases.
@@ -1118,6 +1173,14 @@ class _Translator:
                 hint="Add an alias, for example: -amount AS negative_amount.",
             )
             return None
+        if expression is not None and _has_subquery(expression):
+            self.unsupported(
+                "subquery without an alias",
+                node,
+                hint="Spark names this column after the subquery's spelling; "
+                "add an alias, for example: ... AS largest.",
+            )
+            return None
         if expression is not None and _has_window(expression):
             self.unsupported(
                 "window function without an alias",
@@ -1355,7 +1418,9 @@ class _Translator:
     ) -> ir.Expression | None:
         """Translate HAVING into a filter on the aggregated result."""
         issues_before = len(self.issues)
-        condition = self.expression(having.this)
+        condition = self.filter_condition(
+            having.this, lambda: self.expression(having.this)
+        )
         if condition is None or len(self.issues) > issues_before:
             return None
         return over_groups(condition, "HAVING")
@@ -1447,8 +1512,11 @@ class _Translator:
             return None
 
         self.no_aggregates_in = "another aggregate function"
+        outside_subqueries = self.no_subqueries
+        self.no_subqueries = "subquery in an aggregate function"
         arguments = [self.expression(operand) for operand in operands]
         self.no_aggregates_in = None
+        self.no_subqueries = outside_subqueries
         if any(argument is None for argument in arguments):
             return None
         return ir.AggregateCall(function, tuple(arguments), distinct)  # type: ignore[arg-type]
@@ -1472,7 +1540,9 @@ class _Translator:
             # Parentheses only shape the tree; the tree already encodes them.
             return self.expression(node.this)
         if isinstance(node, exp.Column):
-            return self.column(node)
+            return self.column_reference(node)
+        if isinstance(node, exp.Subquery):
+            return self.scalar_subquery(node)
         if isinstance(node, exp.Literal | exp.Boolean | exp.Null):
             return self.literal(node)
         if isinstance(node, exp.Neg):
@@ -1524,7 +1594,9 @@ class _Translator:
         # Nothing inside a window may contain another window, and aggregates
         # inside it belong to the window function, not to the query.
         outside_windows, outside_aggregates = self.no_windows, self.no_aggregates_in
+        outside_subqueries = self.no_subqueries
         self.no_windows = "window function inside a window"
+        self.no_subqueries = "subquery in a window function"
         try:
             function = self.window_function(node.this)
             self.no_aggregates_in = "a window's PARTITION BY or ORDER BY"
@@ -1537,6 +1609,7 @@ class _Translator:
             ]
         finally:
             self.no_windows, self.no_aggregates_in = outside_windows, outside_aggregates
+            self.no_subqueries = outside_subqueries
 
         spec = node.args.get("spec")
         issues_before = len(self.issues)
@@ -1804,6 +1877,90 @@ class _Translator:
             nulls_first=bool(node.args.get("nulls_first")),
         )
 
+    # --- Subqueries in expressions -----------------------------------------
+
+    def subquery_relation(self, node: exp.Expression) -> ir.Relation | None:
+        """The query of a subquery used in an expression, as a named
+        relation. A SELECT may use its parent's columns, qualified with the
+        parent's table names or aliases (a correlated subquery)."""
+        if self.no_subqueries is not None:
+            self.unsupported(self.no_subqueries, node, hint=_SUBQUERY_PLACE_HINT)
+            return None
+        if isinstance(node, exp.Subquery):
+            if not self.check_parts(node, {"this"}, "subquery"):
+                return None
+            node = node.this
+        relation = self.query(node, correlated=isinstance(node, exp.Select))
+        return None if relation is None else ir.Named("subquery", relation)
+
+    def in_subquery(self, node: exp.In) -> ir.Expression | None:
+        """``x IN (subquery)``, as a condition of a WHERE or HAVING.
+
+        There, NULL and false both drop the row, and Spark matches SQL. As a
+        value elsewhere, Spark returns false where SQL returns NULL (when the
+        subquery has a NULL and no match), so SparkShift does not use it.
+        """
+        if not self.check_parts(node, {"this", "query"}, "IN"):
+            return None
+        if isinstance(node.this, exp.Tuple):
+            self.unsupported("IN (subquery) with several values", node)
+            return None
+        if id(node) not in self.filtering_in_subqueries:
+            self.unsupported(
+                "IN (subquery) used as a value",
+                node,
+                hint="Spark returns false where SQL returns NULL when the "
+                "subquery has a NULL. Use it as a WHERE condition, or use EXISTS.",
+            )
+            return None
+        query = node.args["query"]
+        count = _column_count(query)
+        if count is not None and count != 1:
+            self.unsupported(f"IN (subquery) with {count} columns", query)
+            return None
+        operand = self.expression(node.this)
+        relation = self.subquery_relation(query)
+        if operand is None or relation is None:
+            return None
+        return ir.InSubquery(operand, relation)
+
+    def exists(self, node: exp.Exists) -> ir.Expression | None:
+        if not self.check_parts(node, {"this"}, "EXISTS"):
+            return None
+        relation = self.subquery_relation(node.this)
+        return None if relation is None else ir.Exists(relation)
+
+    def scalar_subquery(self, node: exp.Subquery) -> ir.Expression | None:
+        """A subquery used as a value: one column, at most one row."""
+        count = _column_count(node)
+        if count is not None and count != 1:
+            self.unsupported(f"subquery used as a value with {count} columns", node)
+            return None
+        relation = self.subquery_relation(node)
+        return None if relation is None else ir.ScalarSubquery(relation)
+
+    def any_or_all(self, node: exp.Any | exp.All) -> ir.Expression | None:
+        name = "ALL" if isinstance(node, exp.All) else "ANY"
+        self.unsupported(
+            f"comparison with {name} (subquery)",
+            node.parent or node,
+            hint="Rewrite it with EXISTS, or compare with an aggregate such as "
+            "(SELECT MAX(...) ...).",
+        )
+        return None
+
+    def column_reference(self, node: exp.Column) -> ir.Expression | None:
+        """A column, or in a correlated subquery a column of the enclosing
+        query: one qualified with a name that only the enclosing query
+        defines."""
+        qualifier = node.table.lower()
+        if qualifier and len(self.qualifier_scopes) >= 2:
+            local, correlated = self.qualifier_scopes[-1]
+            parent, _ = self.qualifier_scopes[-2]
+            if correlated and qualifier not in local and qualifier in parent:
+                return ir.OuterColumn(tuple(part.name for part in node.parts))
+        return self.column(node)
+
     # --- Predicates, conditionals, and casts ------------------------------
 
     def not_(self, node: exp.Not) -> ir.Expression | None:
@@ -1835,6 +1992,8 @@ class _Translator:
         return tuple(item for item in translated if item is not None)
 
     def in_list(self, node: exp.In) -> ir.Expression | None:
+        if node.args.get("query") is not None:
+            return self.in_subquery(node)
         if not self.check_parts(node, {"this", "expressions"}, "IN"):
             return None
         operands = self.translate_all([node.this, *node.expressions])
@@ -2036,6 +2195,9 @@ class _Translator:
         exp.Nullif: nullif,
         exp.Cast: cast,
         exp.TryCast: cast,
+        exp.Exists: exists,
+        exp.Any: any_or_all,
+        exp.All: any_or_all,
     }
 
     # --- String and numeric functions --------------------------------------
@@ -2626,6 +2788,50 @@ def _window_function_name(
     if isinstance(function, ir.AggregateCall):
         return function.function.name
     return function.name.upper()
+
+
+def _has_subquery(expression: ir.Expression) -> bool:
+    if isinstance(expression, ir.InSubquery | ir.Exists | ir.ScalarSubquery):
+        return True
+    return any(_has_subquery(child) for child in ir.children(expression))
+
+
+def _regroups(expression: ir.Expression) -> bool:
+    """Whether computing the expression may move rows between partitions,
+    losing an earlier sort: a window function or a subquery."""
+    return _has_window(expression) or _has_subquery(expression)
+
+
+def _local_qualifiers(select: exp.Select) -> frozenset[str]:
+    """The names this SELECT's columns can be qualified with: its tables'
+    and subqueries' aliases or names, lower case."""
+    from_ = select.args.get("from_")
+    sources = [from_.this] if from_ is not None else []
+    sources += [join.this for join in select.args.get("joins") or []]
+    return frozenset(
+        source.alias_or_name.lower() for source in sources if source.alias_or_name
+    )
+
+
+def _filtering_in_subqueries(condition: exp.Expression) -> set[int]:
+    """The ids of IN (subquery) predicates that are terms of a condition's
+    AND chain, negated or not."""
+    found = set()
+    for term in _and_terms(condition):
+        if isinstance(term, exp.Not):
+            term = term.this.unnest()
+        if isinstance(term, exp.In) and term.args.get("query") is not None:
+            found.add(id(term))
+    return found
+
+
+def _and_terms(node: exp.Expression) -> Iterator[exp.Expression]:
+    node = node.unnest()
+    if isinstance(node, exp.And):
+        yield from _and_terms(node.this)
+        yield from _and_terms(node.expression)
+    else:
+        yield node
 
 
 def _has_window(expression: ir.Expression) -> bool:

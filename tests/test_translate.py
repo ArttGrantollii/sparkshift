@@ -1138,7 +1138,11 @@ def test_grouping_check_sees_columns_inside_case() -> None:
 @pytest.mark.parametrize(
     ("sql", "dialect", "message"),
     [
-        ("SELECT a FROM t WHERE a IN (SELECT b FROM u)", None, "IN with a subquery"),
+        (
+            "SELECT a IN (SELECT b FROM u) AS x FROM t",
+            None,
+            "IN (subquery) used as a value",
+        ),
         (
             "SELECT a FROM t WHERE a LIKE b",
             None,
@@ -2161,7 +2165,8 @@ def test_window_next_to_select_star() -> None:
         (
             "SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM t ORDER BY b",
             None,
-            "ORDER BY key that is not selected, in a query with window functions",
+            "ORDER BY key that is not selected, in a query with window functions or "
+            "subqueries",
         ),
     ],
 )
@@ -2196,7 +2201,11 @@ def test_windows_report_only_the_sort_keys_they_do_not_output() -> None:
     )
 
     assert issues == [
-        ("ORDER BY key that is not selected, in a query with window functions", "b")
+        (
+            "ORDER BY key that is not selected, in a query with window "
+            "functions or subqueries",
+            "b",
+        )
     ]
 
 
@@ -2218,9 +2227,9 @@ def test_unknown_parts_of_a_window_sort_key_are_rejected() -> None:
 
 
 def test_unsupported_expression_is_named_by_its_kind() -> None:
-    issues = unsupported_issues("SELECT (SELECT 1) AS x FROM t")
+    issues = unsupported_issues("SELECT a[1] AS x FROM t")
 
-    assert issues == [("SUBQUERY expression", "(SELECT 1)")]
+    assert issues == [("BRACKET expression", "a[1]")]
 
 
 # --- Offset functions and window frames --------------------------------------
@@ -2927,3 +2936,274 @@ def test_only_queries_can_be_combined_or_nested() -> None:
         translate(tree)
 
     assert [issue.message for issue in caught.value.issues] == ["TABLE in a subquery"]
+
+
+# --- Subqueries in expressions -----------------------------------------------
+
+U_B = Project(U, (B,))
+SUBQUERY_U_B = ir.Named("subquery", U_B)
+
+
+def where_condition(sql: str, dialect: str | None = None) -> ir.Expression:
+    plan = translate_sql(sql, dialect)
+    while not isinstance(plan, ir.Filter):
+        assert isinstance(plan, Project | ir.Sort | ir.Limit)
+        plan = plan.source
+    return plan.condition
+
+
+@pytest.mark.parametrize(
+    ("condition", "expected"),
+    [
+        ("a IN (SELECT b FROM u)", ir.InSubquery(A, SUBQUERY_U_B)),
+        (
+            "a NOT IN (SELECT b FROM u)",
+            UnaryOp(UnaryOperator.NOT, ir.InSubquery(A, SUBQUERY_U_B)),
+        ),
+        (
+            "NOT (a IN (SELECT b FROM u))",
+            UnaryOp(UnaryOperator.NOT, ir.InSubquery(A, SUBQUERY_U_B)),
+        ),
+        ("EXISTS (SELECT b FROM u)", ir.Exists(SUBQUERY_U_B)),
+        (
+            "NOT EXISTS (SELECT b FROM u)",
+            UnaryOp(UnaryOperator.NOT, ir.Exists(SUBQUERY_U_B)),
+        ),
+        (
+            "a > (SELECT b FROM u)",
+            BinaryOp(BinaryOperator.GREATER, A, ir.ScalarSubquery(SUBQUERY_U_B)),
+        ),
+    ],
+)
+def test_subqueries_in_where(condition: str, expected: ir.Expression) -> None:
+    assert where_condition(f"SELECT a FROM t WHERE {condition}") == expected
+
+
+def test_in_subquery_may_be_one_of_several_and_conditions() -> None:
+    condition = where_condition(
+        "SELECT a FROM t WHERE c > 1 AND (a IN (SELECT b FROM u) AND b < 5)"
+    )
+
+    assert ir.InSubquery(A, SUBQUERY_U_B) in list(_all_subexpressions(condition))
+
+
+def _all_subexpressions(expression: ir.Expression):  # type: ignore[no-untyped-def]
+    yield expression
+    for child in ir.children(expression):
+        yield from _all_subexpressions(child)
+
+
+def test_correlated_subquery_refers_to_the_outer_query() -> None:
+    condition = where_condition(
+        "SELECT x.a FROM t x WHERE EXISTS (SELECT 1 FROM u y WHERE y.b = x.a)"
+    )
+
+    inner = ir.Filter(
+        ir.RelationAlias(U, "y"),
+        BinaryOp(BinaryOperator.EQUAL, Column(("y", "b")), ir.OuterColumn(("x", "a"))),
+    )
+    assert condition == ir.Exists(ir.Named("subquery", Project(inner, (Literal(1),))))
+
+
+@pytest.mark.parametrize(
+    ("sql", "local"),
+    [
+        # Unqualified names are the subquery's own columns, as in SQL.
+        (
+            "SELECT x.a FROM t x WHERE EXISTS (SELECT 1 FROM u WHERE b = a)",
+            Column(("a",)),
+        ),
+        # The subquery's own alias hides the outer query's.
+        (
+            "SELECT x.a FROM t x WHERE EXISTS (SELECT 1 FROM u x WHERE x.b = x.a)",
+            Column(("x", "a")),
+        ),
+        # Only the parent's names are outer: not the grandparent's.
+        (
+            "SELECT g.a FROM t g WHERE EXISTS (SELECT 1 FROM u p WHERE EXISTS "
+            "(SELECT 1 FROM t c WHERE c.a = g.a))",
+            Column(("g", "a")),
+        ),
+    ],
+)
+def test_outer_references_follow_sql_scoping(sql: str, local: ir.Column) -> None:
+    plan = translate_sql(sql)
+
+    found = list(_relation_columns(plan))
+    assert local in found
+    assert ir.OuterColumn(local.name_parts) not in found
+
+
+def _relation_columns(plan: ir.Relation):  # type: ignore[no-untyped-def]
+    """Every Column and OuterColumn in a plan, including inside subqueries."""
+    roots: list[ir.Expression] = []
+    sources: list[ir.Relation] = []
+    match plan:
+        case ir.Filter(source=source, condition=condition):
+            roots, sources = [condition], [source]
+        case ir.Project(source=source, items=items):
+            roots, sources = list(items), [source]
+        case ir.Named(source=source) | ir.RelationAlias(source=source):
+            sources = [source]
+    for root in roots:
+        for expression in _all_subexpressions(root):
+            if isinstance(expression, ir.Column | ir.OuterColumn):
+                yield expression
+            if isinstance(expression, ir.Exists | ir.InSubquery | ir.ScalarSubquery):
+                yield from _relation_columns(expression.query)
+    for source in sources:
+        yield from _relation_columns(source)
+
+
+def test_subquery_in_from_cannot_refer_to_the_outer_query() -> None:
+    # Only subqueries in expressions are correlated; s.a is the subquery's own.
+    plan = translate_sql("SELECT t.a FROM t JOIN (SELECT t.a FROM t) s ON t.a = s.a")
+
+    assert ir.OuterColumn(("t", "a")) not in list(_relation_columns(plan))
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected_items"),
+    [
+        (
+            "SELECT a, (SELECT b FROM u) AS first_b FROM t",
+            (A, Alias(ir.ScalarSubquery(SUBQUERY_U_B), "first_b")),
+        ),
+        (
+            "SELECT a, EXISTS (SELECT b FROM u) AS any_u FROM t",
+            (A, Alias(ir.Exists(SUBQUERY_U_B), "any_u")),
+        ),
+    ],
+)
+def test_subqueries_in_the_select_list(
+    sql: str, expected_items: tuple[ir.Expression, ...]
+) -> None:
+    assert select_items(sql) == expected_items
+
+
+def test_scalar_subquery_in_order_by() -> None:
+    plan = translate_sql("SELECT a FROM t ORDER BY a + (SELECT b FROM u)")
+
+    key = BinaryOp(BinaryOperator.ADD, A, ir.ScalarSubquery(SUBQUERY_U_B))
+    assert plan == Project(ir.Sort(T, (ascending(key),)), (A,))
+
+
+def test_subquery_in_having() -> None:
+    plan = translate_sql(
+        "SELECT status FROM orders GROUP BY status HAVING COUNT(*) > (SELECT b FROM u)"
+    )
+
+    assert isinstance(plan, Project) and isinstance(plan.source, ir.Filter)
+    assert plan.source.condition == BinaryOp(
+        BinaryOperator.GREATER, Column(("_having_1",)), ir.ScalarSubquery(SUBQUERY_U_B)
+    )
+
+
+def test_subquery_can_use_a_cte() -> None:
+    condition = where_condition(
+        "WITH c AS (SELECT b FROM u) SELECT a FROM t WHERE a IN (SELECT b FROM c)"
+    )
+
+    named_c = ir.Named("c", U_B)
+    assert condition == ir.InSubquery(A, ir.Named("subquery", Project(named_c, (B,))))
+
+
+@pytest.mark.parametrize(
+    ("sql", "message"),
+    [
+        (
+            "SELECT a, a IN (SELECT b FROM u) AS x FROM t",
+            "IN (subquery) used as a value",
+        ),
+        (
+            "SELECT a FROM t WHERE a IN (SELECT b FROM u) OR c > 1",
+            "IN (subquery) used as a value",
+        ),
+        (
+            "SELECT a FROM t WHERE CASE WHEN a IN (SELECT b FROM u) THEN TRUE END",
+            "IN (subquery) used as a value",
+        ),
+        (
+            "SELECT a FROM t WHERE (a, c) IN (SELECT b, c FROM u)",
+            "IN (subquery) with several values",
+        ),
+        (
+            "SELECT a FROM t WHERE a IN (SELECT b, c FROM u)",
+            "IN (subquery) with 2 columns",
+        ),
+        (
+            "SELECT a FROM t WHERE a > (SELECT b, c FROM u)",
+            "subquery used as a value with 2 columns",
+        ),
+        (
+            "SELECT a FROM t WHERE a > ALL (SELECT b FROM u)",
+            "comparison with ALL (subquery)",
+        ),
+        (
+            "SELECT a FROM t WHERE a = ANY (SELECT b FROM u)",
+            "comparison with ANY (subquery)",
+        ),
+        ("SELECT (SELECT b FROM u) FROM t", "subquery without an alias"),
+        (
+            "SELECT t.a FROM t JOIN u ON t.a = u.b AND EXISTS (SELECT 1 FROM u)",
+            "subquery outside WHERE, HAVING, ORDER BY, and the SELECT list",
+        ),
+        (
+            "SELECT SUM((SELECT b FROM u)) AS s FROM t",
+            "subquery in an aggregate function",
+        ),
+        (
+            "SELECT RANK() OVER (ORDER BY (SELECT b FROM u)) AS r FROM t",
+            "subquery in a window function",
+        ),
+        (
+            "SELECT a, (SELECT b FROM u) AS x FROM t ORDER BY c",
+            "ORDER BY key that is not selected, in a query with window functions or "
+            "subqueries",
+        ),
+    ],
+)
+def test_unsupported_subquery(sql: str, message: str) -> None:
+    assert message in [issue for issue, _ in unsupported_issues(sql)]
+
+
+def test_issues_inside_subqueries_are_reported() -> None:
+    issues = unsupported_issues(
+        "SELECT a FROM t WHERE a IN (SELECT my_udf(b) AS x FROM u)"
+    )
+
+    assert issues == [("function MY_UDF", "MY_UDF(b)")]
+
+
+@pytest.mark.parametrize(
+    ("sql", "find", "message"),
+    [
+        ("SELECT a FROM t WHERE a IN (SELECT b FROM u)", exp.In, "IN with EXTRA"),
+        (
+            "SELECT a FROM t WHERE EXISTS (SELECT b FROM u)",
+            exp.Exists,
+            "EXISTS with EXTRA",
+        ),
+        (
+            "SELECT a FROM t WHERE a > (SELECT b FROM u)",
+            exp.Subquery,
+            "subquery with EXTRA",
+        ),
+    ],
+)
+def test_unknown_parts_of_subqueries_are_rejected(
+    sql: str, find: type[exp.Expression], message: str
+) -> None:
+    tree = parse_sql(sql)
+    tree.find(find).set("extra", exp.true())
+
+    with pytest.raises(UnsupportedSQLError) as caught:
+        translate(tree)
+
+    assert message in [issue.message for issue in caught.value.issues]
+
+
+def test_in_unnest_is_rejected() -> None:
+    issues = unsupported_issues("SELECT a FROM t WHERE a IN UNNEST([1, 2])", "bigquery")
+
+    assert [message for message, _ in issues] == ["IN with UNNEST"]

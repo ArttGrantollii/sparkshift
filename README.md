@@ -92,9 +92,10 @@ UnsupportedSQLError: 2 unsupported constructs:
 | `WITH` (CTEs, including column lists) and subqueries in `FROM` and `JOIN` | Supported |
 | `NATURAL`, semi, anti, and as-of joins; `LATERAL` and `APPLY` | Unsupported — rejected with an error |
 | `UNION [ALL]`, `INTERSECT [ALL]`, `EXCEPT [ALL]` and `MINUS`, with `ORDER BY`/`LIMIT` on the result | Supported |
-| `WITH RECURSIVE`, `UNION BY NAME`, `ORDER BY` expressions on a set operation, and subqueries in expressions | Unsupported — rejected with an error |
+| Subqueries in expressions: `IN`/`NOT IN (subquery)` as `WHERE`/`HAVING` conditions; `EXISTS`, `NOT EXISTS`, and subqueries used as values in `WHERE`, `HAVING`, `ORDER BY`, and the `SELECT` list; correlated references to the enclosing query | Supported |
+| `WITH RECURSIVE`, `UNION BY NAME`, `ORDER BY` expressions on a set operation, `ANY`/`ALL`/`SOME` comparisons, and row-value `IN (subquery)` | Unsupported — rejected with an error |
 | `GROUP BY` expressions, `ROLLUP`, `CUBE`, `GROUPING SETS`, `AVG(DISTINCT ...)` | Unsupported — rejected with an error |
-| `IN (subquery)`, `LIKE ... ESCAPE`, `IS TRUE`/`IS FALSE`, casts to `FLOAT`/`REAL`, `CHAR(n)`/`VARCHAR(n)`, unparameterized `DECIMAL`, and timestamps | Unsupported — rejected with an error |
+| `LIKE ... ESCAPE`, `IS TRUE`/`IS FALSE`, casts to `FLOAT`/`REAL`, `CHAR(n)`/`VARCHAR(n)`, unparameterized `DECIMAL`, and timestamps | Unsupported — rejected with an error |
 | Everything else, including `OFFSET`, user-defined functions, date formatting and parsing, and other functions | Unsupported — rejected with an error |
 
 Support grows feature by feature; see the [roadmap](ROADMAP.md).
@@ -148,6 +149,20 @@ when it differs from Spark's default, for example `.asc_nulls_last()`:
 The same applies to `ORDER BY` inside a window. An explicit `NULLS FIRST`
 or `NULLS LAST` always wins. A plain `ORDER BY` name means a `SELECT` alias
 before a same-named table column, as standard SQL specifies.
+
+### Subqueries and NULLs
+
+`x NOT IN (SELECT ...)` is never true when the subquery returns a NULL, so
+it returns no rows; and a row whose `x` is NULL never qualifies. SparkShift
+translates it with Spark's own subquery support (`~F.col("x").isin(subquery)`),
+which follows these rules, rather than a `left_anti` join, which does not.
+
+Used as a value rather than as a `WHERE` or `HAVING` condition (in the
+`SELECT` list, or inside `OR`), `IN (subquery)` is rejected: where SQL
+returns NULL, Spark returns false. `EXISTS` is never NULL, so it can be used
+anywhere. A correlated subquery must qualify the enclosing query's columns
+with its table name or alias, as in `o.customer_id = c.customer_id`, and can
+refer only to the query directly around it.
 
 ### Window frames
 

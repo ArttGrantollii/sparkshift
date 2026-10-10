@@ -264,8 +264,47 @@ class WindowCall:
     frame: WindowFrame | None = None
 
 
+@dataclass(frozen=True)
+class OuterColumn:
+    """A column of the enclosing query, used inside a correlated subquery, as
+    ``c.customer_id`` in ``EXISTS (... WHERE o.customer_id = c.customer_id)``.
+    It holds name parts, not a Column, so rewrites of the subquery's own
+    columns never touch it."""
+
+    name_parts: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class InSubquery:
+    """``expression IN (subquery)``: true if the subquery's single column has
+    an equal value; NULL rather than false when it has none but holds a
+    NULL."""
+
+    expression: "Expression"
+    query: "Relation"
+
+
+@dataclass(frozen=True)
+class Exists:
+    """``EXISTS (subquery)``: whether the subquery returns any row. Never NULL."""
+
+    query: "Relation"
+
+
+@dataclass(frozen=True)
+class ScalarSubquery:
+    """A subquery that returns one column and at most one row, used as a
+    value; NULL when it returns no row."""
+
+    query: "Relation"
+
+
 Expression: TypeAlias = (
     Column
+    | OuterColumn
+    | InSubquery
+    | Exists
+    | ScalarSubquery
     | Literal
     | BinaryOp
     | UnaryOp

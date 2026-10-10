@@ -268,7 +268,10 @@ class _Emitter:
                     # Grouping without aggregates is the distinct key values.
                     steps = [self.call("select", keys), self.call("distinct", [])]
                 elif not keys:
-                    steps = [self.call("agg", aggregates)]
+                    # One row for the whole input. select(...) rather than
+                    # agg(...): Spark cannot resolve agg's columns in a
+                    # subquery that refers to its enclosing query.
+                    steps = [self.call("select", aggregates)]
                 else:
                     steps = [self.call("groupBy", keys), self.call("agg", aggregates)]
                 return start, [*calls, *steps]
@@ -516,6 +519,16 @@ class _Emitter:
             case ir.Column(name_parts=parts):
                 self.uses_functions = True
                 return f"F.col({python_string(spark_identifier(parts))})", _ATOM
+            case ir.OuterColumn(name_parts=parts):
+                self.uses_functions = True
+                name = python_string(spark_identifier(parts))
+                return f"F.col({name}).outer()", _ATOM
+            case ir.InSubquery(expression=inner, query=query):
+                return self.method(inner, "isin", self.inline_relation(query)), _ATOM
+            case ir.Exists(query=query):
+                return f"{self.inline_relation(query)}.exists()", _ATOM
+            case ir.ScalarSubquery(query=query):
+                return f"{self.inline_relation(query)}.scalar()", _ATOM
             case ir.Literal(value=value):
                 self.uses_functions = True
                 return f"F.lit({self.python_value(value)})", _ATOM
@@ -716,8 +729,16 @@ def _walk(plan: ir.Relation) -> Iterator[ir.Relation]:
                 | ir.Limit(source=source)
             ):
                 yield from walk(source)
+        # Subqueries inside the relation's expressions are relations too.
+        for root in _roots(node):
+            for expression in _subexpressions(root):
+                if isinstance(expression, _SUBQUERY_TYPES):
+                    yield from walk(expression.query)
 
     return walk(plan)
+
+
+_SUBQUERY_TYPES = (ir.InSubquery, ir.Exists, ir.ScalarSubquery)
 
 
 def _unique_name(name: str, taken: set[str]) -> str:
@@ -769,20 +790,24 @@ def _expressions(plan: ir.Relation) -> Iterator[ir.Expression]:
     """Yield every expression in the plan and all their sub-expressions, from
     the source relation up, as the generated chain uses them."""
     for node in reversed(list(_walk(plan))):
-        roots: Sequence[ir.Expression] = ()
-        match node:
-            case ir.Join(condition=condition) if condition is not None:
-                roots = (condition,)
-            case ir.Filter(condition=condition):
-                roots = (condition,)
-            case ir.Aggregate(keys=keys, aggregates=aggregates):
-                roots = (*keys, *aggregates)
-            case ir.Project(items=items):
-                roots = items
-            case ir.Sort(keys=sort_keys):
-                roots = tuple(key.expression for key in sort_keys)
-        for root in roots:
+        for root in _roots(node):
             yield from _subexpressions(root)
+
+
+def _roots(node: ir.Relation) -> Sequence[ir.Expression]:
+    """The expressions a relation computes directly (not those of its sources)."""
+    match node:
+        case ir.Join(condition=condition) if condition is not None:
+            return (condition,)
+        case ir.Filter(condition=condition):
+            return (condition,)
+        case ir.Aggregate(keys=keys, aggregates=aggregates):
+            return (*keys, *aggregates)
+        case ir.Project(items=items):
+            return items
+        case ir.Sort(keys=sort_keys):
+            return tuple(key.expression for key in sort_keys)
+    return ()
 
 
 def _subexpressions(expression: ir.Expression) -> Iterator[ir.Expression]:
