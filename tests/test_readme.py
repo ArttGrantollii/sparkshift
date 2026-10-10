@@ -32,6 +32,17 @@ def test_command_line_example_matches_real_output(
     assert f"```python\n{capsys.readouterr().out}```" in README
 
 
+def test_coverage_report_example_matches_real_output(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(Path(__file__).parents[1])
+
+    assert main(["report", "examples/coverage"]) == 0
+
+    assert "sparkshift report examples/coverage\n" in README
+    assert f"```text\n{capsys.readouterr().out}```" in README
+
+
 def test_unsupported_example_matches_real_error() -> None:
     with pytest.raises(sparkshift.UnsupportedSQLError) as caught:
         sparkshift.convert(

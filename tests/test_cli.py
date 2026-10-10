@@ -2,11 +2,13 @@
 
 import importlib
 import io
+import json
 import os
 import runpy
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -14,6 +16,14 @@ import pytest
 import sparkshift
 from sparkshift.cli import EXIT_CONVERTED, EXIT_NOT_CONVERTED, EXIT_USAGE, main
 from sparkshift.diagnostics import ConversionResult, Diagnostic
+from sparkshift.report import (
+    Report,
+    assess,
+    to_json,
+    to_markdown,
+    to_text,
+    unreadable,
+)
 
 SQL = "SELECT order_id, amount * 2 AS doubled FROM orders WHERE status = 'paid'"
 CODE = sparkshift.convert(SQL).code
@@ -371,3 +381,122 @@ def test_unwritable_output_directory_is_a_usage_error(
     err = usage_error(["convert", str(queries), "-o", str(output)], capsys)
 
     assert f"cannot write {output / 'a_orders.py'}" in err
+
+
+# --- Coverage reports ----------------------------------------------------------
+
+
+def _report_of(queries: Path, dialect: str | None = None) -> Report:
+    """The report the command should produce for the queries fixture."""
+    return Report(
+        str(queries),
+        dialect,
+        (
+            assess("a_orders.sql", SQL, dialect),
+            assess("c_bad.sql", "SELECT my_udf(a) AS x FROM t", dialect),
+            unreadable("d_latin1.sql", "it is not UTF-8 text"),
+            assess("reports/b_customers.sql", "SELECT name FROM customers", dialect),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("arguments", "render"),
+    [([], to_text), (["--format", "markdown"], to_markdown), (["-f", "json"], to_json)],
+)
+def test_report_on_a_directory(
+    queries: Path,
+    capsys: pytest.CaptureFixture[str],
+    arguments: list[str],
+    render: Callable[[Report], str],
+) -> None:
+    assert main(["report", str(queries), *arguments]) == EXIT_CONVERTED
+
+    out, err = capsys.readouterr()
+    assert out == render(_report_of(queries))
+    assert err == ""
+
+
+def test_report_on_one_file_with_a_dialect(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "top.sql"
+    path.write_text("SELECT TOP 2 name FROM customers", encoding="utf-8")
+
+    assert main(["report", str(path), "-d", "tsql", "-f", "json"]) == EXIT_CONVERTED
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["dialect"] == "tsql"
+    assert data["files"] == [
+        {"path": str(path), "status": "converted", "findings": [], "error": None}
+    ]
+
+
+def test_report_writes_the_output_file(
+    queries: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "reports" / "coverage.md"
+
+    assert main(["report", str(queries), "-f", "markdown", "-o", str(output)]) == 0
+
+    assert output.read_text(encoding="utf-8") == to_markdown(_report_of(queries))
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize(
+    ("threshold", "exit_code"),
+    [("0", 0), ("50", 0), ("50.1", 1), ("100", 1)],
+)
+def test_report_fail_under(
+    queries: Path, capsys: pytest.CaptureFixture[str], threshold: str, exit_code: int
+) -> None:
+    # Two of the four files convert: exactly 50%.
+    assert main(["report", str(queries), "--fail-under", threshold]) == exit_code
+
+    err = capsys.readouterr().err
+    if exit_code:
+        assert err == (
+            f"sparkshift: converted 2 of 4 files (50.0%), "
+            f"below --fail-under {float(threshold):g}%\n"
+        )
+    else:
+        assert err == ""
+
+
+def test_fail_under_compares_exact_shares(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = tmp_path / "queries"
+    source.mkdir()
+    for name, sql in [("a", SQL), ("b", SQL), ("c", "SELECT my_udf(a) AS x FROM t")]:
+        (source / f"{name}.sql").write_text(sql, encoding="utf-8")
+
+    # 2 of 3 is 66.666...%: shown rounded as 66.7%, yet below 66.67.
+    arguments = ["report", str(source), "--fail-under", "66.67"]
+    assert main(arguments) == EXIT_NOT_CONVERTED
+    assert "(66.7%), below --fail-under 66.67%" in capsys.readouterr().err
+    assert main([*arguments[:-1], "66.66"]) == EXIT_CONVERTED
+
+
+@pytest.mark.parametrize("threshold", ["-1", "100.5", "lots"])
+def test_report_rejects_bad_thresholds(
+    queries: Path, capsys: pytest.CaptureFixture[str], threshold: str
+) -> None:
+    usage_error(["report", str(queries), "--fail-under", threshold], capsys)
+
+
+def test_report_usage_errors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = tmp_path / "missing"
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    err = usage_error(["report", str(missing)], capsys)
+    assert f"cannot read {missing}: no such file or directory" in err
+
+    err = usage_error(["report", str(empty)], capsys)
+    assert f"no .sql files in {empty}" in err
+
+    err = usage_error(["report", str(empty), "-f", "html"], capsys)
+    assert "invalid choice: 'html'" in err

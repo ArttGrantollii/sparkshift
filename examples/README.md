@@ -25,3 +25,6 @@ The generated files are produced by the command line, one folder per dialect:
 ```bash
 uv run python examples/regenerate.py
 ```
+
+[coverage/](coverage/README.md) is different: a small mixed workload, not all
+of it convertible, for trying `sparkshift report`.

@@ -38,6 +38,8 @@ flowchart LR
 | Middle | `ir.py` | SparkShift's own description of DataFrame operations ([ADR 0003](adr/0003-introduce-a-small-ir.md)) |
 | Backend | `emit.py` | IR → readable PySpark source |
 | Entry point | `api.py` | `convert(sql, dialect)` runs the stages in order |
+| Analysis | `report.py` | Calls `convert` for many files and summarizes the outcomes: pure functions and data, with text, Markdown, and JSON formats; it reads no files |
+| Command line | `cli.py` | Reads and writes files, and calls `convert` or `report` |
 
 Only `parsing.py` and `translate.py` may import SQLGlot; the IR and emitter
 never depend on it. Both rules are enforced by `tests/test_architecture.py`.

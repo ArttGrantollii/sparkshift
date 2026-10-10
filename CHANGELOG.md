@@ -154,6 +154,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `QUALIFY`, in aggregate queries, and, in Snowflake, when it names a `SELECT`
   alias, which Snowflake reads as a table column if one exists. A Snowflake
   example in the gallery shows it.
+- `sparkshift report`: a coverage report for a SQL file or directory, as
+  text, Markdown, or JSON. It gives every file one status (converted, with
+  warnings, not converted, invalid SQL, or unreadable) and ranks the
+  constructs that block conversion by the number of files they block, with
+  hints and example files. `--fail-under PERCENT` makes it usable as a CI
+  gate. A sample workload is in `examples/coverage`.
 
 ### Changed
 

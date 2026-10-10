@@ -106,6 +106,59 @@ and 2 for a usage error such as a missing file or an unknown dialect.
 `python -m sparkshift` works the same way. In a development checkout, run it
 as `uv run sparkshift`.
 
+## Coverage report
+
+Before a migration, `sparkshift report` tells you how much of a set of SQL
+files converts and which constructs block the rest, without writing any code:
+
+```bash
+sparkshift report queries/ --dialect snowflake          # summary for the terminal
+sparkshift report queries/ -f markdown -o coverage.md   # tables for a pull request or wiki
+sparkshift report queries/ -f json                      # for other tools
+sparkshift report queries/ --fail-under 90              # exit 1 below 90% converted, for CI
+```
+
+For example, on the small mixed workload in
+[examples/coverage](examples/coverage):
+
+```bash
+sparkshift report examples/coverage
+```
+
+<!-- Exact SparkShift output, checked by tests/test_readme.py. -->
+```text
+SparkShift coverage report: examples/coverage (generic SQL)
+
+Files            7
+Converted        2  28.6%
+  with warnings  0   0.0%
+Not converted    4  57.1%
+Invalid SQL      1  14.3%
+Unreadable       0   0.0%
+
+What blocks conversion
+Construct                       Files  Occurrences
+function MY_UDF                     2            2
+OFFSET clause                       2            2
+several statements in one file      1            1
+
+Invalid SQL
+  customers/unfinished.sql: Incomplete WHERE near 'WHERE' (line 3, column 1)
+
+Hints and example files: --format markdown or --format json.
+```
+
+Every file gets exactly one status: converted, converted with warnings, not
+converted, invalid SQL, or unreadable. Blockers are ranked by the number of
+files they block, then by how often they occur, so the first rows are the
+rewrites that unblock the most files. The Markdown and JSON reports add each
+blocker's hint, an example file, and every file's status. The JSON has a
+`version` field; its status counts are separate and add up to `files`, and
+`converted_percent` includes the files converted with warnings.
+
+The exit status is 0 when the report is produced, whatever it finds; 1 only
+when `--fail-under` is given and fewer files convert; and 2 for a usage error.
+
 ## Playground
 
 The [playground](https://arttgrantollii.github.io/sparkshift/) runs SparkShift entirely in the browser, with
