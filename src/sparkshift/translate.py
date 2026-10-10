@@ -93,8 +93,17 @@ _ORDERED_WINDOW_FUNCTIONS = frozenset(
 _VALUE_WINDOW_FUNCTIONS = frozenset({"FIRST_VALUE", "LAST_VALUE"})
 _WINDOW_PLACE_HINT = (
     "Window functions are supported in the SELECT list of queries without "
-    "GROUP BY, with an alias."
+    "GROUP BY, with an alias, and in QUALIFY."
 )
+
+# Dialects whose databases have no QUALIFY clause, which SQLGlot parses anyway.
+_NO_QUALIFY_DIALECTS = {
+    "tsql": "T-SQL",
+    "postgres": "PostgreSQL",
+    "mysql": "MySQL",
+    "oracle": "Oracle",
+}
+_QUALIFY_PREFIX = "_qualify"
 
 _GROUP_PART_NAMES = {
     "grouping_sets": "GROUPING SETS",
@@ -627,6 +636,7 @@ class _Translator:
         condition: ir.Expression | None = None
         group: exp.Group | None = None
         having: exp.Having | None = None
+        qualify: exp.Qualify | None = None
         order: exp.Order | None = None
         distinct = False
         limit: int | None = None
@@ -663,6 +673,8 @@ class _Translator:
                 group = value
             elif part == "having":
                 having = value
+            elif part == "qualify":
+                qualify = value
             elif part == "order":
                 order = value
             elif part == "distinct":
@@ -678,6 +690,13 @@ class _Translator:
 
         if source is None or items is None or failed:
             return None
+
+        qualified: tuple[ir.Expression, tuple[ir.Alias, ...]] | None = None
+        if qualify is not None:
+            qualified = self.qualify(qualify, select, items, aggregating)
+            if qualified is None:
+                return None
+        helpers = qualified[1] if qualified is not None else ()
 
         keys: list[_OrderKey] = []
         if order is not None:
@@ -701,9 +720,11 @@ class _Translator:
                         hint="With DISTINCT, order by selected columns or aliases.",
                     )
             return None
-        if not sort_output and any(_regroups(item) for item in items):
+        regroups = qualify is not None or any(_regroups(item) for item in items)
+        if not sort_output and regroups:
             # Sorting before the projection would not survive it: computing a
-            # window or a subquery can regroup the rows.
+            # window or a subquery can regroup the rows. (QUALIFY always
+            # filters on a window.)
             for key in keys:
                 if key.output is None:
                     self.unsupported(
@@ -716,22 +737,29 @@ class _Translator:
 
         # Build the plan in SQL's logical evaluation order, not the order the
         # clauses are written in: FROM (and joins), WHERE, GROUP BY, HAVING,
-        # SELECT, DISTINCT, ORDER BY, LIMIT.
+        # SELECT (computing window functions), QUALIFY, DISTINCT, ORDER BY,
+        # LIMIT.
         relation: ir.Relation | None = source
         if condition is not None:
             relation = ir.Filter(source, condition)
         if aggregating:
             early = [] if sort_output else keys
             relation = self.aggregation(select, relation, items, group, having, early)
-        elif items != (ir.Star(),):
+        elif items != (ir.Star(),) or helpers:
             if not sort_output:
                 # Sorting before a projection keeps the order, as Spark SQL
                 # itself does for keys that are not selected.
                 sort_keys = tuple(_sort_key(key, key.expression) for key in keys)
                 relation = ir.Sort(relation, sort_keys)
-            relation = ir.Project(relation, items)
+            relation = ir.Project(relation, (*items, *helpers))
         if relation is None:
             return None
+        if qualified is not None:
+            # Window functions cannot be used in a filter, so the ones QUALIFY
+            # needs are computed as helper columns first and dropped after.
+            relation = ir.Filter(relation, qualified[0])
+            if helpers:
+                relation = ir.DropColumns(relation, tuple(h.name for h in helpers))
         if distinct:
             relation = ir.Distinct(relation)
         if keys and sort_output:
@@ -989,6 +1017,142 @@ class _Translator:
             )
             return None
         return int(count.this) if supported else None
+
+    def qualify(
+        self,
+        qualify: exp.Qualify,
+        select: exp.Select,
+        items: tuple[ir.Expression, ...],
+        aggregating: bool,
+    ) -> tuple[ir.Expression, tuple[ir.Alias, ...]] | None:
+        """Translate QUALIFY into a condition on the SELECT list's output and
+        the helper columns it needs: window functions and input columns the
+        SELECT list does not output.
+
+        QUALIFY filters rows after window functions are computed and before
+        DISTINCT, so the condition runs on the projection's result.
+        """
+        if self.dialect in _NO_QUALIFY_DIALECTS:
+            name = _NO_QUALIFY_DIALECTS[self.dialect]
+            self.unsupported(
+                f"QUALIFY clause in {name}",
+                qualify,
+                hint=f"{name} has no QUALIFY clause. Compute the window function "
+                "in a CTE and filter on it with WHERE.",
+            )
+            return None
+        if aggregating:
+            self.unsupported(
+                "QUALIFY in an aggregate query",
+                qualify,
+                hint="Window functions over grouped rows are not supported yet; "
+                "aggregate in a CTE and apply QUALIFY in the outer query.",
+            )
+            return None
+        if not qualify.find(exp.Window) and not any(map(_has_window, items)):
+            self.unsupported(
+                "QUALIFY without a window function",
+                qualify,
+                hint="QUALIFY filters on window functions; use WHERE for other "
+                "conditions.",
+            )
+            return None
+
+        issues_before = len(self.issues)
+        names = _output_names(items)
+        self.check_qualify_names(qualify, items, names)
+        outside = self.no_windows
+        self.no_windows = None
+        try:
+            condition = self.expression_without_aggregates(qualify.this, "QUALIFY")
+        finally:
+            self.no_windows = outside
+        if condition is None or len(self.issues) > issues_before:
+            return None
+
+        # Every input column is an output column too.
+        all_columns = ir.Star() in items
+        helpers: list[ir.Alias] = []
+
+        def output(expression: ir.Expression) -> ir.Expression | None:
+            """The expression in terms of the projection's output columns, or
+            None to look inside it."""
+            if isinstance(expression, ir.Column) and len(expression.name_parts) == 1:
+                # A plain name means a SELECT item of that name first, as in
+                # Spark and BigQuery (see check_qualify_names).
+                wanted = expression.name_parts[0].lower()
+                for name in names:
+                    if name is not None and name.lower() == wanted:
+                        return ir.Column((name,))
+                if all_columns:
+                    return expression
+            for item, name in zip(items, names, strict=True):
+                if name is not None and _source_expression(item) == expression:
+                    return ir.Column((name,))
+            if not isinstance(expression, ir.WindowCall | ir.Column):
+                return None
+            for helper in helpers:
+                if helper.expression == expression:
+                    return ir.Column((helper.name,))
+            helpers.append(
+                ir.Alias(expression, f"{_QUALIFY_PREFIX}_{len(helpers) + 1}")
+            )
+            return ir.Column((helpers[-1].name,))
+
+        return _rewrite(condition, output), tuple(helpers)
+
+    def check_qualify_names(
+        self,
+        qualify: exp.Qualify,
+        items: tuple[ir.Expression, ...],
+        names: list[str | None],
+    ) -> None:
+        """Reject QUALIFY names whose meaning depends on the table schema.
+
+        A plain name in QUALIFY can mean a SELECT item or a column of the
+        input. Spark reports a name that could be both as ambiguous, so in a
+        query it runs, the name means the SELECT item. Snowflake instead reads
+        it as the input column when the table has one, which SparkShift cannot
+        know. Inside a window function, the name would be computed before the
+        SELECT list exists.
+        """
+        for column in qualify.this.find_all(exp.Column):
+            if column.table or isinstance(column.this, exp.Star):
+                continue
+            wanted = column.name.lower()
+            matches = [
+                index
+                for index, name in enumerate(names)
+                if name is not None and name.lower() == wanted
+            ]
+            if len(matches) > 1:
+                self.unsupported(
+                    "QUALIFY name that matches several SELECT items",
+                    column,
+                    hint="Rename the items.",
+                )
+                continue
+            if not matches:
+                continue
+            plain = _plain_column(items[matches[0]])
+            if plain is not None and plain[0].name_parts[-1].lower() == wanted:
+                continue  # the input column itself, under its own name
+            in_window = isinstance(
+                column.find_ancestor(exp.Window, exp.Qualify), exp.Window
+            )
+            if in_window:
+                self.unsupported(
+                    "SELECT alias inside a window function in QUALIFY",
+                    column,
+                    hint="Repeat the aliased expression.",
+                )
+            elif self.dialect == "snowflake":
+                self.unsupported(
+                    "QUALIFY reference to a SELECT alias",
+                    column,
+                    hint="Snowflake reads this name as a table column if the "
+                    "table has one; repeat the aliased expression in QUALIFY.",
+                )
 
     def from_(self, select: exp.Select) -> ir.Relation | None:
         from_ = select.args.get("from_")
@@ -1905,7 +2069,8 @@ class _Translator:
         if isinstance(node.this, exp.Tuple):
             self.unsupported("IN (subquery) with several values", node)
             return None
-        if id(node) not in self.filtering_in_subqueries:
+        # Where no subquery is allowed, subquery_relation says so instead.
+        if self.no_subqueries is None and id(node) not in self.filtering_in_subqueries:
             self.unsupported(
                 "IN (subquery) used as a value",
                 node,

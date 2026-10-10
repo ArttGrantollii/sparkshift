@@ -18,6 +18,7 @@ import test_filtering
 import test_functions
 import test_joins
 import test_ordering
+import test_qualify
 import test_set_operations
 import test_subqueries
 import test_windows
@@ -36,6 +37,7 @@ MODULES = [
     test_dates,
     test_ordering,
     test_windows,
+    test_qualify,
     test_ctes,
     test_set_operations,
     test_subqueries,

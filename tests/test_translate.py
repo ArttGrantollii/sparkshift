@@ -310,8 +310,11 @@ def test_issues_inside_one_expression_are_all_reported() -> None:
         ("SELECT 1", None, ("SELECT without FROM", "SELECT 1")),
         (
             "SELECT * FROM t QUALIFY ROW_NUMBER() OVER (ORDER BY a) = 1",
-            "snowflake",
-            ("QUALIFY clause", "QUALIFY ROW_NUMBER() OVER (ORDER BY a) = 1"),
+            "postgres",
+            (
+                "QUALIFY clause in PostgreSQL",
+                "QUALIFY ROW_NUMBER() OVER (ORDER BY a) = 1",
+            ),
         ),
     ],
 )
@@ -3207,3 +3210,193 @@ def test_in_unnest_is_rejected() -> None:
     issues = unsupported_issues("SELECT a FROM t WHERE a IN UNNEST([1, 2])", "bigquery")
 
     assert [message for message, _ in issues] == ["IN with UNNEST"]
+
+
+# --- QUALIFY -----------------------------------------------------------------
+
+ROW_NUMBER_BY_B = "ROW_NUMBER() OVER (PARTITION BY a ORDER BY b)"
+
+
+def _window(dialect: str | None = None) -> ir.WindowCall:
+    return window_item(f"SELECT {ROW_NUMBER_BY_B} AS r FROM t", dialect)
+
+
+def _helper(n: int) -> Column:
+    return Column((f"_qualify_{n}",))
+
+
+@pytest.mark.parametrize("dialect", [None, "snowflake", "bigquery"])
+def test_qualify_filters_on_a_helper_column_it_then_drops(dialect: str | None) -> None:
+    plan = translate_sql(f"SELECT a, b FROM t QUALIFY {ROW_NUMBER_BY_B} = 1", dialect)
+
+    assert plan == ir.DropColumns(
+        ir.Filter(
+            Project(TableScan(("t",)), (A, B, Alias(_window(dialect), "_qualify_1"))),
+            BinaryOp(BinaryOperator.EQUAL, _helper(1), Literal(1)),
+        ),
+        ("_qualify_1",),
+    )
+
+
+def test_qualify_on_a_window_alias_needs_no_helper() -> None:
+    plan = translate_sql(f"SELECT a, {ROW_NUMBER_BY_B} AS rn FROM t QUALIFY rn = 1")
+
+    assert plan == ir.Filter(
+        Project(TableScan(("t",)), (A, Alias(_window(), "rn"))),
+        BinaryOp(BinaryOperator.EQUAL, Column(("rn",)), Literal(1)),
+    )
+
+
+def test_qualify_reuses_a_selected_window_and_renamed_column() -> None:
+    plan = translate_sql(
+        f"SELECT a AS x, {ROW_NUMBER_BY_B} AS rn FROM t "
+        f"QUALIFY {ROW_NUMBER_BY_B} = 1 AND a > 0"
+    )
+
+    assert isinstance(plan, ir.Filter)
+    assert plan.condition == BinaryOp(
+        BinaryOperator.AND,
+        BinaryOp(BinaryOperator.EQUAL, Column(("rn",)), Literal(1)),
+        BinaryOp(BinaryOperator.GREATER, Column(("x",)), Literal(0)),
+    )
+
+
+def test_unselected_columns_become_helpers_once() -> None:
+    plan = translate_sql(
+        f"SELECT a FROM t QUALIFY {ROW_NUMBER_BY_B} = 1 AND t.c > 0 AND t.c < 9"
+    )
+
+    assert isinstance(plan, ir.DropColumns)
+    assert plan.names == ("_qualify_1", "_qualify_2")
+    assert isinstance(plan.source, ir.Filter)
+    projection = plan.source.source
+    assert isinstance(projection, Project)
+    assert projection.items[1:] == (
+        Alias(_window(), "_qualify_1"),
+        Alias(Column(("t", "c")), "_qualify_2"),
+    )
+
+
+def test_select_star_with_qualify_keeps_plain_names() -> None:
+    plan = translate_sql(f"SELECT * FROM t QUALIFY {ROW_NUMBER_BY_B} = 1 AND c > 0")
+
+    assert isinstance(plan, ir.DropColumns)
+    assert isinstance(plan.source, ir.Filter)
+    projection = plan.source.source
+    assert projection == Project(
+        TableScan(("t",)), (Star(), Alias(_window(), "_qualify_1"))
+    )
+    assert plan.source.condition == BinaryOp(
+        BinaryOperator.AND,
+        BinaryOp(BinaryOperator.EQUAL, _helper(1), Literal(1)),
+        BinaryOp(BinaryOperator.GREATER, C, Literal(0)),
+    )
+
+
+def test_qualify_runs_before_distinct_order_by_and_limit() -> None:
+    plan = translate_sql(
+        f"SELECT DISTINCT a FROM t WHERE b > 0 QUALIFY {ROW_NUMBER_BY_B} = 1 "
+        "ORDER BY a LIMIT 5"
+    )
+
+    steps = []
+    node: ir.Relation = plan
+    while not isinstance(node, TableScan):
+        steps.append(type(node).__name__)
+        node = node.source  # type: ignore[union-attr]
+    assert steps == [
+        "Limit",
+        "Sort",
+        "Distinct",
+        "DropColumns",
+        "Filter",
+        "Project",
+        "Filter",
+    ]
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # The selected column itself, under its own name.
+        f"SELECT a, b FROM t QUALIFY a > 0 AND {ROW_NUMBER_BY_B} = 1",
+        f"SELECT a AS a FROM t QUALIFY a > 0 AND {ROW_NUMBER_BY_B} = 1",
+        f"SELECT t.a FROM t QUALIFY a > 0 AND {ROW_NUMBER_BY_B} = 1",
+        # Not a SELECT item at all.
+        f"SELECT a FROM t QUALIFY c > 0 AND {ROW_NUMBER_BY_B} = 1",
+    ],
+)
+def test_snowflake_qualify_allows_names_that_mean_the_same(sql: str) -> None:
+    translate_sql(sql, "snowflake")  # raises if rejected
+
+
+@pytest.mark.parametrize(
+    ("sql", "dialect", "message"),
+    [
+        *(
+            (
+                f"SELECT a FROM t QUALIFY {ROW_NUMBER_BY_B} = 1",
+                dialect,
+                f"QUALIFY clause in {name}",
+            )
+            for dialect, name in [
+                ("tsql", "T-SQL"),
+                ("postgres", "PostgreSQL"),
+                ("mysql", "MySQL"),
+                ("oracle", "Oracle"),
+            ]
+        ),
+        (
+            "SELECT a, COUNT(*) AS n FROM t GROUP BY a "
+            "QUALIFY RANK() OVER (ORDER BY a) = 1",
+            None,
+            "QUALIFY in an aggregate query",
+        ),
+        ("SELECT a FROM t QUALIFY a > 1", None, "QUALIFY without a window function"),
+        (
+            f"SELECT a, {ROW_NUMBER_BY_B} AS rn FROM t QUALIFY rn = 1",
+            "snowflake",
+            "QUALIFY reference to a SELECT alias",
+        ),
+        (
+            "SELECT b + 1 AS x FROM t QUALIFY ROW_NUMBER() OVER (ORDER BY x) = 1",
+            None,
+            "SELECT alias inside a window function in QUALIFY",
+        ),
+        (
+            f"SELECT a AS x, b AS x, {ROW_NUMBER_BY_B} AS rn FROM t QUALIFY x = 1",
+            None,
+            "QUALIFY name that matches several SELECT items",
+        ),
+        (
+            f"SELECT a, {ROW_NUMBER_BY_B} AS rn FROM t QUALIFY SUM(a) > 1",
+            None,
+            "aggregate function SUM in QUALIFY",
+        ),
+        (
+            f"SELECT a FROM t QUALIFY {ROW_NUMBER_BY_B} = 1 AND a IN (SELECT a FROM u)",
+            None,
+            "subquery outside WHERE, HAVING, ORDER BY, and the SELECT list",
+        ),
+        (
+            f"SELECT a FROM t QUALIFY {ROW_NUMBER_BY_B} = 1 ORDER BY b",
+            None,
+            "ORDER BY key that is not selected, in a query with window functions "
+            "or subqueries",
+        ),
+    ],
+)
+def test_unsupported_qualify(sql: str, dialect: str | None, message: str) -> None:
+    assert message in [message for message, _ in unsupported_issues(sql, dialect)]
+
+
+def test_every_qualify_issue_is_reported() -> None:
+    issues = unsupported_issues(
+        f"SELECT a, {ROW_NUMBER_BY_B} AS rn FROM t QUALIFY rn = 1 AND my_udf(a) = 2",
+        "snowflake",
+    )
+
+    assert [message for message, _ in issues] == [
+        "QUALIFY reference to a SELECT alias",
+        "function MY_UDF",
+    ]

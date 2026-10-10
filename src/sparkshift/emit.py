@@ -239,6 +239,10 @@ class _Emitter:
                 start, calls = self.chain(source)
                 renamed = self.call("toDF", [python_string(name) for name in names])
                 return start, [*calls, renamed]
+            case ir.DropColumns(source=source, names=names):
+                start, calls = self.chain(source)
+                dropped = self.call("drop", [python_string(name) for name in names])
+                return start, [*calls, dropped]
             case ir.RelationAlias(source=source, name=name):
                 if self.is_redundant_alias(source, name):
                     return self.chain(source)
@@ -706,6 +710,7 @@ def _walk(plan: ir.Relation) -> Iterator[ir.Relation]:
                 yield from walk(right)
             case (
                 ir.RenameColumns(source=source)
+                | ir.DropColumns(source=source)
                 | ir.RelationAlias(source=source)
                 | ir.Filter(source=source)
                 | ir.Aggregate(source=source)

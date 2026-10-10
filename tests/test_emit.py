@@ -1397,6 +1397,21 @@ def test_rename_columns_requires_names() -> None:
         ir.RenameColumns(TableScan(("t",)), ())
 
 
+def test_dropped_columns_are_named() -> None:
+    one = ir.DropColumns(TableScan(("t",)), ("_qualify_1",))
+    two = ir.DropColumns(TableScan(("t",)), ("_qualify_1", "_qualify_2"))
+
+    assert emit(one).endswith('    .drop("_qualify_1")\n)\n')
+    assert emit(two).endswith(
+        '    .drop(\n        "_qualify_1",\n        "_qualify_2",\n    )\n)\n'
+    )
+
+
+def test_drop_columns_requires_names() -> None:
+    with pytest.raises(ValueError, match="at least one name"):
+        ir.DropColumns(TableScan(("t",)), ())
+
+
 # --- Set operations ----------------------------------------------------------
 
 T_ONLY = TableScan(("t",))

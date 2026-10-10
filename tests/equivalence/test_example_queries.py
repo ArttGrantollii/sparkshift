@@ -47,6 +47,13 @@ REFERENCES: dict[str, tuple[str | None, list[str] | None]] = {
         "WHERE o.customer_id = c.customer_id) ORDER BY c.name NULLS LAST",
         ["name"],
     ),
+    "snowflake/latest_order_per_customer": (
+        "SELECT customer_id, order_id, order_date, amount FROM orders "
+        "QUALIFY ROW_NUMBER() OVER (PARTITION BY customer_id "
+        "ORDER BY order_date DESC NULLS FIRST, order_id DESC NULLS FIRST) = 1 "
+        "ORDER BY customer_id NULLS LAST",
+        ["customer_id"],
+    ),
     "bigquery/monthly_revenue": (
         "SELECT month, SUM(amount) AS revenue, "
         "COUNT(DISTINCT customer_id) AS customers FROM (SELECT "

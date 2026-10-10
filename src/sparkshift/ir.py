@@ -394,6 +394,18 @@ class RenameColumns:
 
 
 @dataclass(frozen=True)
+class DropColumns:
+    """Remove columns by name, such as helper columns a filter needed."""
+
+    source: "Relation"
+    names: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.names:
+            raise ValueError("DropColumns needs at least one name")
+
+
+@dataclass(frozen=True)
 class RelationAlias:
     """Give a relation a name that qualified columns can refer to, as in
     ``FROM customers c`` followed by ``c.name``."""
@@ -530,6 +542,7 @@ Relation: TypeAlias = (
     TableScan
     | Named
     | RenameColumns
+    | DropColumns
     | RelationAlias
     | Join
     | Filter

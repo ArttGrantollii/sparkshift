@@ -9,8 +9,8 @@ Convert SQL into readable, idiomatic, tested PySpark DataFrame code.
 never leaves your browser.
 
 > **Status: pre-release.** SparkShift converts `SELECT` queries, including
-> joins, aggregation, ordering, window functions, CTEs, set operations, and
-> subqueries, from generic SQL and six dialects (see below). Everything else
+> joins, aggregation, ordering, window functions and `QUALIFY`, CTEs, set
+> operations, and subqueries, from generic SQL and six dialects (see below). Everything else
 > is rejected with a clear error. See [ROADMAP.md](ROADMAP.md) for what is
 > planned.
 
@@ -157,7 +157,8 @@ the same result as its SQL on Apache Spark.
 | `DATE_TRUNC` to year, quarter, month; `CURRENT_DATE`, `CURRENT_TIMESTAMP`; casts to timestamp types | Supported, with dialect rules below |
 | Window functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, and `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` `OVER (PARTITION BY ... ORDER BY ...)` | Supported in the `SELECT` list of queries without `GROUP BY` |
 | Window frames: `ROWS BETWEEN` with `UNBOUNDED`, `n PRECEDING`, `CURRENT ROW`, `n FOLLOWING`; `RANGE BETWEEN` with `UNBOUNDED` and `CURRENT ROW`; `IGNORE NULLS` for `FIRST_VALUE`/`LAST_VALUE` | Supported |
-| `NTH_VALUE`, `RANGE` frames with offsets, `GROUPS` frames, `EXCLUDE`, `IGNORE NULLS` for `LAG`/`LEAD`, named windows, `QUALIFY`, and windows in aggregate queries | Unsupported — rejected with an error |
+| `QUALIFY` on window functions, `SELECT` aliases, and columns | Supported in generic SQL, Snowflake, and BigQuery, in queries without `GROUP BY`; filters after the window functions and before `DISTINCT`, `ORDER BY`, and `LIMIT` |
+| `NTH_VALUE`, `RANGE` frames with offsets, `GROUPS` frames, `EXCLUDE`, `IGNORE NULLS` for `LAG`/`LEAD`, named windows, and windows (including `QUALIFY`) in aggregate queries | Unsupported — rejected with an error |
 | `WITH` (CTEs, including column lists) and subqueries in `FROM` and `JOIN` | Supported |
 | `NATURAL`, semi, anti, and as-of joins; `LATERAL` and `APPLY` | Unsupported — rejected with an error |
 | `UNION [ALL]`, `INTERSECT [ALL]`, `EXCEPT [ALL]` and `MINUS`, with `ORDER BY`/`LIMIT` on the result | Supported |
@@ -286,6 +287,9 @@ rejects it rather than guess:
 | `FIRST_VALUE`, `LAST_VALUE` with `ORDER BY` but no frame | BigQuery | The default frame is not documented. |
 | `RANGE BETWEEN 5 PRECEDING AND ...` | All | The offset is measured in the `ORDER BY` column's type (a number, or an interval for dates), which only the schema would tell. |
 | `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `LAG`, `LEAD` without `ORDER BY` | PostgreSQL, MySQL, others | The result depends on an arbitrary row order, and Spark requires an `ORDER BY`. |
+| `QUALIFY` | T-SQL, PostgreSQL, MySQL, Oracle | These databases have no `QUALIFY` clause. |
+| `QUALIFY` referring to a `SELECT` alias (`QUALIFY rn = 1`) | Snowflake | Snowflake reads the name as a table column when the table has one, which only the schema would tell; repeat the window function instead. Spark reports a name that could be both as ambiguous, and BigQuery's documentation filters on aliases, so there the name means the alias. |
+| A `SELECT` alias inside a window function in `QUALIFY` | All | The window is computed before the `SELECT` list's aliases exist. |
 
 ### Known limitations
 
@@ -316,9 +320,12 @@ rejects it rather than guess:
 - `ROW_NUMBER()` numbers rows that tie on the window's `ORDER BY` in an
   arbitrary order, in Spark as in every database. Add a unique column to the
   window's `ORDER BY` for repeatable results.
-- In a query with window functions, `ORDER BY` must use selected columns or
-  aliases: computing a window regroups the rows, so sorting earlier would
-  not last.
+- In a query with window functions or `QUALIFY`, `ORDER BY` must use selected
+  columns or aliases: computing a window regroups the rows, so sorting earlier
+  would not last.
+- `QUALIFY` is converted with a helper column (`_qualify_1`, ...) for each
+  window function or unselected column it uses, because Spark does not allow
+  window functions in a filter; the helpers are dropped after filtering.
 
 ## How correctness is verified
 

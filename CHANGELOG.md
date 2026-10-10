@@ -147,8 +147,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on `main`. It can share a query as a link (kept after the `#`, so it is
   never sent to a server), highlights the generated code, and passes an
   axe-core accessibility audit (WCAG 2.1 AA) in light and dark mode.
+- `QUALIFY` in generic SQL, Snowflake, and BigQuery: window functions and
+  unselected columns it uses become helper columns of the projection, which
+  are filtered on and then dropped, so it runs after the window functions and
+  before `DISTINCT`, `ORDER BY`, and `LIMIT`. Rejected in dialects without
+  `QUALIFY`, in aggregate queries, and, in Snowflake, when it names a `SELECT`
+  alias, which Snowflake reads as a table column if one exists. A Snowflake
+  example in the gallery shows it.
 
 ### Changed
+
+- `IN (subquery)` where no subquery is allowed, such as in `QUALIFY` or a
+  join condition, now reports where subqueries are supported instead of
+  "used as a value".
 
 - Aggregation without `GROUP BY` is generated as `.select(...)` instead of
   `.agg(...)`: the same one-row result, and it also works in correlated
