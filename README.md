@@ -5,6 +5,9 @@
 
 Convert SQL into readable, idiomatic, tested PySpark DataFrame code.
 
+**[Try it in your browser](https://arttgrantollii.github.io/sparkshift/)**: nothing to install, and your SQL
+never leaves your browser.
+
 > **Status: pre-release.** SparkShift converts `SELECT` queries, including
 > joins, aggregation, ordering, window functions, CTEs, set operations, and
 > subqueries, from generic SQL and six dialects (see below). Everything else
@@ -105,10 +108,13 @@ as `uv run sparkshift`.
 
 ## Playground
 
-[playground/](playground/README.md) is a web page that runs SparkShift
-entirely in the browser, with [Pyodide](https://pyodide.org): paste SQL,
-pick a dialect, and get PySpark, without installing anything and without
-the SQL leaving the browser. To run it locally:
+The [playground](https://arttgrantollii.github.io/sparkshift/) runs SparkShift entirely in the browser, with
+[Pyodide](https://pyodide.org): paste SQL, pick a dialect, and get
+PySpark, without installing anything and without the SQL leaving the
+browser. **Copy link** shares a query; the query is kept after the `#` in
+the link, which browsers never send to a server. Every commit that passes
+CI is published there. To run it locally (see
+[playground/](playground/README.md)):
 
 ```bash
 uv run python tools/build_playground.py
@@ -261,7 +267,7 @@ rejects it rather than guess:
 | Selecting a column that is neither grouped nor aggregated | MySQL (relaxed mode) | MySQL returns an arbitrary value; Spark raises an error. |
 | `ISNULL(a, b)` | T-SQL | Returns the first argument's type (`ISNULL(int_col, 1.5)` is 1); `COALESCE` returns 1.5. |
 | `CAST(x AS VARCHAR)` without a length | T-SQL | Means `VARCHAR(30)` and truncates longer values. |
-| `CAST(x AS FLOAT)` / `REAL` | All | Sizes differ: T-SQL `FLOAT` is 8 bytes, Spark `FLOAT` is 4. |
+| `CAST(x AS FLOAT)` / `REAL` | All except PostgreSQL `FLOAT` | Sizes differ: T-SQL `FLOAT` is 8 bytes, Spark `FLOAT` is 4. (PostgreSQL's `FLOAT` means `DOUBLE PRECISION` and is converted to `double`.) |
 | `LIKE '[a-c]%'` | T-SQL | `[ ]` is a character class in T-SQL; Spark matches it literally. |
 | `LIKE` patterns containing `\` | All | Whether backslash escapes wildcards differs between databases and Spark. |
 | `ROUND(x)` | PostgreSQL, MySQL, Oracle | Floating-point halves round to even (`2.5` → `2`) but exact numbers away from zero; Spark always rounds away, and only the column type would tell. |

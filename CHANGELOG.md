@@ -143,6 +143,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   static page with no server, so SQL never leaves the browser (ADR 0004).
   A browser test in CI converts every example in headless Chromium and
   requires output identical to the command line's.
+- The playground is published at https://arttgrantollii.github.io/sparkshift/ after CI passes
+  on `main`. It can share a query as a link (kept after the `#`, so it is
+  never sent to a server), highlights the generated code, and passes an
+  axe-core accessibility audit (WCAG 2.1 AA) in light and dark mode.
 
 ### Changed
 

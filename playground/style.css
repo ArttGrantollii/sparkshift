@@ -9,6 +9,11 @@
   --accent-text: #ffffff;
   --error-background: #fdecec;
   --error-text: #8a1c1c;
+  /* Code colors, each at least 4.5:1 against --surface (WCAG AA). */
+  --code-string: #1d6b2a;
+  --code-keyword: #7a2a99;
+  --code-function: #1d4e9e;
+  --code-number: #8f4300;
   --mono: ui-monospace, "SFMono-Regular", "Cascadia Code", Consolas, monospace;
 }
 
@@ -23,6 +28,10 @@
     --accent-text: #0b1020;
     --error-background: #3a1d1f;
     --error-text: #ffb4b4;
+    --code-string: #8fd694;
+    --code-keyword: #d7a6ff;
+    --code-function: #8ab4ff;
+    --code-number: #f0b37e;
   }
 }
 
@@ -77,6 +86,7 @@ label {
   display: flex;
   flex-direction: column;
   gap: 0.25rem;
+  max-width: 100%;
   font-weight: 600;
 }
 
@@ -98,6 +108,9 @@ pre {
 select {
   padding: 0.4rem 0.5rem;
   min-width: 14rem;
+  /* A select is as wide as its longest option; on a phone, that can be
+     wider than the screen. */
+  max-width: 100%;
 }
 
 button {
@@ -114,10 +127,36 @@ button:disabled {
   cursor: not-allowed;
 }
 
-#copy {
-  padding: 0.15rem 0.75rem;
+button.secondary {
   background: transparent;
   color: var(--accent);
+}
+
+#copy {
+  padding: 0.15rem 0.75rem;
+}
+
+.notice {
+  padding: 0.75rem 1rem;
+  border-radius: 6px;
+  background: var(--error-background);
+  color: var(--error-text);
+}
+
+#code .string {
+  color: var(--code-string);
+}
+
+#code .keyword {
+  color: var(--code-keyword);
+}
+
+#code .function {
+  color: var(--code-function);
+}
+
+#code .number {
+  color: var(--code-number);
 }
 
 kbd {

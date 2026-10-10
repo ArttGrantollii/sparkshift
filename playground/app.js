@@ -12,9 +12,18 @@ const DIALECT_NAMES = {
 };
 
 const elements = Object.fromEntries(
-  ["dialect", "example", "convert", "status", "sql", "code", "copy", "errors"].map(
-    (id) => [id, document.getElementById(id)],
-  ),
+  [
+    "dialect",
+    "example",
+    "convert",
+    "share",
+    "status",
+    "sql",
+    "output",
+    "code",
+    "copy",
+    "errors",
+  ].map((id) => [id, document.getElementById(id)]),
 );
 
 let convertForPage = null;
@@ -55,12 +64,42 @@ async function start() {
     elements.example.add(new Option(label, String(index)));
   });
 
-  for (const control of [elements.dialect, elements.example, elements.convert]) {
+  for (const control of [elements.dialect, elements.example, elements.convert, elements.share]) {
     control.disabled = false;
   }
   setStatus(`Ready. SparkShift ${about.version}, running on Pyodide ${pyodide.version}.`);
-  loadExample(0);
+  if (!loadSharedQuery()) {
+    loadExample(0);
+  }
 }
+
+// --- Shared links -----------------------------------------------------------
+//
+// A link to a query keeps it after the "#", which browsers never send to a
+// server: the SQL still stays on the visitor's machine.
+
+function sharedQueryLink() {
+  const parameters = new URLSearchParams({
+    dialect: elements.dialect.value,
+    sql: elements.sql.value,
+  });
+  return `${location.origin}${location.pathname}#${parameters}`;
+}
+
+function loadSharedQuery() {
+  const parameters = new URLSearchParams(location.hash.slice(1));
+  const sql = parameters.get("sql");
+  if (sql === null) {
+    return false;
+  }
+  const dialect = parameters.get("dialect") ?? "";
+  elements.dialect.value = dialect in DIALECT_NAMES ? dialect : "";
+  elements.sql.value = sql;
+  convert();
+  return true;
+}
+
+// --- Converting -------------------------------------------------------------
 
 function loadExample(index) {
   const example = examples[index];
@@ -79,7 +118,8 @@ function convert() {
   const result = JSON.parse(convertForPage(elements.sql.value, elements.dialect.value));
   elements.errors.replaceChildren();
   elements.errors.hidden = result.ok;
-  elements.code.textContent = result.ok ? result.code : "";
+  elements.output.hidden = !result.ok;
+  elements.code.replaceChildren(result.ok ? highlight(result.code) : "");
   elements.copy.disabled = !result.ok;
   if (!result.ok) {
     showErrors(result);
@@ -111,6 +151,32 @@ function showErrors(result) {
   }
 }
 
+// --- Highlighting -----------------------------------------------------------
+//
+// Generated code uses a small part of Python, so a few patterns are enough.
+// Highlighting only wraps text in spans: the code's text, and what Copy
+// copies, stay exactly the generated code.
+
+const TOKENS = /("(?:[^"\\\n]|\\.)*")|\b(from|import|as|True|False|None)\b|\b((?:F|Window)\.\w+)|\b(\d+(?:\.\d+)?)\b/g;
+const TOKEN_CLASSES = ["string", "keyword", "function", "number"];
+
+function highlight(code) {
+  const fragment = document.createDocumentFragment();
+  let end = 0;
+  for (const match of code.matchAll(TOKENS)) {
+    fragment.append(code.slice(end, match.index));
+    const span = document.createElement("span");
+    span.className = TOKEN_CLASSES[match.slice(1).findIndex((group) => group !== undefined)];
+    span.textContent = match[0];
+    fragment.append(span);
+    end = match.index + match[0].length;
+  }
+  fragment.append(code.slice(end));
+  return fragment;
+}
+
+// --- Events -----------------------------------------------------------------
+
 elements.convert.addEventListener("click", convert);
 elements.example.addEventListener("change", () => {
   loadExample(Number(elements.example.value));
@@ -126,8 +192,17 @@ elements.copy.addEventListener("click", async () => {
   await navigator.clipboard.writeText(elements.code.textContent);
   setStatus("Copied the PySpark code.");
 });
+elements.share.addEventListener("click", async () => {
+  const link = sharedQueryLink();
+  history.replaceState(null, "", link);
+  await navigator.clipboard.writeText(link);
+  setStatus("Copied a link to this query.");
+});
 
 start().catch((error) => {
-  setStatus(`The playground could not start: ${error.message}`);
+  setStatus(
+    `The playground could not start (${error.message}). It needs JavaScript ` +
+      "and a connection to cdn.jsdelivr.net, which serves Python for the browser.",
+  );
   console.error(error);
 });

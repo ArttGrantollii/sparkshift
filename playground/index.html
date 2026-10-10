@@ -45,7 +45,12 @@
         <button id="convert" type="button" disabled>
           Convert <kbd>Ctrl</kbd>+<kbd>Enter</kbd>
         </button>
+        <button id="share" class="secondary" type="button" disabled>Copy link</button>
       </div>
+
+      <noscript>
+        <p class="notice">The playground runs Python in your browser and needs JavaScript.</p>
+      </noscript>
 
       <p id="status" role="status" aria-live="polite">
         Loading Python (about 10 MB, only on your first visit)…
@@ -59,7 +64,7 @@
         <section aria-labelledby="output-label">
           <div class="pane-heading">
             <h2 id="output-label">PySpark</h2>
-            <button id="copy" type="button" disabled>Copy</button>
+            <button id="copy" class="secondary" type="button" disabled>Copy</button>
           </div>
           <pre id="output" tabindex="0"><code id="code"></code></pre>
           <div id="errors" role="alert" hidden></div>
