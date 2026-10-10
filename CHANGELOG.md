@@ -126,6 +126,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keep SQL's NULL rules for `NOT IN`. Rejects `IN (subquery)` used as a
   value (Spark returns false where SQL returns NULL), `ANY`/`ALL`, and
   row-value `IN`.
+- Command line: `sparkshift convert` (also `python -m sparkshift`) converts
+  a SQL file or standard input, with `--dialect` and `--output`. Code goes
+  to standard output and messages to standard error; the exit status is 0
+  when converted, 1 when the SQL cannot be, and 2 for usage errors.
 
 ### Changed
 

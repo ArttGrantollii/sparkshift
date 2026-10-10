@@ -28,6 +28,9 @@ dependencies = [
     "sqlglot>=30.21,<31",
 ]
 
+[project.scripts]
+sparkshift = "sparkshift.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/ArttGrantollii/sparkshift"
 Repository = "https://github.com/ArttGrantollii/sparkshift"

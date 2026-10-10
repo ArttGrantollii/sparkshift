@@ -5,10 +5,11 @@
 
 Convert SQL into readable, idiomatic, tested PySpark DataFrame code.
 
-> **Status: early development.** SparkShift converts `SELECT` queries with
-> joins, column expressions, `WHERE`, `DISTINCT`, and row limits (see below).
-> Everything else is rejected with a clear error. See [ROADMAP.md](ROADMAP.md)
-> for planned scope.
+> **Status: pre-release.** SparkShift converts `SELECT` queries, including
+> joins, aggregation, ordering, window functions, CTEs, set operations, and
+> subqueries, from generic SQL and six dialects (see below). Everything else
+> is rejected with a clear error. See [ROADMAP.md](ROADMAP.md) for what is
+> planned.
 
 ## Goal
 
@@ -59,6 +60,41 @@ UnsupportedSQLError: 2 unsupported constructs:
   - function MY_UDF: MY_UDF(score)
   - OFFSET clause: OFFSET 20
 ```
+
+## Command line
+
+```bash
+sparkshift convert query.sql                    # print the PySpark code
+sparkshift convert query.sql --dialect tsql     # SQL in a specific dialect
+sparkshift convert query.sql -o query.py        # write the code to a file
+cat query.sql | sparkshift convert -            # read standard input
+```
+
+For example:
+
+```bash
+echo "SELECT TOP 3 name FROM customers ORDER BY name" | sparkshift convert - --dialect tsql
+```
+
+<!-- Exact SparkShift output, checked by tests/test_readme.py. Not reformatted. -->
+<!-- fmt: off -->
+```python
+from pyspark.sql import functions as F
+
+result = (
+    spark.table("customers")
+    .select(F.col("name"))
+    .orderBy(F.col("name").asc())
+    .limit(3)
+)
+```
+<!-- fmt: on -->
+
+The code goes to standard output and every message to standard error, so
+`> query.py` never captures an error. The exit status is 0 when the query is
+converted, 1 when it cannot be (every issue is listed), and 2 for a usage
+error such as a missing file or an unknown dialect. `python -m sparkshift`
+works the same way. In a development checkout, run it as `uv run sparkshift`.
 
 ## Supported SQL
 

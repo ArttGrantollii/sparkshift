@@ -1,19 +1,21 @@
 # Roadmap
 
-SparkShift is in early development. This roadmap describes intended scope,
-not current capabilities. See the README for what works today.
+SparkShift is in pre-release development. This roadmap describes intended
+scope, not current capabilities; see the README for what works today.
+Phases are listed in the order they are planned; their numbers are kept
+from the original plan.
 
 Status legend: **Done** · **In progress** · **Planned**
 
 | Phase | Scope | Status |
 |---|---|---|
 | 0 | Engineering foundation: packaging, tooling, CI, architecture notes | Done |
-| 1 | Core SQL → PySpark engine: expressions, SELECT/WHERE, joins, aggregation, ordering, window functions, CTEs, set operations — with Spark equivalence tests | Planned |
-| 2 | CLI (`sparkshift convert`), packaging polish, verified examples | Planned |
-| 3 | Advanced SQL: subqueries (IN / EXISTS), QUALIFY, multi-dialect testing, coverage reporting | Planned |
+| 1 | Core SQL → PySpark engine: expressions, SELECT/WHERE, joins, aggregation, ordering, window functions, CTEs, set operations, subqueries — with Spark equivalence tests | Done |
+| 2 | CLI (`sparkshift convert`), packaging polish, verified examples | In progress |
+| 6 | Public browser-based playground (live demo) | Planned |
+| 3 | Advanced SQL: QUALIFY, multi-dialect testing, coverage reporting | Planned |
 | 4 | SAS → PySpark for a documented subset (DATA step, PROC SQL/SORT/MEANS/FREQ) | Planned |
 | 5 | Databricks notebook generation and deployment | Planned |
-| 6 | Public browser-based playground (live demo) | Planned |
 | 7 | Documentation polish and 1.0 release on PyPI | Planned |
 
 ## Guiding principle
