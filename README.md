@@ -103,6 +103,18 @@ and 2 for a usage error such as a missing file or an unknown dialect.
 `python -m sparkshift` works the same way. In a development checkout, run it
 as `uv run sparkshift`.
 
+## Playground
+
+[playground/](playground/README.md) is a web page that runs SparkShift
+entirely in the browser, with [Pyodide](https://pyodide.org): paste SQL,
+pick a dialect, and get PySpark, without installing anything and without
+the SQL leaving the browser. To run it locally:
+
+```bash
+uv run python tools/build_playground.py
+python3 -m http.server --directory _site 8000
+```
+
 ## Examples
 
 [examples/](examples/README.md) has a realistic query in each dialect next

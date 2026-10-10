@@ -32,3 +32,6 @@ derby.log
 .ipynb_checkpoints/
 .DS_Store
 Thumbs.db
+
+# The built playground (tools/build_playground.py).
+_site/

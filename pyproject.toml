@@ -46,6 +46,7 @@ packages = ["src/sparkshift"]
 
 [dependency-groups]
 dev = [
+    "playwright>=1.50",
     "pre-commit>=4.6.2",
     "pyspark>=4.2.0",
     "pytest>=9.1.1",
@@ -83,6 +84,7 @@ testpaths = ["tests"]
 addopts = ["--strict-markers", "--strict-config"]
 markers = [
     "spark: starts a real local SparkSession (slower; requires Java)",
+    "browser: drives the playground in headless Chromium (requires network)",
 ]
 
 [tool.coverage.run]

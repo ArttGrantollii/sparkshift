@@ -55,7 +55,26 @@ jobs:
 
       - run: uv sync --locked
 
-      - run: uv run pytest --cov -v
+      # Browser tests run in their own job, below.
+      - run: uv run pytest --cov -v -m "not browser"
+
+  # The playground, built and driven in a real browser: every example must
+  # convert exactly as on the command line.
+  playground:
+    name: Playground (browser)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+
+      - run: uv sync --locked
+
+      - run: uv run playwright install --with-deps chromium
+
+      - run: uv run pytest -m browser -v
 
   # What users install is the built wheel, not this checkout: build it,
   # inspect it, and use it in an environment with nothing else installed.

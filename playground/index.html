@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- Scripts come only from this site and Pyodide's pinned CDN release.
+         'wasm-unsafe-eval' lets the browser compile Pyodide's WebAssembly. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net 'wasm-unsafe-eval'; connect-src 'self' https://cdn.jsdelivr.net; style-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'"
+    />
+    <title>SparkShift playground: SQL to PySpark</title>
+    <meta
+      name="description"
+      content="Convert SQL into readable PySpark in your browser. Your SQL never leaves this page."
+    />
+    <link rel="stylesheet" href="style.css" />
+    <script src="https://cdn.jsdelivr.net/pyodide/v314.0.7/full/pyodide.js"></script>
+    <script type="module" src="app.js"></script>
+  </head>
+  <body>
+    <header>
+      <h1>SparkShift playground</h1>
+      <p>
+        Convert SQL into readable PySpark. Everything runs in your browser: your
+        SQL never leaves this page.
+        <a href="https://github.com/ArttGrantollii/sparkshift">Source on GitHub</a>
+      </p>
+    </header>
+
+    <main>
+      <div class="controls">
+        <label>
+          Dialect
+          <select id="dialect" disabled>
+            <option value="">Generic SQL</option>
+          </select>
+        </label>
+        <label>
+          Example
+          <select id="example" disabled>
+            <option value="">Load an example…</option>
+          </select>
+        </label>
+        <button id="convert" type="button" disabled>
+          Convert <kbd>Ctrl</kbd>+<kbd>Enter</kbd>
+        </button>
+      </div>
+
+      <p id="status" role="status" aria-live="polite">
+        Loading Python (about 10 MB, only on your first visit)…
+      </p>
+
+      <div class="panes">
+        <section aria-labelledby="sql-label">
+          <h2 id="sql-label"><label for="sql">SQL</label></h2>
+          <textarea id="sql" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+        </section>
+        <section aria-labelledby="output-label">
+          <div class="pane-heading">
+            <h2 id="output-label">PySpark</h2>
+            <button id="copy" type="button" disabled>Copy</button>
+          </div>
+          <pre id="output" tabindex="0"><code id="code"></code></pre>
+          <div id="errors" role="alert" hidden></div>
+        </section>
+      </div>
+    </main>
+
+    <footer>
+      <p id="about">
+        The generated code expects a SparkSession named <code>spark</code>, as in a
+        Databricks notebook. Constructs SparkShift cannot convert safely are rejected
+        with an explanation instead of guessed.
+      </p>
+    </footer>
+  </body>
+</html>

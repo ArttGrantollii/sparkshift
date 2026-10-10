@@ -103,7 +103,7 @@ These rules keep every planned interface possible:
 |---|---|---|
 | **Python API** | Call the conversion function directly from Python code. | Structured results |
 | **CLI** | Read SQL from a file or stdin, print code to stdout, warnings to stderr, and return meaningful exit codes. | No I/O in core |
-| **Web playground** | Load the SparkShift and SQLGlot wheels into Pyodide in the browser and call the core from JavaScript. No backend server. | Pure Python, no Spark |
+| **Web playground** | Load the SparkShift and SQLGlot wheels into Pyodide in the browser and call the core from JavaScript. No backend server ([ADR 0004](adr/0004-run-the-playground-in-the-browser.md)). | Pure Python, no Spark |
 | **Databricks** | Wrap generated code in notebook format; optionally deploy it through the Databricks SDK as an optional extra (`sparkshift[databricks]`), with credentials from the environment. | No Spark, no I/O in core |
 
 ## How correctness is verified

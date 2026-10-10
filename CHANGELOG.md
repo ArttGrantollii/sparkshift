@@ -139,6 +139,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtime dependency and that it contains the package, type information,
   license, and command, checks the description with `twine`, and runs the
   installed `sparkshift` command in a clean environment.
+- A web playground that runs SparkShift in the browser with Pyodide: a
+  static page with no server, so SQL never leaves the browser (ADR 0004).
+  A browser test in CI converts every example in headless Chromium and
+  requires output identical to the command line's.
 
 ### Changed
 
