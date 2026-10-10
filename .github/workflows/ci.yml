@@ -56,3 +56,30 @@ jobs:
       - run: uv sync --locked
 
       - run: uv run pytest --cov -v
+
+  # What users install is the built wheel, not this checkout: build it,
+  # inspect it, and use it in an environment with nothing else installed.
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.2.0
+
+      - name: Build the source distribution and wheel
+        run: uv build
+
+      - name: Check the wheel's dependencies and contents
+        run: python3 tools/check_wheel.py dist/*.whl
+
+      - name: Check the package description renders on PyPI
+        run: uvx twine check --strict dist/*
+
+      - name: Install the wheel in a clean environment and use it
+        run: |
+          uv venv /tmp/clean
+          uv pip install --python /tmp/clean dist/*.whl
+          /tmp/clean/bin/sparkshift --version
+          echo "SELECT name FROM customers WHERE country = 'US'" \
+            | /tmp/clean/bin/sparkshift convert -

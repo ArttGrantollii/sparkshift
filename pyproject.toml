@@ -11,9 +11,10 @@ requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Art Grantolli" }]
-keywords = ["pyspark", "spark", "sql", "transpiler", "databricks", "data-engineering"]
+keywords = ["pyspark", "spark", "sql", "transpiler", "migration", "data-engineering"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -69,6 +70,13 @@ select = [
 [tool.ruff.lint.per-file-ignores]
 # Test data is laid out as aligned tables, one row per line.
 "tests/equivalence/datasets.py" = ["E501"]
+# Generated code expects a SparkSession named `spark` to exist.
+"examples/pyspark/**" = ["F821"]
+
+[tool.ruff.format]
+# Generated examples keep SparkShift's own layout, byte for byte; tests
+# check them against the converter's output instead.
+exclude = ["examples/pyspark/**"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

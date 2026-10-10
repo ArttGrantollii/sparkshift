@@ -103,6 +103,14 @@ and 2 for a usage error such as a missing file or an unknown dialect.
 `python -m sparkshift` works the same way. In a development checkout, run it
 as `uv run sparkshift`.
 
+## Examples
+
+[examples/](examples/README.md) has a realistic query in each dialect next
+to the PySpark SparkShift generates for it, such as the latest order per
+customer in PostgreSQL or customers without orders in Snowflake. Tests keep
+every example identical to the converter's output and check that it returns
+the same result as its SQL on Apache Spark.
+
 ## Supported SQL
 
 | Construct | Status |

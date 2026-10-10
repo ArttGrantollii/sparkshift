@@ -11,7 +11,7 @@ Status legend: **Done** · **In progress** · **Planned**
 |---|---|---|
 | 0 | Engineering foundation: packaging, tooling, CI, architecture notes | Done |
 | 1 | Core SQL → PySpark engine: expressions, SELECT/WHERE, joins, aggregation, ordering, window functions, CTEs, set operations, subqueries — with Spark equivalence tests | Done |
-| 2 | CLI (`sparkshift convert`), packaging polish, verified examples | In progress |
+| 2 | CLI (`sparkshift convert`), packaging polish, verified examples | Done |
 | 6 | Public browser-based playground (live demo) | Planned |
 | 3 | Advanced SQL: QUALIFY, multi-dialect testing, coverage reporting | Planned |
 | 4 | SAS → PySpark for a documented subset (DATA step, PROC SQL/SORT/MEANS/FREQ) | Planned |
