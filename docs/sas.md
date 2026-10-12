@@ -35,6 +35,7 @@ Reference* for functions, and *Base SAS 9.4 Procedures Guide* for procedures.
 | Conditions | Comparisons (`=`, `^=`, `<`, `<=`, `>`, `>=` and `EQ`, `NE`, `LT`, `LE`, `GT`, `GE`); `AND`, `OR`, `NOT (...)`; `IN`, `NOT IN`; `BETWEEN ... AND`; `IS [NOT] MISSING` and `IS [NOT] NULL`; a number on its own. A comparison or condition used as a value is 1 or 0 |
 | Functions | `SUM`, `MEAN`, `MIN`, `MAX`, `N`, `NMISS`, `COALESCE`; `ROUND`, `INT`, `CEIL`, `FLOOR`, `ABS`, `MOD`; `UPCASE`, `LOWCASE`, `STRIP`, `TRIM`, `SUBSTR`, `LENGTH`; `CATS`, `CATX`, `COALESCEC`; `MISSING`. See [Functions](#functions) |
 | `PROC SORT` | `DATA=`, `OUT=` (with data set options), `NODUPKEY`, `BY` with `DESCENDING`, and `WHERE`. Options that do not change the result (`EQUALS`, `FORCE`, `TAGSORT`, `SORTSIZE=`, ...) are accepted. See [PROC SORT](#proc-sort) |
+| `PROC MEANS`, `PROC SUMMARY` | `DATA=`, `NWAY`, `MISSING`; `CLASS` (with `/ MISSING`), `VAR`, `BY`, `WHERE`; `OUTPUT OUT=` with `N`, `NMISS`, `SUM`, `MEAN`, `MIN`, `MAX`, `RANGE`, `STD`, and `VAR`, in the forms `mean=`, `mean=names`, and `mean(variables)=names`. Options that only change printed output are accepted. See [PROC MEANS and SUMMARY](#proc-means-and-summary) |
 | Comments | `/* ... */` anywhere, and `* ... ;` statements |
 
 Everything else is rejected with a list of every unsupported construct, for
@@ -43,7 +44,9 @@ loops, other functions (date functions among them), `**`, `||`, date
 constants, variable lists such as `x1-x5` and `OF x1-x5`, macros (`%let`,
 `&name`), global statements such as `LIBNAME` and `OPTIONS`, `DATA _NULL_`,
 writing to a permanent library, PROC SORT's `DUPOUT=`, `NOUNIQUEKEY`, and
-collating sequences, and the other PROC steps.
+collating sequences, PROC MEANS without `OUTPUT` (a printed report), quantiles
+such as `MEDIAN`, `AUTONAME`, `TYPES`, `WAYS`, `ID`, `FREQ`, and `WEIGHT`, and
+the other PROC steps.
 
 ## The rules
 
@@ -318,6 +321,62 @@ such order, so `dropDuplicates` keeps any row of each group. SparkShift warns,
 unless `KEEP=` on the `DATA=` data set shows that every variable is a BY
 variable; then all rows of a group are the same.
 
+### PROC MEANS and SUMMARY
+
+*Base SAS 9.4 Procedures Guide*, "MEANS Procedure": the PROC MEANS, CLASS,
+VAR, and OUTPUT statements, "Results: PROC MEANS", and "Keywords and
+Formulas". PROC SUMMARY works the same way, but prints nothing.
+
+**What is computed.** Each `OUTPUT OUT=` statement creates a data set with
+"the variables specified in the BY statement", "the variables specified in
+the CLASS statement", `_TYPE_`, `_FREQ_` ("the number of observations that a
+given output level represents"), and the statistics, in that order:
+
+```sas
+proc means data=orders noprint nway;
+    class status;
+    var amount;
+    output out=summary sum=revenue mean=average;
+run;
+```
+
+becomes `.groupBy(F.col("status")).agg(F.lit(1).alias("_TYPE_"),
+F.count(F.lit(1)).alias("_FREQ_"), F.sum(...).alias("revenue"), ...)`. The
+statistics follow the keyword definitions: `N` is "the number of x values
+that are not missing" (`F.count`), `NMISS` the number that are missing
+(`F.count_if`), `RANGE` "the difference between maximum value and minimum
+value", and `VAR` and `STD` divide by n − 1, the default `VARDEF=DF`
+(`F.var_samp`, `F.stddev_samp`). "PROC MEANS excludes missing values for the
+analysis variables before calculating statistics", as Spark's aggregates do.
+
+**Names.** In `statistic(variables)=names`, "the first name contains the
+statistic for the first analysis variable", and so on. Without variables, the
+statistic is for the `VAR` variables; without names, the output variables take
+the analysis variables' names. SparkShift needs one name for each variable, or
+none, and different names for all output variables.
+
+**Missing CLASS values.** "If a class variable has a missing value for an
+observation, then PROC MEANS excludes that observation from the analysis
+unless you use the MISSING option", so SparkShift filters those rows first. "If
+a BY or ID variable value is missing, then PROC MEANS treats it like any other
+BY or ID variable value."
+
+**_TYPE_ and NWAY.** "By default, PROC MEANS generates all possible types":
+every combination of the CLASS variables, which is Spark's `.cube(...)`.
+`_TYPE_` "indicates which combination of the class variables PROC MEANS uses":
+in binary, "each value of one indicates an active class variable in the type",
+the first CLASS variable the leftmost digit. Spark's `F.grouping_id()` has the
+same bits with ones for the variables that are not active, so `_TYPE_` is
+`2^k − 1 − grouping_id()` for k CLASS variables. `NWAY` "limits the output
+statistics to the observations with the highest _TYPE_ value", which is a
+`.groupBy(...)` with `_TYPE_` set to `2^k − 1`.
+
+**Order.** The output is sorted by the BY variables, then by `_TYPE_` (the
+`DESCENDTYPES` option "orders observations in the output data set by
+descending _TYPE_ value"), then by the CLASS variables' values (the default,
+`ORDER=UNFORMATTED`, "orders values by their unformatted values"). BY groups
+come in the BY variables' order, as the input must be sorted by them.
+
 ## Limitations
 
 - **Column order of KEEP:** SAS keeps variables in the data set's order;
@@ -368,3 +427,15 @@ variable; then all rows of a group are the same.
 - **Order in later steps:** a SAS data set keeps its order. Spark does not
   promise that later operations keep a sorted DataFrame's order; sort it again
   just before writing it out if the order matters.
+- **Formatted CLASS values:** SAS groups CLASS variables by their formatted
+  values ("a single level consists of all input observations whose formatted
+  class values match"), BEST12. for a number without a format. Spark groups by
+  the values themselves, so numbers that differ only beyond 12 significant
+  digits are one SAS level but separate Spark groups. The same applies to
+  text that differs only in trailing blanks, and to missing versus empty text
+  with `MISSING`.
+- **BY with CLASS:** without `NWAY`, SAS computes every combination of the
+  CLASS variables within each BY group; SparkShift requires `NWAY` then.
+- **VAR is needed:** without a `VAR` statement, SAS analyzes every numeric
+  variable, which SparkShift cannot see; name the variables in `VAR` or in
+  `statistic(variables)=`.

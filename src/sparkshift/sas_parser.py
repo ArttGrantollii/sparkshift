@@ -269,7 +269,44 @@ class ProcSort:
     span: Span
 
 
-Step = DataStep | ProcSort
+@dataclass(frozen=True)
+class StatisticRequest:
+    """statistic(variables)=names in an OUTPUT statement. Without
+    variables, the statistic is for the VAR variables; without names, the
+    output variables take the analysis variables' names."""
+
+    statistic: str
+    variables: tuple[str, ...]
+    names: tuple[str, ...]
+    span: Span
+
+
+@dataclass(frozen=True)
+class OutputStatement:
+    out: Dataset | None
+    statistics: tuple[StatisticRequest, ...]
+    span: Span
+
+
+@dataclass(frozen=True)
+class ProcMeans:
+    """PROC MEANS or PROC SUMMARY (``procedure``), which differ only in what
+    they print. ``classes`` holds each CLASS variable and whether its
+    statement has the MISSING option."""
+
+    procedure: str
+    data: Dataset | None
+    nway: bool
+    missing: bool
+    by: tuple[ByVariable, ...]
+    classes: tuple[tuple[str, bool], ...]
+    variables: tuple[str, ...]
+    outputs: tuple[OutputStatement, ...]
+    wheres: tuple[WhereStatement, ...]
+    span: Span
+
+
+Step = DataStep | ProcSort | ProcMeans
 
 
 @dataclass(frozen=True)
@@ -330,6 +367,81 @@ _SORT_OPTIONS_WITHOUT_EFFECT = frozenset(
         "THREADS",
     }
 )
+# The statistics PROC MEANS can compute. In the PROC statement they choose
+# what is printed, not what an OUTPUT statement stores.
+_MEANS_STATISTICS = frozenset(
+    {
+        "CLM",
+        "CSS",
+        "CV",
+        "KURTOSIS",
+        "KURT",
+        "LCLM",
+        "MAX",
+        "MEAN",
+        "MIN",
+        "MODE",
+        "N",
+        "NMISS",
+        "RANGE",
+        "SKEWNESS",
+        "SKEW",
+        "STDDEV",
+        "STD",
+        "STDERR",
+        "SUM",
+        "SUMWGT",
+        "UCLM",
+        "USS",
+        "VAR",
+        "MEDIAN",
+        "P1",
+        "P5",
+        "P10",
+        "P20",
+        "P25",
+        "P30",
+        "P40",
+        "P50",
+        "P60",
+        "P70",
+        "P75",
+        "P80",
+        "P90",
+        "P95",
+        "P99",
+        "Q1",
+        "Q3",
+        "QRANGE",
+        "PROBT",
+        "PRT",
+        "T",
+    }
+)
+# PROC MEANS options that change only the printed output, or performance.
+_MEANS_OPTIONS_WITHOUT_EFFECT = frozenset(
+    {
+        "ALPHA",
+        "FW",
+        "MAXDEC",
+        "NONOBS",
+        "NOPRINT",
+        "NOTHREADS",
+        "PCTLDEF",
+        "PRINT",
+        "PRINTALL",
+        "PRINTALLTYPES",
+        "PRINTIDS",
+        "PRINTIDVARS",
+        "QMARKERS",
+        "QMETHOD",
+        "QNTLDEF",
+        "SUMSIZE",
+        "THREADS",
+    }
+)
+# Options with a value, accepted only with the value that is the default.
+_DEFAULT_VALUES = {"VARDEF": "DF", "ORDER": "UNFORMATTED"}
 
 
 class _Parser:
@@ -414,8 +526,169 @@ class _Parser:
         span = self.span(header[0], last)
         if header[1].is_keyword("SORT"):
             return self.proc_sort(header, body, span)
+        if header[1].is_keyword("MEANS", "SUMMARY"):
+            return self.proc_means(header, body, span)
         self.unsupported(f"PROC {header[1].text.upper()} step", header)
         return None
+
+    def proc_means(
+        self, header: list[Token], body: list[list[Token]], span: Span
+    ) -> ProcMeans:
+        procedure = header[1].text.upper()
+        tokens = _Tokens(header[2:], self)
+        data = None
+        nway = missing = False
+        while not tokens.at_end():
+            option = tokens.take_name(f"a PROC {procedure} option")
+            keyword = option.text.upper()
+            has_value = tokens.peek().is_symbol("=")
+            if keyword == "DATA" and has_value:
+                tokens.take()
+                data = self.dataset(tokens)
+                continue
+            value = self.option_value(tokens) if has_value else None
+            if keyword == "NWAY" and not has_value:
+                nway = True
+            elif keyword == "MISSING" and not has_value:
+                missing = True
+            elif not self.harmless_option(
+                keyword, value, _MEANS_OPTIONS_WITHOUT_EFFECT
+            ):
+                name = f"{keyword}={value}" if has_value else keyword
+                self.unsupported(
+                    f"PROC {procedure} option {name}",
+                    [option],
+                    "SparkShift supports DATA=, NWAY, and MISSING.",
+                )
+        by: list[ByVariable] = []
+        classes: list[tuple[str, bool]] = []
+        variables: list[str] = []
+        outputs: list[OutputStatement] = []
+        wheres: list[WhereStatement] = []
+        for statement in body:
+            first = statement[0]
+            statement_span = self.span(first, statement[-1])
+            names, options = _split_options(statement[1:])
+            rest = _Tokens(names, self)
+            if first.is_keyword("BY"):
+                if by:
+                    raise self.error(
+                        f"PROC {procedure} with a second BY statement", first
+                    )
+                by = self.by_variables(rest)
+            elif first.is_keyword("CLASS"):
+                class_missing = self.class_options(options)
+                classes += [(n, class_missing) for n in self.names(rest, "CLASS")]
+            elif first.is_keyword("VAR"):
+                if options:
+                    self.unsupported("VAR statement options", options)
+                variables += self.names(rest, "VAR")
+            elif first.is_keyword("OUTPUT"):
+                outputs.append(self.output_statement(statement, statement_span))
+            elif first.is_keyword("WHERE"):
+                where = _Tokens(statement[1:], self)
+                condition = self.expression(where)
+                where.expect_end()
+                wheres.append(WhereStatement(condition, statement_span))
+            else:
+                self.unsupported(
+                    f"{first.text.upper()} statement in PROC {procedure}", statement
+                )
+        return ProcMeans(
+            procedure,
+            data,
+            nway,
+            missing,
+            tuple(by),
+            tuple(classes),
+            tuple(variables),
+            tuple(outputs),
+            tuple(wheres),
+            span,
+        )
+
+    def option_value(self, tokens: "_Tokens") -> str:
+        """The value of an option after its equals sign, upper case: one
+        token, a parenthesized group, or a size such as 512M."""
+        tokens.take()
+        start = tokens.index
+        tokens.skip_option_value()
+        value = tokens.previous()
+        if value.kind is Kind.NUMBER and tokens.adjacent(value):
+            tokens.take()  # the unit of a size such as 512M
+        return "".join(
+            token.text for token in tokens.tokens[start : tokens.index]
+        ).upper()
+
+    def harmless_option(
+        self, keyword: str, value: str | None, without_effect: frozenset[str]
+    ) -> bool:
+        """Whether an option leaves the output data set unchanged."""
+        if keyword in _DEFAULT_VALUES:
+            return value == _DEFAULT_VALUES[keyword]
+        return keyword in without_effect or (
+            value is None and keyword in _MEANS_STATISTICS
+        )
+
+    def class_options(self, options: list[Token]) -> bool:
+        """The options of a CLASS statement, after the slash: whether it has
+        MISSING. Options about formats and printing are reported."""
+        missing = False
+        tokens = _Tokens(options, self)
+        while not tokens.at_end():
+            option = tokens.take_name("a CLASS option")
+            keyword = option.text.upper()
+            value = self.option_value(tokens) if tokens.peek().is_symbol("=") else None
+            if keyword == "MISSING" and value is None:
+                missing = True
+            elif not (
+                keyword in ("ASCENDING", "ASCEND", "GROUPINTERNAL") and value is None
+            ) and not (keyword == "ORDER" and value == "UNFORMATTED"):
+                name = f"{keyword}={value}" if value is not None else keyword
+                self.unsupported(f"CLASS option {name}", [option])
+        return missing
+
+    def output_statement(self, statement: list[Token], span: Span) -> OutputStatement:
+        """OUTPUT OUT=data-set statistic(variables)=names ... / options."""
+        names, options = _split_options(statement[1:])
+        tokens = _Tokens(names, self)
+        out = None
+        statistics: list[StatisticRequest] = []
+        while not tokens.at_end():
+            keyword = tokens.take_name("OUT= or a statistic")
+            upper = keyword.text.upper()
+            if upper == "OUT" and tokens.peek().is_symbol("="):
+                tokens.take()
+                out = self.dataset(tokens)
+                continue
+            if upper in ("IDGROUP", "IDGRP", "MAXID", "MINID"):
+                self.unsupported(f"{upper} in an OUTPUT statement", [keyword])
+                break
+            variables: tuple[str, ...] = ()
+            if tokens.peek().is_symbol("("):
+                tokens.take()
+                variables = self.names(tokens, f"{upper}(...)")
+                tokens.expect_symbol(")")
+            tokens.expect_symbol("=")
+            outputs = []
+            while tokens.peek().kind is Kind.NAME and not tokens.peek(1).is_symbol(
+                "=", "("
+            ):
+                outputs.append(tokens.take().text)
+            statistics.append(
+                StatisticRequest(
+                    upper,
+                    variables,
+                    tuple(outputs),
+                    self.span(keyword, tokens.previous()),
+                )
+            )
+        option_tokens = _Tokens(options, self)
+        while not option_tokens.at_end():
+            option = option_tokens.take_name("an OUTPUT option")
+            if not option.is_keyword("AUTOLABEL", "NOINHERIT", "INHERIT", "KEEPLEN"):
+                self.unsupported(f"OUTPUT option {option.text.upper()}", [option])
+        return OutputStatement(out, tuple(statistics), span)
 
     def proc_sort(
         self, header: list[Token], body: list[list[Token]], span: Span
@@ -478,6 +751,9 @@ class _Parser:
         variables = []
         while not tokens.at_end():
             name = tokens.take_name("a BY variable")
+            if name.is_keyword("NOTSORTED", "GROUPFORMAT") and variables:
+                self.unsupported(f"BY option {name.text.upper()}", [name])
+                continue
             descending = name.is_keyword("DESCENDING") and not tokens.at_end()
             if descending:
                 name = tokens.take_name("a variable after DESCENDING")
@@ -987,6 +1263,15 @@ class _Parser:
 
 
 _SPECIAL_LISTS = frozenset({"_ALL_", "_NUMERIC_", "_CHARACTER_"})
+
+
+def _split_options(tokens: list[Token]) -> tuple[list[Token], list[Token]]:
+    """A statement's tokens before and after the slash that starts its
+    options."""
+    for index, token in enumerate(tokens):
+        if token.is_symbol("/"):
+            return tokens[:index], tokens[index + 1 :]
+    return tokens, []
 
 
 def _with_span(expression: Expression, span: Span) -> Expression:

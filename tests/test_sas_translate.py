@@ -1186,3 +1186,232 @@ def test_a_data_step_reads_the_sorted_data_set() -> None:
     ).datasets
 
     assert step.source is sorted_
+
+
+# --- PROC MEANS and SUMMARY ----------------------------------------------------
+
+C = Column(("c",))
+FREQ = ir.Alias(ir.AggregateCall(ir.AggregateFunction.COUNT), "_FREQ_")
+
+
+def type_of(value: int) -> ir.Alias:
+    return ir.Alias(Literal(value), "_TYPE_")
+
+
+def aggregate(function: ir.AggregateFunction, variable: ir.Expression) -> ir.Expression:
+    return ir.AggregateCall(function, (variable,))
+
+
+def present(variable: ir.Expression) -> ir.Expression:
+    """Not missing, as a number or as text."""
+    return negated(
+        BinaryOp(
+            BinaryOperator.OR,
+            IsNull(variable),
+            BinaryOp(
+                BinaryOperator.EQUAL, FunctionCall("rtrim", (variable,)), Literal("")
+            ),
+        )
+    )
+
+
+def means(program: str) -> ir.Relation:
+    [dataset] = translate(program).datasets
+    return dataset.source
+
+
+def test_nway_groups_by_the_class_variables_without_missing_values() -> None:
+    relation = means(
+        "proc means data=t nway; class a; var x; output out=s mean=avg; run;"
+    )
+
+    summary = ir.Aggregate(
+        ir.Filter(T, present(A)),
+        (A,),
+        (type_of(1), FREQ, ir.Alias(aggregate(ir.AggregateFunction.AVG, X), "avg")),
+    )
+    assert relation == ir.Sort(summary, (ascending("a"),))
+
+
+def test_missing_keeps_missing_class_values() -> None:
+    for program in (
+        "proc means data=t nway missing; class a b; var x; output out=s n=n; run;",
+        "proc means data=t nway; class a b / missing; var x; output out=s n=n; run;",
+    ):
+        relation = means(program)
+        assert isinstance(relation, ir.Sort)
+        assert isinstance(relation.source, ir.Aggregate)
+        assert relation.source.source == T
+
+
+def test_missing_on_one_class_statement_applies_to_its_variables() -> None:
+    relation = means(
+        "proc means data=t nway; class a / missing; class b; var x; "
+        "output out=s n=n; run;"
+    )
+
+    assert isinstance(relation, ir.Sort)
+    assert isinstance(relation.source, ir.Aggregate)
+    assert relation.source.source == ir.Filter(T, present(B))
+
+
+def test_without_nway_every_combination_with_its_type() -> None:
+    relation = means(
+        "proc summary data=t missing; class a b; var x; output out=s sum=total; run;"
+    )
+
+    grouping = ir.AggregateCall(ir.AggregateFunction.GROUPING_ID)
+    type_value = BinaryOp(BinaryOperator.SUBTRACT, Literal(3), grouping)
+    summary = ir.Aggregate(
+        T,
+        (A, B),
+        (
+            ir.Alias(type_value, "_TYPE_"),
+            FREQ,
+            ir.Alias(aggregate(ir.AggregateFunction.SUM, X), "total"),
+        ),
+        cube=True,
+    )
+    order = (ascending("_TYPE_"), ascending("a"), ascending("b"))
+    assert relation == ir.Sort(summary, order)
+
+
+def test_by_groups_keep_missing_values_and_their_order() -> None:
+    relation = means(
+        "proc means data=t; by descending k; var x; output out=s max=top; run;"
+    )
+
+    k = Column(("k",))
+    summary = ir.Aggregate(
+        T,
+        (k,),
+        (type_of(0), FREQ, ir.Alias(aggregate(ir.AggregateFunction.MAX, X), "top")),
+    )
+    assert relation == ir.Sort(summary, (descending("k"),))
+
+
+def test_the_whole_data_set_is_one_row_with_type_0() -> None:
+    relation = means("proc means data=t; var x; output out=s n=count; run;")
+
+    assert relation == ir.Aggregate(
+        T,
+        (),
+        (type_of(0), FREQ, ir.Alias(aggregate(ir.AggregateFunction.COUNT, X), "count")),
+    )
+
+
+@pytest.mark.parametrize(
+    ("statistic", "expected"),
+    [
+        ("n", aggregate(ir.AggregateFunction.COUNT, X)),
+        ("nmiss", aggregate(ir.AggregateFunction.COUNT_IF, IsNull(X))),
+        ("sum", aggregate(ir.AggregateFunction.SUM, X)),
+        ("mean", aggregate(ir.AggregateFunction.AVG, X)),
+        ("min", aggregate(ir.AggregateFunction.MIN, X)),
+        ("max", aggregate(ir.AggregateFunction.MAX, X)),
+        (
+            "range",
+            BinaryOp(
+                BinaryOperator.SUBTRACT,
+                aggregate(ir.AggregateFunction.MAX, X),
+                aggregate(ir.AggregateFunction.MIN, X),
+            ),
+        ),
+        ("std", aggregate(ir.AggregateFunction.STDDEV_SAMP, X)),
+        ("stddev", aggregate(ir.AggregateFunction.STDDEV_SAMP, X)),
+        ("var", aggregate(ir.AggregateFunction.VAR_SAMP, X)),
+    ],
+)
+def test_statistics(statistic: str, expected: ir.Expression) -> None:
+    relation = means(f"proc means data=t; var x; output out=s {statistic}=v; run;")
+
+    assert isinstance(relation, ir.Aggregate)
+    assert relation.aggregates[2] == ir.Alias(expected, "v")
+
+
+def test_statistic_names_follow_the_variables() -> None:
+    relation = means(
+        "proc means data=t; var x y; "
+        "output out=s mean= sum(y)=total min(y x)=low_y low_x; run;"
+    )
+
+    assert isinstance(relation, ir.Aggregate)
+    assert [a.name for a in relation.aggregates if isinstance(a, ir.Alias)] == [
+        "_TYPE_",
+        "_FREQ_",
+        "x",
+        "y",
+        "total",
+        "low_y",
+        "low_x",
+    ]
+
+
+def test_each_output_statement_creates_a_data_set() -> None:
+    first, second = translate(
+        "proc means data=t nway; class a; var x; "
+        "output out=sums(drop=_type_) sum=total; output out=means mean=average; run;"
+    ).datasets
+
+    assert (first.name, second.name) == ("sums", "means")
+    assert isinstance(first.source, ir.DropColumns)
+
+
+def test_proc_means_reads_the_last_data_set_and_a_where_statement() -> None:
+    first, second = translate(
+        "data a; set t; run; proc means nway; where x > 1; class c; var x; "
+        "output out=s n=n; run;"
+    ).datasets
+
+    assert isinstance(second.source, ir.Sort)
+    assert isinstance(second.source.source, ir.Aggregate)
+    assert second.source.source.source == ir.Filter(
+        ir.Filter(first, GREATER_1), present(C)
+    )
+
+
+@pytest.mark.parametrize(
+    ("program", "message"),
+    [
+        ("proc means data=t; var x; run;", "PROC MEANS without an OUTPUT statement"),
+        ("proc summary; output out=s n=n; run;", "PROC SUMMARY without DATA="),
+        ("proc means data=t; var x; output n=n; run;", "OUTPUT without OUT="),
+        ("proc means data=t; var x; output out=s; run;", "OUTPUT without statistics"),
+        (
+            "proc means data=t; var x; output out=perm.s n=n; run;",
+            "PROC MEANS writing to library PERM",
+        ),
+        ("proc means data=t; var x; output out=s median=m; run;", "statistic MEDIAN"),
+        (
+            "proc means data=t; output out=s mean=m; run;",
+            "MEAN without analysis variables",
+        ),
+        (
+            "proc means data=t; var x y; output out=s mean=m; run;",
+            "MEAN with 1 name for 2 variables",
+        ),
+        (
+            "proc means data=t; var x; output out=s mean(x y)=m n=; run;",
+            "MEAN with 1 name for 2 variables",
+        ),
+        (
+            "proc means data=t; var x; output out=s mean=a sum=a; run;",
+            "output variable a named twice",
+        ),
+        (
+            "proc means data=t nway; class a; var x; output out=s mean=a; run;",
+            "output variable a named twice",
+        ),
+        (
+            "proc means data=t; by k; class a; var x; output out=s n=n; run;",
+            "PROC MEANS with BY and CLASS but without NWAY",
+        ),
+        (
+            "proc means data=t(where=(x > 1)); where x < 5; var x; "
+            "output out=s n=n; run;",
+            "WHERE statement and WHERE= in PROC MEANS",
+        ),
+    ],
+)
+def test_unsupported_proc_means(program: str, message: str) -> None:
+    assert issues(program) == [message]

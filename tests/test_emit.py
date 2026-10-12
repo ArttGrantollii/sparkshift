@@ -1424,6 +1424,42 @@ def test_drop_duplicates_requires_columns() -> None:
         ir.DropDuplicates(TableScan(("t",)), ())
 
 
+def test_a_cube_with_its_grouping_id() -> None:
+    a = ir.Column(("a",))
+    grouping = ir.AggregateCall(ir.AggregateFunction.GROUPING_ID)
+    plan = ir.Aggregate(
+        TableScan(("t",)),
+        (a,),
+        (
+            ir.Alias(
+                ir.BinaryOp(ir.BinaryOperator.SUBTRACT, Literal(1), grouping), "t"
+            ),
+            ir.Alias(
+                ir.AggregateCall(ir.AggregateFunction.COUNT_IF, (ir.IsNull(a),)), "m"
+            ),
+            ir.Alias(ir.AggregateCall(ir.AggregateFunction.VAR_SAMP, (a,)), "v"),
+            ir.Alias(ir.AggregateCall(ir.AggregateFunction.STDDEV_SAMP, (a,)), "s"),
+        ),
+        cube=True,
+    )
+
+    code = emit(plan)
+
+    assert '    .cube(F.col("a"))\n' in code
+    assert '(F.lit(1) - F.grouping_id()).alias("t")' in code
+    assert 'F.count_if(F.col("a").isNull()).alias("m")' in code
+    assert 'F.var_samp(F.col("a")).alias("v")' in code
+    assert 'F.stddev_samp(F.col("a")).alias("s")' in code
+
+
+def test_a_cube_needs_keys_and_aggregates() -> None:
+    count = ir.AggregateCall(ir.AggregateFunction.COUNT)
+    with pytest.raises(ValueError, match="cube needs keys and aggregates"):
+        ir.Aggregate(TableScan(("t",)), (), (count,), cube=True)
+    with pytest.raises(ValueError, match="cube needs keys and aggregates"):
+        ir.Aggregate(TableScan(("t",)), (ir.Column(("a",)),), (), cube=True)
+
+
 def test_renames_by_name_are_one_call_each() -> None:
     plan = ir.RenameByName(
         TableScan(("t",)), (("name", "customer_name"), ("id", "key"))

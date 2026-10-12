@@ -320,7 +320,8 @@ class _Emitter:
                     # subquery that refers to its enclosing query.
                     steps = [self.call("select", aggregates)]
                 else:
-                    steps = [self.call("groupBy", keys), self.call("agg", aggregates)]
+                    method = "cube" if plan.cube else "groupBy"
+                    steps = [self.call(method, keys), self.call("agg", aggregates)]
                 return start, [*calls, *steps]
             case ir.Project(source=source, items=items):
                 start, calls = self.chain(source)
@@ -596,7 +597,7 @@ class _Emitter:
                 function=function, arguments=arguments, distinct=distinct
             ):
                 self.uses_functions = True
-                if not arguments:
+                if not arguments and function is ir.AggregateFunction.COUNT:
                     # COUNT(*): count rows, whatever their values.
                     return "F.count(F.lit(1))", _ATOM
                 name = function.value

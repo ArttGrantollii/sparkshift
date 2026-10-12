@@ -58,6 +58,8 @@ from sparkshift.sas_parser import (
     Missing,
     Name,
     Number,
+    OutputStatement,
+    ProcMeans,
     ProcSort,
     Program,
     RenameOption,
@@ -146,6 +148,10 @@ _DATE_FUNCTIONS = frozenset(
         "YEAR",
         "YRDIF",
     }
+)
+# The statistics an OUTPUT statement of PROC MEANS can store.
+_STATISTICS_COMPUTED = frozenset(
+    {"N", "NMISS", "SUM", "MEAN", "MIN", "MAX", "RANGE", "STD", "VAR"}
 )
 # INT, CEIL, and FLOOR give the integer a value is within 1E-12 of.
 _FUZZ = 1e-12
@@ -252,8 +258,10 @@ class _SasTranslator:
             self.variables, self.input_columns = {}, None
             if isinstance(step, DataStep):
                 self.data_step(step)
-            else:
+            elif isinstance(step, ProcSort):
                 self.proc_sort(step)
+            else:
+                self.proc_means(step)
         if self.issues:
             raise UnsupportedSQLError(self.issues)
         return SasTranslation(tuple(self.outputs), tuple(self.warnings))
@@ -346,28 +354,11 @@ class _SasTranslator:
         NODUPKEY, sorted with missing values first (they are the smallest),
         then the OUT= options."""
         issues_before = len(self.issues)
-        source = step.data
-        if source is None or (
-            source.library is None and source.member.upper() == "_LAST_"
-        ):
-            if not self.outputs:
-                self.unsupported(
-                    "PROC SORT without DATA=",
-                    step.span,
-                    "SAS sorts the data set created last, which this program does "
-                    "not create; name it with DATA=.",
-                )
-                return
-            options = source.options if source is not None else ()
-            source = Dataset(None, self.outputs[-1].name, options, step.span)
+        source = self.procedure_input(step.data, "SORT", step.span)
+        if source is None:
+            return
         if step.out is not None:
-            target = step.out
-            if target.library is not None and target.library.upper() != "WORK":
-                self.unsupported(
-                    f"PROC SORT writing to library {target.library.upper()}",
-                    target.span,
-                    _LIBRARY_HINT,
-                )
+            self.check_procedure_output(step.out, "SORT")
         elif source.library is not None and source.library.upper() != "WORK":
             self.unsupported(
                 f"PROC SORT replacing {source.library.upper()}.{source.member.upper()}",
@@ -375,24 +366,7 @@ class _SasTranslator:
                 "Without OUT=, PROC SORT replaces the data set it sorts. Add "
                 "OUT= to name a WORK data set.",
             )
-        relation, filtered = self.input_dataset(source)
-        self.input_columns = _input_columns(source)
-        for extra in step.wheres[1:]:
-            self.unsupported(
-                "second WHERE statement",
-                extra.span,
-                "Combine the conditions with AND in one WHERE statement.",
-            )
-        if step.wheres and filtered:
-            self.unsupported(
-                "WHERE statement and WHERE= in PROC SORT",
-                step.wheres[0].span,
-                "Combine the conditions in the WHERE= option.",
-            )
-        elif step.wheres:
-            condition = self.condition(step.wheres[0].condition)
-            if condition is not None:
-                relation = ir.Filter(relation, condition)
+        relation = self.procedure_rows(source, step.wheres, "SORT")
         names = _unique([variable.name for variable in step.by])
         if step.nodupkey:
             relation = ir.DropDuplicates(relation, names)
@@ -427,6 +401,196 @@ class _SasTranslator:
         named = ir.Named(target.member.lower(), relation)
         self.created[target.member.lower()] = named
         self.outputs.append(named)
+
+    def proc_means(self, step: ProcMeans) -> None:
+        """PROC MEANS or SUMMARY: one data set for each OUTPUT statement, with
+        the BY and CLASS variables, _TYPE_, _FREQ_, and the statistics."""
+        procedure = step.procedure
+        source = self.procedure_input(step.data, procedure, step.span)
+        if source is None:
+            return
+        relation = self.procedure_rows(source, step.wheres, procedure)
+        if not step.outputs:
+            self.unsupported(
+                f"PROC {procedure} without an OUTPUT statement",
+                step.span,
+                "Without OUTPUT, it prints a report; SparkShift creates DataFrames. "
+                "Add OUTPUT OUT= with the statistics.",
+            )
+        classes: dict[str, tuple[str, bool]] = {}
+        for name, missing in step.classes:
+            classes.setdefault(name.lower(), (name, missing or step.missing))
+        # Observations with a missing CLASS value are left out, unless MISSING.
+        present = [
+            _not(_is_missing(ir.Column((name,))))
+            for name, missing in classes.values()
+            if not missing
+        ]
+        if present:
+            relation = ir.Filter(relation, _all(present))
+        if classes and step.by and not step.nway:
+            self.unsupported(
+                f"PROC {procedure} with BY and CLASS but without NWAY",
+                step.span,
+                "SAS would compute every combination of the CLASS variables within "
+                "each BY group; add NWAY to compute only the full combination.",
+            )
+        for output in step.outputs:
+            self.means_output(step, output, relation, [n for n, _ in classes.values()])
+
+    def means_output(
+        self,
+        step: ProcMeans,
+        output: OutputStatement,
+        relation: ir.Relation,
+        classes: list[str],
+    ) -> None:
+        issues_before = len(self.issues)
+        if output.out is None:
+            self.unsupported(
+                "OUTPUT without OUT=",
+                output.span,
+                "SAS would name the data set DATA1, DATA2, ...; name it with OUT=.",
+            )
+            return
+        self.check_procedure_output(output.out, step.procedure)
+        if not output.statistics:
+            self.unsupported(
+                "OUTPUT without statistics",
+                output.span,
+                "SAS would write N, MIN, MAX, MEAN, and STD as rows marked by "
+                "_STAT_; name the statistics, as in MEAN(x)=average.",
+            )
+        by = _unique([variable.name for variable in step.by])
+        cube = bool(classes) and not step.nway
+        # _TYPE_ has a bit for each CLASS variable, the first the highest, set
+        # when the row's statistics are for that variable's values.
+        full = 2 ** len(classes) - 1
+        type_value: ir.Expression = ir.Literal(full)
+        if cube:
+            grouping = ir.AggregateCall(ir.AggregateFunction.GROUPING_ID)
+            type_value = ir.BinaryOp(ir.BinaryOperator.SUBTRACT, type_value, grouping)
+        aggregates: list[ir.Expression] = [
+            ir.Alias(type_value, "_TYPE_"),
+            ir.Alias(ir.AggregateCall(ir.AggregateFunction.COUNT), "_FREQ_"),
+        ]
+        taken = {name.lower() for name in (*by, *classes, "_TYPE_", "_FREQ_")}
+        for request in output.statistics:
+            statistic = "STD" if request.statistic == "STDDEV" else request.statistic
+            if statistic not in _STATISTICS_COMPUTED:
+                self.unsupported(
+                    f"statistic {request.statistic}",
+                    request.span,
+                    "SparkShift computes N, NMISS, SUM, MEAN, MIN, MAX, RANGE, STD, "
+                    "and VAR.",
+                )
+                continue
+            variables = request.variables or step.variables
+            if not variables:
+                self.unsupported(
+                    f"{request.statistic} without analysis variables",
+                    request.span,
+                    "SAS would use every numeric variable, which SparkShift cannot "
+                    "see; list them in a VAR statement.",
+                )
+                continue
+            names = request.names or variables
+            if len(names) != len(variables):
+                self.unsupported(
+                    f"{request.statistic} with {_count(len(names), 'name')} for "
+                    f"{_count(len(variables), 'variable')}",
+                    request.span,
+                    "Give one name for each variable.",
+                )
+                continue
+            for variable, name in zip(variables, names, strict=True):
+                if name.lower() in taken:
+                    self.unsupported(
+                        f"output variable {name} named twice",
+                        request.span,
+                        "Give each statistic its own name.",
+                    )
+                    continue
+                taken.add(name.lower())
+                value = _statistic(statistic, ir.Column((variable,)))
+                aggregates.append(ir.Alias(value, name))
+        keys = tuple(ir.Column((name,)) for name in (*by, *classes))
+        summary: ir.Relation = ir.Aggregate(relation, keys, tuple(aggregates), cube)
+        # The output is ordered by the BY variables, then by _TYPE_, then by
+        # the CLASS variables' values.
+        descending = {v.name.lower(): v.descending for v in step.by}
+        order = [
+            ir.SortKey(
+                ir.Column((name,)),
+                descending=descending[name.lower()],
+                nulls_first=not descending[name.lower()],
+            )
+            for name in by
+        ]
+        if cube:
+            order.append(ir.SortKey(ir.Column(("_TYPE_",)), False, True))
+        order += [ir.SortKey(ir.Column((name,)), False, True) for name in classes]
+        if order:
+            summary = ir.Sort(summary, tuple(order))
+        summary = self.dataset_options(summary, output.out, output_side=True)[0]
+        if len(self.issues) > issues_before:
+            return
+        named = ir.Named(output.out.member.lower(), summary)
+        self.created[output.out.member.lower()] = named
+        self.outputs.append(named)
+
+    def procedure_input(
+        self, data: Dataset | None, procedure: str, span: Span
+    ) -> Dataset | None:
+        """A procedure's DATA= data set: without DATA=, or with DATA=_LAST_,
+        the data set created last."""
+        if data is not None and not (
+            data.library is None and data.member.upper() == "_LAST_"
+        ):
+            return data
+        if not self.outputs:
+            self.unsupported(
+                f"PROC {procedure} without DATA=",
+                span,
+                "SAS would use the data set created last, which this program does "
+                "not create; name it with DATA=.",
+            )
+            return None
+        options = data.options if data is not None else ()
+        return Dataset(None, self.outputs[-1].name, options, span)
+
+    def procedure_rows(
+        self, source: Dataset, wheres: tuple[WhereStatement, ...], procedure: str
+    ) -> ir.Relation:
+        """The rows a procedure reads: its DATA= data set, after its options
+        and the WHERE statement."""
+        relation, filtered = self.input_dataset(source)
+        self.input_columns = _input_columns(source)
+        for extra in wheres[1:]:
+            self.unsupported(
+                "second WHERE statement",
+                extra.span,
+                "Combine the conditions with AND in one WHERE statement.",
+            )
+        if wheres and filtered:
+            self.unsupported(
+                f"WHERE statement and WHERE= in PROC {procedure}",
+                wheres[0].span,
+                "Combine the conditions in the WHERE= option.",
+            )
+        elif wheres:
+            condition = self.condition(wheres[0].condition)
+            if condition is not None:
+                relation = ir.Filter(relation, condition)
+        return relation
+
+    def check_procedure_output(self, dataset: Dataset, procedure: str) -> None:
+        if dataset.library is not None and dataset.library.upper() != "WORK":
+            self.unsupported(
+                f"PROC {procedure} writing to library {dataset.library.upper()}",
+                dataset.span,
+                _LIBRARY_HINT,
+            )
 
     def check_statements(self, step: DataStep) -> None:
         """Report the issues in the statements of a step that is not
@@ -1522,6 +1686,38 @@ def _not(condition: ir.Expression) -> ir.Expression:
     return ir.UnaryOp(ir.UnaryOperator.NOT, condition)
 
 
+def _statistic(statistic: str, variable: ir.Expression) -> ir.Expression:
+    """A PROC MEANS statistic of a variable's values that are not missing.
+    VAR and STD divide by n - 1, SAS's default (VARDEF=DF)."""
+    simple = {
+        "N": ir.AggregateFunction.COUNT,
+        "SUM": ir.AggregateFunction.SUM,
+        "MEAN": ir.AggregateFunction.AVG,
+        "MIN": ir.AggregateFunction.MIN,
+        "MAX": ir.AggregateFunction.MAX,
+        "STD": ir.AggregateFunction.STDDEV_SAMP,
+        "VAR": ir.AggregateFunction.VAR_SAMP,
+    }
+    if statistic in simple:
+        return ir.AggregateCall(simple[statistic], (variable,))
+    if statistic == "NMISS":
+        return ir.AggregateCall(ir.AggregateFunction.COUNT_IF, (ir.IsNull(variable),))
+    largest = ir.AggregateCall(ir.AggregateFunction.MAX, (variable,))
+    smallest = ir.AggregateCall(ir.AggregateFunction.MIN, (variable,))
+    return ir.BinaryOp(ir.BinaryOperator.SUBTRACT, largest, smallest)
+
+
+def _all(conditions: list[ir.Expression]) -> ir.Expression:
+    combined = conditions[0]
+    for condition in conditions[1:]:
+        combined = ir.BinaryOp(ir.BinaryOperator.AND, combined, condition)
+    return combined
+
+
+def _count(number: int, noun: str) -> str:
+    return f"{number} {noun}" + ("" if number == 1 else "s")
+
+
 def _sum(terms: list[ir.Expression]) -> ir.Expression:
     total = terms[0]
     for term in terms[1:]:
@@ -1558,7 +1754,7 @@ def _decimal_places(unit: int | float | None) -> int | None:
 
 
 def _arguments(count: int) -> str:
-    return f"{count} argument" + ("" if count == 1 else "s")
+    return _count(count, "argument")
 
 
 def _argument_range(fewest: int, most: int | None) -> str:

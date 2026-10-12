@@ -87,6 +87,14 @@ class AggregateFunction(Enum):
     AVG = "avg"
     MIN = "min"
     MAX = "max"
+    # The number of rows for which a condition is true.
+    COUNT_IF = "count_if"
+    # The sample variance and standard deviation (divisor n - 1).
+    VAR_SAMP = "var_samp"
+    STDDEV_SAMP = "stddev_samp"
+    # Which keys a row of a cube aggregates over: one bit per key, the first
+    # key the highest, set when the key is aggregated over. No arguments.
+    GROUPING_ID = "grouping_id"
 
 
 @dataclass(frozen=True)
@@ -95,7 +103,7 @@ class AggregateCall:
 
     ``COUNT`` with no arguments counts rows, as in ``COUNT(*)``. Every other
     call ignores NULL inputs, and returns NULL when all inputs are NULL
-    (``COUNT`` returns 0).
+    (``COUNT`` and ``COUNT_IF`` return 0).
     """
 
     function: AggregateFunction
@@ -499,15 +507,21 @@ class Aggregate:
     The output has the key columns first, then the aggregates, as PySpark's
     ``groupBy(...).agg(...)`` produces. With no keys, the whole input is one
     group, and the output has exactly one row even when the input is empty.
+
+    With ``cube``, rows are also grouped by every subset of the keys, as
+    ``cube(...)`` does; a key a row aggregates over is NULL in that row.
     """
 
     source: "Relation"
     keys: tuple[Expression, ...]
     aggregates: tuple[Expression, ...]
+    cube: bool = False
 
     def __post_init__(self) -> None:
         if not self.keys and not self.aggregates:
             raise ValueError("Aggregate needs keys or aggregates")
+        if self.cube and not (self.keys and self.aggregates):
+            raise ValueError("A cube needs keys and aggregates")
 
 
 class SetOperator(Enum):

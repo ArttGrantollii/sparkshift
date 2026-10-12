@@ -207,6 +207,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Options that do not change the result are accepted; `DUPOUT=`,
   `NOUNIQUEKEY`, and collating sequences are rejected.
 - `ir.DropDuplicates`, emitted as `.dropDuplicates([...])`.
+- SAS `PROC MEANS` and `PROC SUMMARY` with `OUTPUT OUT=`: `CLASS`, `VAR`,
+  `BY`, `WHERE`, `NWAY`, and `MISSING`, and the statistics `N`, `NMISS`,
+  `SUM`, `MEAN`, `MIN`, `MAX`, `RANGE`, `STD`, and `VAR`. Following SAS:
+  observations with a missing CLASS value are left out unless `MISSING`;
+  without `NWAY`, every combination of the CLASS variables, as `.cube(...)`,
+  with `_TYPE_` computed from `F.grouping_id()`; `_FREQ_` counts
+  observations; `VAR` and `STD` divide by n − 1; the output is ordered by BY,
+  `_TYPE_`, and CLASS. PROC MEANS without `OUTPUT`, quantiles, `AUTONAME`,
+  and `TYPES`/`WAYS`/`ID`/`FREQ`/`WEIGHT` are rejected.
+- IR: `Aggregate(cube=True)` (`.cube(...)`) and the aggregates `count_if`,
+  `var_samp`, `stddev_samp`, and `grouping_id`.
 
 ### Changed
 

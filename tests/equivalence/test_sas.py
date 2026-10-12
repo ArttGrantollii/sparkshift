@@ -703,6 +703,125 @@ SAS_SCENARIOS = {
             ),
         ),
     ),
+    # --- PROC MEANS and SUMMARY --------------------------------------------
+    # An observation with a missing CLASS value is left out: order 106 has no
+    # status. Statistics skip missing values: order 105's amount is missing.
+    "PROC MEANS NWAY: statistics for each CLASS value": (
+        "proc means data=orders(keep=status amount) nway noprint; class status; "
+        "var amount; output out=by_status n=count sum=total mean=average; run;",
+        Sorted(
+            "status",
+            _result(
+                "status string, _TYPE_ int, _FREQ_ bigint, count bigint, "
+                "total decimal(20,2), average decimal(14,6)",
+                ("cancelled", 1, 1, 1, Decimal("0.00"), Decimal("0.000000")),
+                ("completed", 1, 6, 6, Decimal("412.50"), Decimal("68.750000")),
+                ("pending", 1, 1, 0, None, None),
+                ("refunded", 1, 1, 1, Decimal("-15.75"), Decimal("-15.750000")),
+            ),
+        ),
+    ),
+    # With MISSING, missing CLASS values form a group, first in the order.
+    "MISSING keeps missing CLASS values": (
+        "proc means data=orders(keep=status amount) nway; class status / missing; "
+        "var amount; output out=by_status n=count; run;",
+        Sorted(
+            "status",
+            _result(
+                "status string, _TYPE_ int, _FREQ_ bigint, count bigint",
+                (None, 1, 1, 1),
+                ("cancelled", 1, 1, 1),
+                ("completed", 1, 6, 6),
+                ("pending", 1, 1, 0),
+                ("refunded", 1, 1, 1),
+            ),
+        ),
+    ),
+    # Without NWAY, every combination of the CLASS variables, numbered by
+    # _TYPE_: 0 for all observations, 1 for is_active alone, 2 for country
+    # alone, 3 for both. Customer 4 is left out: its country is missing.
+    "PROC SUMMARY: every combination, with _TYPE_": (
+        "proc summary data=customers; class country is_active; var score; "
+        "output out=combinations sum=total; run;",
+        Sorted(
+            "_TYPE_, country, is_active",
+            _result(
+                "country string, is_active boolean, _TYPE_ bigint, _FREQ_ bigint, "
+                "total double",
+                (None, None, 0, 7, 18.75),
+                (None, False, 1, 3, 13.0),
+                (None, True, 1, 4, 5.75),
+                ("DE", None, 2, 2, 1.25),
+                ("ES", None, 2, 1, None),
+                ("FR", None, 2, 2, 10.0),
+                ("US", None, 2, 2, 7.5),
+                ("DE", True, 3, 2, 1.25),
+                ("ES", True, 3, 1, None),
+                ("FR", False, 3, 2, 10.0),
+                ("US", False, 3, 1, 3.0),
+                ("US", True, 3, 1, 4.5),
+            ),
+        ),
+    ),
+    # A missing BY value forms a BY group of its own (order 107).
+    "PROC MEANS BY groups": (
+        "proc means data=orders noprint; by customer_id; var amount discount; "
+        "output out=per_customer max=top_amount top_discount "
+        "nmiss=missing_amount missing_discount; run;",
+        Sorted(
+            "customer_id",
+            _result(
+                "customer_id int, _TYPE_ int, _FREQ_ bigint, "
+                "top_amount decimal(10,2), top_discount double, "
+                "missing_amount bigint, missing_discount bigint",
+                (None, 0, 1, Decimal("42.00"), 0.0, 0, 0),
+                (1, 0, 2, Decimal("120.50"), 0.1, 0, 0),
+                (2, 0, 3, Decimal("80.00"), 0.1, 0, 1),
+                (3, 0, 2, Decimal("-15.75"), 0.25, 1, 0),
+                (4, 0, 1, Decimal("999.99"), 0.0, 0, 0),
+                (99, 0, 1, Decimal("10.00"), 0.0, 0, 0),
+            ),
+        ),
+    ),
+    # One row for the whole data set. VAR and STD divide by n - 1: the seven
+    # scores sum to 18.75 and their squares to 87.0625.
+    "statistics of the whole data set": (
+        "proc means data=customers noprint; var score; output out=overall "
+        "n=n nmiss=nmiss min=low max=high range=spread var=variance std=sd; run;",
+        _result(
+            "_TYPE_ int, _FREQ_ bigint, n bigint, nmiss bigint, low double, "
+            "high double, spread double, variance double, sd double",
+            (
+                0,
+                8,
+                7,
+                1,
+                -1.25,
+                5.0,
+                6.25,
+                (87.0625 - 18.75**2 / 7) / 6,
+                ((87.0625 - 18.75**2 / 7) / 6) ** 0.5,
+            ),
+        ),
+    ),
+    # Statistics name their variables, so no VAR statement is needed; the
+    # OUT= options apply to the output.
+    "statistics of named variables, with OUT= options": (
+        "proc summary data=orders nway; class status; "
+        "output out=summary(drop=_type_ rename=(_freq_=orders)) "
+        "sum(amount)=total mean(discount)=average_discount; run;",
+        Sorted(
+            "status",
+            _result(
+                "status string, orders bigint, total decimal(20,2), "
+                "average_discount double",
+                ("cancelled", 1, Decimal("0.00"), None),
+                ("completed", 6, Decimal("412.50"), 0.05),
+                ("pending", 1, None, 0.25),
+                ("refunded", 1, Decimal("-15.75"), 0.0),
+            ),
+        ),
+    ),
 }
 
 

@@ -728,3 +728,115 @@ def test_a_proc_sort_ends_at_the_next_step() -> None:
 def test_invalid_proc_sort(source: str, message: str) -> None:
     with pytest.raises(SASParseError, match=message):
         parse_sas(source)
+
+
+# --- PROC MEANS and SUMMARY ----------------------------------------------------
+
+
+def test_proc_means() -> None:
+    program = parse_sas(
+        "proc means data=orders(keep=a b c) nway missing noprint maxdec=2 n mean; "
+        "by k descending j; class a b; class c / missing order=unformatted; "
+        "var x y; where x > 1; "
+        "output out=stats(drop=_type_) n= mean(x)=avg sum(x y)=sx sy / noinherit; "
+        "run;"
+    )
+
+    assert program.issues == ()
+    assert shape(program.steps) == (
+        (
+            "ProcMeans",
+            "MEANS",
+            ("Dataset", None, "orders", (("KeepOption", ("a", "b", "c")),)),
+            True,
+            True,
+            (("ByVariable", "k", False), ("ByVariable", "j", True)),
+            (("a", False), ("b", False), ("c", True)),
+            ("x", "y"),
+            (
+                (
+                    "OutputStatement",
+                    ("Dataset", None, "stats", (("DropOption", ("_type_",)),)),
+                    (
+                        ("StatisticRequest", "N", (), ()),
+                        ("StatisticRequest", "MEAN", ("x",), ("avg",)),
+                        ("StatisticRequest", "SUM", ("x", "y"), ("sx", "sy")),
+                    ),
+                ),
+            ),
+            (("WhereStatement", binary(">", name("x"), number(1))),),
+        ),
+    )
+
+
+def test_proc_summary_without_options() -> None:
+    [step] = parse_sas("proc summary; output out=s; run;").steps
+
+    assert shape(step) == (
+        "ProcMeans",
+        "SUMMARY",
+        None,
+        False,
+        False,
+        (),
+        (),
+        (),
+        (("OutputStatement", ("Dataset", None, "s", ()), ()),),
+        (),
+    )
+
+
+def test_proc_means_options_that_do_not_change_the_output() -> None:
+    program = parse_sas(
+        "proc means data=a print fw=12 nonobs alpha=0.1 vardef=df qmethod=os "
+        "sumsize=512M threads clm median p90; run;"
+    )
+
+    assert program.issues == ()
+
+
+def test_unsupported_proc_means_options_and_statements() -> None:
+    program = parse_sas(
+        "proc means data=a vardef=n chartype order=freq descendtypes; "
+        "class a / descending preloadfmt; class b / order=data; var x / weight=w; "
+        "types a; id b; by c notsorted; "
+        "output out=s idgroup(max(x) out(y)=top) mean=; "
+        "output out=t mean= / autoname levels; run;"
+    )
+
+    assert issues(program) == [
+        "PROC MEANS option VARDEF=N",
+        "PROC MEANS option CHARTYPE",
+        "PROC MEANS option ORDER=FREQ",
+        "PROC MEANS option DESCENDTYPES",
+        "CLASS option DESCENDING",
+        "CLASS option PRELOADFMT",
+        "CLASS option ORDER=DATA",
+        "VAR statement options",
+        "TYPES statement in PROC MEANS",
+        "ID statement in PROC MEANS",
+        "BY option NOTSORTED",
+        "IDGROUP in an OUTPUT statement",
+        "OUTPUT option AUTONAME",
+        "OUTPUT option LEVELS",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ("proc means data=a; by x; by y; run;", "PROC MEANS with a second BY"),
+        ("proc means data=a; class; run;", "CLASS names no variables"),
+        ("proc means data=a; output out=s mean x; run;", "Expected '='"),
+        ("proc means data=a; output out=s mean(x=a; run;", "Expected '\\)'"),
+        ("proc means data=a; output out=s 'mean'=a; run;", "Expected OUT= or"),
+        ("proc means data=a; class x / 'missing'; run;", "Expected a CLASS option"),
+        ("proc means data=a; output out=s / 'x'; run;", "Expected an OUTPUT option"),
+        ("proc means data=a; where x >; run;", "Unexpected"),
+        ("proc means data=a; where x > 1 y; run;", "Unexpected 'y'"),
+        ("proc summary 1; run;", "Expected a PROC SUMMARY option"),
+    ],
+)
+def test_invalid_proc_means(source: str, message: str) -> None:
+    with pytest.raises(SASParseError, match=message):
+        parse_sas(source)
