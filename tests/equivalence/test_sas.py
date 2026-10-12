@@ -822,6 +822,75 @@ SAS_SCENARIOS = {
             ),
         ),
     ),
+    # --- PROC FREQ ---------------------------------------------------------
+    # A missing value keeps its count, but is left out of the percentages: the
+    # nine orders with a status make 100%. Missing values come first.
+    "PROC FREQ one-way table": (
+        "proc freq data=orders noprint; tables status / out=status_counts; run;",
+        Sorted(
+            "status",
+            _result(
+                "status string, COUNT bigint, PERCENT double",
+                (None, 1, None),
+                ("cancelled", 1, 100 / 9),
+                ("completed", 6, 600 / 9),
+                ("pending", 1, 100 / 9),
+                ("refunded", 1, 100 / 9),
+            ),
+        ),
+    ),
+    # With MISSING, a missing value is a level like any other.
+    "PROC FREQ with MISSING": (
+        "proc freq data=orders; tables status / out=status_counts missing; run;",
+        Sorted(
+            "status",
+            _result(
+                "status string, COUNT bigint, PERCENT double",
+                (None, 1, 10.0),
+                ("cancelled", 1, 10.0),
+                ("completed", 6, 60.0),
+                ("pending", 1, 10.0),
+                ("refunded", 1, 10.0),
+            ),
+        ),
+    ),
+    # Seven customers have both values; PCT_ROW divides by the country's
+    # count, PCT_COL by the is_active value's count.
+    "PROC FREQ two-way table with OUTPCT": (
+        "proc freq data=customers; tables country*is_active / out=cells outpct; run;",
+        Sorted(
+            "country, is_active",
+            _result(
+                "country string, is_active boolean, COUNT bigint, PERCENT double, "
+                "PCT_ROW double, PCT_COL double",
+                (None, None, 1, None, None, None),
+                ("DE", True, 2, 200 / 7, 100.0, 50.0),
+                ("ES", True, 1, 100 / 7, 100.0, 25.0),
+                ("FR", False, 2, 200 / 7, 100.0, 200 / 3),
+                ("US", False, 1, 100 / 7, 50.0, 100 / 3),
+                ("US", True, 1, 100 / 7, 50.0, 25.0),
+            ),
+        ),
+    ),
+    # Percentages are within each BY group; a missing BY value is a group.
+    # Customer 4's only order has no status, so nothing makes its 100%.
+    "PROC FREQ with BY groups": (
+        "proc freq data=orders; by customer_id; tables status / out=per_customer; run;",
+        Sorted(
+            "customer_id, status",
+            _result(
+                "customer_id int, status string, COUNT bigint, PERCENT double",
+                (None, "completed", 1, 100.0),
+                (1, "completed", 2, 100.0),
+                (2, "cancelled", 1, 100 / 3),
+                (2, "completed", 2, 200 / 3),
+                (3, "pending", 1, 50.0),
+                (3, "refunded", 1, 50.0),
+                (4, None, 1, None),
+                (99, "completed", 1, 100.0),
+            ),
+        ),
+    ),
 }
 
 

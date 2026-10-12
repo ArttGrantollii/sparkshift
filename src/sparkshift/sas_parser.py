@@ -306,7 +306,28 @@ class ProcMeans:
     span: Span
 
 
-Step = DataStep | ProcSort | ProcMeans
+@dataclass(frozen=True)
+class TablesStatement:
+    """TABLES a a*b / options. Each request is the variables of one table;
+    OUT= describes the last one."""
+
+    requests: tuple[tuple[str, ...], ...]
+    out: Dataset | None
+    missing: bool
+    outpct: bool
+    span: Span
+
+
+@dataclass(frozen=True)
+class ProcFreq:
+    data: Dataset | None
+    by: tuple[ByVariable, ...]
+    tables: tuple[TablesStatement, ...]
+    wheres: tuple[WhereStatement, ...]
+    span: Span
+
+
+Step = DataStep | ProcSort | ProcMeans | ProcFreq
 
 
 @dataclass(frozen=True)
@@ -441,7 +462,23 @@ _MEANS_OPTIONS_WITHOUT_EFFECT = frozenset(
     }
 )
 # Options with a value, accepted only with the value that is the default.
-_DEFAULT_VALUES = {"VARDEF": "DF", "ORDER": "UNFORMATTED"}
+_MEANS_DEFAULT_VALUES = {"VARDEF": "DF", "ORDER": "UNFORMATTED"}
+# PROC FREQ and TABLES options that change only the printed output.
+_FREQ_OPTIONS_WITHOUT_EFFECT = frozenset({"COMPRESS", "NLEVELS", "NOPRINT", "PAGE"})
+_TABLES_OPTIONS_WITHOUT_EFFECT = frozenset(
+    {
+        "CROSSLIST",
+        "LIST",
+        "MISSPRINT",
+        "NOCOL",
+        "NOCUM",
+        "NOFREQ",
+        "NOPERCENT",
+        "NOPRINT",
+        "NOROW",
+        "NOSPARSE",
+    }
+)
 
 
 class _Parser:
@@ -528,6 +565,8 @@ class _Parser:
             return self.proc_sort(header, body, span)
         if header[1].is_keyword("MEANS", "SUMMARY"):
             return self.proc_means(header, body, span)
+        if header[1].is_keyword("FREQ"):
+            return self.proc_freq(header, body, span)
         self.unsupported(f"PROC {header[1].text.upper()} step", header)
         return None
 
@@ -552,7 +591,11 @@ class _Parser:
             elif keyword == "MISSING" and not has_value:
                 missing = True
             elif not self.harmless_option(
-                keyword, value, _MEANS_OPTIONS_WITHOUT_EFFECT
+                keyword,
+                value,
+                # In the PROC statement, statistics choose what is printed.
+                _MEANS_OPTIONS_WITHOUT_EFFECT | _MEANS_STATISTICS,
+                _MEANS_DEFAULT_VALUES,
             ):
                 name = f"{keyword}={value}" if has_value else keyword
                 self.unsupported(
@@ -607,6 +650,105 @@ class _Parser:
             span,
         )
 
+    def proc_freq(
+        self, header: list[Token], body: list[list[Token]], span: Span
+    ) -> ProcFreq:
+        tokens = _Tokens(header[2:], self)
+        data = None
+        while not tokens.at_end():
+            option = tokens.take_name("a PROC FREQ option")
+            keyword = option.text.upper()
+            has_value = tokens.peek().is_symbol("=")
+            if keyword == "DATA" and has_value:
+                tokens.take()
+                data = self.dataset(tokens)
+                continue
+            value = self.option_value(tokens) if has_value else None
+            if not self.harmless_option(
+                keyword, value, _FREQ_OPTIONS_WITHOUT_EFFECT, {"ORDER": "INTERNAL"}
+            ):
+                name = f"{keyword}={value}" if has_value else keyword
+                self.unsupported(
+                    f"PROC FREQ option {name}",
+                    [option],
+                    "SparkShift supports DATA= and options that only change what "
+                    "is printed.",
+                )
+        by: list[ByVariable] = []
+        tables: list[TablesStatement] = []
+        wheres: list[WhereStatement] = []
+        for statement in body:
+            first = statement[0]
+            statement_span = self.span(first, statement[-1])
+            if first.is_keyword("BY"):
+                if by:
+                    raise self.error("PROC FREQ with a second BY statement", first)
+                by = self.by_variables(_Tokens(statement[1:], self))
+            elif first.is_keyword("TABLES", "TABLE"):
+                tables.append(self.tables_statement(statement, statement_span))
+            elif first.is_keyword("WHERE"):
+                where = _Tokens(statement[1:], self)
+                condition = self.expression(where)
+                where.expect_end()
+                wheres.append(WhereStatement(condition, statement_span))
+            else:
+                self.unsupported(
+                    f"{first.text.upper()} statement in PROC FREQ", statement
+                )
+        return ProcFreq(data, tuple(by), tuple(tables), tuple(wheres), span)
+
+    def tables_statement(self, statement: list[Token], span: Span) -> TablesStatement:
+        """TABLES a a*b / OUT=data-set MISSING OUTPCT."""
+        request_tokens, options = _split_options(statement[1:])
+        if not request_tokens:
+            raise self.error("TABLES names no variables", statement[0])
+        tokens = _Tokens(request_tokens, self)
+        requests: list[tuple[str, ...]] = []
+        while not tokens.at_end():
+            if tokens.peek().kind is not Kind.NAME:
+                # (a b)*c, or a variable list such as a--c.
+                self.unsupported(
+                    "table request with parentheses or a variable list",
+                    tokens.rest(),
+                    "Write each table out, as in TABLES a*c b*c.",
+                )
+                break
+            names = [tokens.take().text]
+            while tokens.peek().is_symbol("*"):
+                tokens.take()
+                names.append(tokens.take_name("a variable after *").text)
+            if tokens.peek().is_symbol("-", "--", ":"):
+                self.unsupported(
+                    "table request with parentheses or a variable list",
+                    tokens.rest(),
+                    "Write each table out, as in TABLES a*c b*c.",
+                )
+                break
+            requests.append(tuple(names))
+        out = None
+        missing = outpct = False
+        option_tokens = _Tokens(options, self)
+        while not option_tokens.at_end():
+            option = option_tokens.take_name("a TABLES option")
+            keyword = option.text.upper()
+            if keyword == "OUT" and option_tokens.peek().is_symbol("="):
+                option_tokens.take()
+                out = self.dataset(option_tokens)
+                continue
+            value = (
+                self.option_value(option_tokens)
+                if option_tokens.peek().is_symbol("=")
+                else None
+            )
+            if keyword == "MISSING" and value is None:
+                missing = True
+            elif keyword == "OUTPCT" and value is None:
+                outpct = True
+            elif not (value is None and keyword in _TABLES_OPTIONS_WITHOUT_EFFECT):
+                name = f"{keyword}={value}" if value is not None else keyword
+                self.unsupported(f"TABLES option {name}", [option])
+        return TablesStatement(tuple(requests), out, missing, outpct, span)
+
     def option_value(self, tokens: "_Tokens") -> str:
         """The value of an option after its equals sign, upper case: one
         token, a parenthesized group, or a size such as 512M."""
@@ -621,14 +763,17 @@ class _Parser:
         ).upper()
 
     def harmless_option(
-        self, keyword: str, value: str | None, without_effect: frozenset[str]
+        self,
+        keyword: str,
+        value: str | None,
+        without_effect: frozenset[str],
+        defaults: dict[str, str],
     ) -> bool:
-        """Whether an option leaves the output data set unchanged."""
-        if keyword in _DEFAULT_VALUES:
-            return value == _DEFAULT_VALUES[keyword]
-        return keyword in without_effect or (
-            value is None and keyword in _MEANS_STATISTICS
-        )
+        """Whether a PROC MEANS or FREQ option leaves the output data set
+        unchanged."""
+        if keyword in defaults:
+            return value == defaults[keyword]
+        return keyword in without_effect
 
     def class_options(self, options: list[Token]) -> bool:
         """The options of a CLASS statement, after the slash: whether it has

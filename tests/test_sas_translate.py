@@ -1415,3 +1415,137 @@ def test_proc_means_reads_the_last_data_set_and_a_where_statement() -> None:
 )
 def test_unsupported_proc_means(program: str, message: str) -> None:
     assert issues(program) == [message]
+
+
+# --- PROC FREQ -----------------------------------------------------------------
+
+COUNT = Column(("COUNT",))
+
+
+def percentage(column: str, *partition: ir.Expression) -> ir.Expression:
+    count = Column((column,))
+    total = ir.WindowCall(
+        ir.AggregateCall(ir.AggregateFunction.SUM, (count,)), tuple(partition)
+    )
+    return BinaryOp(
+        BinaryOperator.DIVIDE,
+        BinaryOp(BinaryOperator.MULTIPLY, count, Literal(100)),
+        total,
+    )
+
+
+def counted(
+    source: ir.Relation, complete: ir.Expression, *keys: ir.Expression
+) -> ir.Relation:
+    """The counts, and the helper column of those without missing values."""
+    count = ir.Alias(ir.AggregateCall(ir.AggregateFunction.COUNT), "COUNT")
+    counts = ir.Aggregate(source, keys, (count,))
+    return ir.WithColumn(counts, "_counted", ir.Case(((complete, COUNT),), None))
+
+
+def test_a_one_way_table() -> None:
+    [dataset] = translate(
+        "proc freq data=t noprint; tables a / out=counts; run;"
+    ).datasets
+
+    percent = ir.WithColumn(
+        counted(T, present(A), A), "PERCENT", percentage("_counted")
+    )
+    assert dataset == ir.Named(
+        "counts",
+        ir.Sort(ir.DropColumns(percent, ("_counted",)), (ascending("a"),)),
+    )
+
+
+def test_missing_values_count_in_percentages_with_missing() -> None:
+    [dataset] = translate(
+        "proc freq data=t; tables a / out=counts missing; run;"
+    ).datasets
+
+    count = ir.Alias(ir.AggregateCall(ir.AggregateFunction.COUNT), "COUNT")
+    assert isinstance(dataset.source, ir.Sort)
+    assert dataset.source.source == ir.WithColumn(
+        ir.Aggregate(T, (A,), (count,)), "PERCENT", percentage("COUNT")
+    )
+
+
+def test_a_two_way_table_with_row_and_column_percentages() -> None:
+    [dataset] = translate(
+        "proc freq data=t; by k; tables a b*c / out=cells outpct; run;"
+    ).datasets
+
+    k = Column(("k",))
+    complete = BinaryOp(BinaryOperator.AND, present(B), present(C))
+    base = counted(T, complete, k, B, C)
+    cells = ir.WithColumn(base, "PERCENT", percentage("_counted", k))
+    rows = ir.WithColumn(cells, "PCT_ROW", percentage("_counted", k, B))
+    columns = ir.WithColumn(rows, "PCT_COL", percentage("_counted", k, C))
+    assert dataset.source == ir.Sort(
+        ir.DropColumns(columns, ("_counted",)),
+        (ascending("k"), ascending("b"), ascending("c")),
+    )
+
+
+def test_the_helper_column_gets_a_free_name() -> None:
+    [dataset] = translate(
+        "proc freq data=t; tables _counted*_COUNTED_2 / out=s; run;"
+    ).datasets
+
+    assert isinstance(dataset.source, ir.Sort)
+    assert dataset.source.source == ir.DropColumns(
+        dataset.source.source.source, ("_counted_3",)
+    )
+
+
+def test_each_tables_statement_with_out_creates_a_data_set() -> None:
+    first, second = translate(
+        "proc freq data=t; tables a / out=one; tables b; tables c / out=two; run;"
+    ).datasets
+
+    assert (first.name, second.name) == ("one", "two")
+
+
+def test_proc_freq_reads_the_last_data_set_and_a_where_statement() -> None:
+    first, second = translate(
+        "data a; set t; run; proc freq; where x > 1; by descending k; "
+        "tables a / out=s(keep=a count); run;"
+    ).datasets
+
+    assert isinstance(second.source, ir.Project)
+    sorted_ = second.source.source
+    assert isinstance(sorted_, ir.Sort)
+    assert sorted_.keys == (descending("k"), ascending("a"))
+    dropped = sorted_.source
+    assert isinstance(dropped, ir.DropColumns)
+    percent = dropped.source
+    assert isinstance(percent, ir.WithColumn)
+    assert isinstance(percent.source, ir.WithColumn)
+    assert isinstance(percent.source.source, ir.Aggregate)
+    assert percent.source.source.source == ir.Filter(first, GREATER_1)
+
+
+@pytest.mark.parametrize(
+    ("program", "message"),
+    [
+        ("proc freq data=t; tables a; run;", "PROC FREQ without an OUT= data set"),
+        ("proc freq; tables a / out=s; run;", "PROC FREQ without DATA="),
+        (
+            "proc freq data=t; tables a / out=perm.s; run;",
+            "PROC FREQ writing to library PERM",
+        ),
+        (
+            "proc freq data=t; tables a / out=s outpct; run;",
+            "OUTPCT for a table that is not two-way",
+        ),
+        (
+            "proc freq data=t; tables a*b*c / out=s outpct; run;",
+            "OUTPCT for a table that is not two-way",
+        ),
+        (
+            "proc freq data=t; tables (a b)*c / out=s; run;",
+            "table request with parentheses or a variable list",
+        ),
+    ],
+)
+def test_unsupported_proc_freq(program: str, message: str) -> None:
+    assert issues(program) == [message]

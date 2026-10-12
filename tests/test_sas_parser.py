@@ -840,3 +840,71 @@ def test_unsupported_proc_means_options_and_statements() -> None:
 def test_invalid_proc_means(source: str, message: str) -> None:
     with pytest.raises(SASParseError, match=message):
         parse_sas(source)
+
+
+# --- PROC FREQ -----------------------------------------------------------------
+
+
+def test_proc_freq() -> None:
+    program = parse_sas(
+        "proc freq data=orders noprint order=internal; by k; where x > 1; "
+        "tables a a*b / out=counts(drop=percent) missing outpct nocum list; "
+        "table c; run;"
+    )
+
+    assert program.issues == ()
+    assert shape(program.steps) == (
+        (
+            "ProcFreq",
+            ("Dataset", None, "orders", ()),
+            (("ByVariable", "k", False),),
+            (
+                (
+                    "TablesStatement",
+                    (("a",), ("a", "b")),
+                    ("Dataset", None, "counts", (("DropOption", ("percent",)),)),
+                    True,
+                    True,
+                ),
+                ("TablesStatement", (("c",),), None, False, False),
+            ),
+            (("WhereStatement", binary(">", name("x"), number(1))),),
+        ),
+    )
+
+
+def test_unsupported_proc_freq_options_and_statements() -> None:
+    program = parse_sas(
+        "proc freq data=a order=freq formchar='|'; weight w; "
+        "tables a / out=c sparse outcum chisq; tables (a b)*c / out=d; "
+        "tables a-c; tables a*b--d; exact chisq; run;"
+    )
+
+    assert issues(program) == [
+        "PROC FREQ option ORDER=FREQ",
+        "PROC FREQ option FORMCHAR='|'",
+        "WEIGHT statement in PROC FREQ",
+        "TABLES option SPARSE",
+        "TABLES option OUTCUM",
+        "TABLES option CHISQ",
+        "table request with parentheses or a variable list",
+        "table request with parentheses or a variable list",
+        "table request with parentheses or a variable list",
+        "EXACT statement in PROC FREQ",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ("proc freq data=a; by x; by y; run;", "PROC FREQ with a second BY"),
+        ("proc freq data=a; tables / out=b; run;", "TABLES names no variables"),
+        ("proc freq data=a; tables a*; run;", "Expected a variable after \\*"),
+        ("proc freq data=a; tables a / 'out'; run;", "Expected a TABLES option"),
+        ("proc freq data=a; where x >; run;", "Unexpected"),
+        ("proc freq 'a'; run;", "Expected a PROC FREQ option"),
+    ],
+)
+def test_invalid_proc_freq(source: str, message: str) -> None:
+    with pytest.raises(SASParseError, match=message):
+        parse_sas(source)

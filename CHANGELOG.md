@@ -218,6 +218,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `TYPES`/`WAYS`/`ID`/`FREQ`/`WEIGHT` are rejected.
 - IR: `Aggregate(cube=True)` (`.cube(...)`) and the aggregates `count_if`,
   `var_samp`, `stddev_samp`, and `grouping_id`.
+- SAS `PROC FREQ` with `TABLES ... / OUT=`: one-way and n-way tables, `BY`,
+  `WHERE`, `MISSING`, and `OUTPCT` for two-way tables. `COUNT` and
+  `PERCENT` follow SAS: a combination with a missing value keeps its count
+  but is left out of the percentages, unless `MISSING`; percentages are
+  within BY groups (window sums); missing values come first in the order.
+  PROC FREQ without `OUT=`, its `OUTPUT` statement, `SPARSE`, `OUTCUM`, and
+  grouped requests are rejected.
 
 ### Changed
 

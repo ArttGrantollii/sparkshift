@@ -15,7 +15,8 @@ against SAS itself.
 
 All rules come from SAS's public documentation at documentation.sas.com:
 *SAS 9.4 Language Reference: Concepts*, *SAS 9.4 Functions and CALL Routines:
-Reference* for functions, and *Base SAS 9.4 Procedures Guide* for procedures.
+Reference* for functions, *Base SAS 9.4 Procedures Guide* for procedures, and
+the FREQ procedure chapter of the *SAS/STAT User's Guide*.
 
 ## Supported so far
 
@@ -35,6 +36,7 @@ Reference* for functions, and *Base SAS 9.4 Procedures Guide* for procedures.
 | Conditions | Comparisons (`=`, `^=`, `<`, `<=`, `>`, `>=` and `EQ`, `NE`, `LT`, `LE`, `GT`, `GE`); `AND`, `OR`, `NOT (...)`; `IN`, `NOT IN`; `BETWEEN ... AND`; `IS [NOT] MISSING` and `IS [NOT] NULL`; a number on its own. A comparison or condition used as a value is 1 or 0 |
 | Functions | `SUM`, `MEAN`, `MIN`, `MAX`, `N`, `NMISS`, `COALESCE`; `ROUND`, `INT`, `CEIL`, `FLOOR`, `ABS`, `MOD`; `UPCASE`, `LOWCASE`, `STRIP`, `TRIM`, `SUBSTR`, `LENGTH`; `CATS`, `CATX`, `COALESCEC`; `MISSING`. See [Functions](#functions) |
 | `PROC SORT` | `DATA=`, `OUT=` (with data set options), `NODUPKEY`, `BY` with `DESCENDING`, and `WHERE`. Options that do not change the result (`EQUALS`, `FORCE`, `TAGSORT`, `SORTSIZE=`, ...) are accepted. See [PROC SORT](#proc-sort) |
+| `PROC FREQ` | `DATA=`, `BY`, `WHERE`, and `TABLES a` or `TABLES a*b*...` with `/ OUT=`, `MISSING`, and `OUTPCT` (two-way tables). Options that only change printed output are accepted. See [PROC FREQ](#proc-freq) |
 | `PROC MEANS`, `PROC SUMMARY` | `DATA=`, `NWAY`, `MISSING`; `CLASS` (with `/ MISSING`), `VAR`, `BY`, `WHERE`; `OUTPUT OUT=` with `N`, `NMISS`, `SUM`, `MEAN`, `MIN`, `MAX`, `RANGE`, `STD`, and `VAR`, in the forms `mean=`, `mean=names`, and `mean(variables)=names`. Options that only change printed output are accepted. See [PROC MEANS and SUMMARY](#proc-means-and-summary) |
 | Comments | `/* ... */` anywhere, and `* ... ;` statements |
 
@@ -45,8 +47,9 @@ constants, variable lists such as `x1-x5` and `OF x1-x5`, macros (`%let`,
 `&name`), global statements such as `LIBNAME` and `OPTIONS`, `DATA _NULL_`,
 writing to a permanent library, PROC SORT's `DUPOUT=`, `NOUNIQUEKEY`, and
 collating sequences, PROC MEANS without `OUTPUT` (a printed report), quantiles
-such as `MEDIAN`, `AUTONAME`, `TYPES`, `WAYS`, `ID`, `FREQ`, and `WEIGHT`, and
-the other PROC steps.
+such as `MEDIAN`, `AUTONAME`, `TYPES`, `WAYS`, `ID`, `FREQ`, and `WEIGHT`, PROC
+FREQ without `OUT=` (printed tables), its `OUTPUT` statement, `SPARSE`,
+`OUTCUM`, and grouped requests such as `(a b)*c`, and the other PROC steps.
 
 ## The rules
 
@@ -377,6 +380,37 @@ descending _TYPE_ value"), then by the CLASS variables' values (the default,
 `ORDER=UNFORMATTED`, "orders values by their unformatted values"). BY groups
 come in the BY variables' order, as the input must be sorted by them.
 
+### PROC FREQ
+
+*SAS/STAT User's Guide*, "The FREQ Procedure": the PROC FREQ and TABLES
+statements, "Missing Values", and "Output Data Sets".
+
+**What is computed.** "The OUT= option in the TABLES statement creates an
+output data set that contains one observation for each combination of
+variable values (or table cell) in the last table request", with the BY
+variables, the table's variables, `COUNT` ("the table cell frequency"), and
+`PERCENT` ("the table cell percentage"). With `OUTPCT`, a two-way table also
+gets `PCT_ROW` and `PCT_COL`, the percentages of the row and column
+frequencies. Percentages are within each BY group: a window sum over the BY
+variables (`F.sum(...).over(Window.partitionBy(...))`).
+
+**Missing values.** "If an observation has a missing value for a variable in a
+TABLES request, by default PROC FREQ does not include that observation in the
+frequency or crosstabulation table. Also by default, PROC FREQ does not include
+observations with missing values in the computation of percentages", but "the
+TABLES statement OUT= data set includes an observation that contains the
+missing value frequency". So a combination with a missing value keeps its
+`COUNT`, with missing percentages, and the other percentages add up to 100.
+SparkShift computes this with a helper column, `_counted`, that holds the
+counts that take part (dropped afterwards). `MISSING` "treats missing values
+as a valid nonmissing level for all TABLES variables", included in the
+percentages.
+
+**Order.** By default, `ORDER=INTERNAL`: values in their unformatted order, and
+"the ORDER= option does not apply to missing values, which are always ordered
+first". The output is sorted by the BY variables, then by the table's
+variables.
+
 ## Limitations
 
 - **Column order of KEEP:** SAS keeps variables in the data set's order;
@@ -436,6 +470,11 @@ come in the BY variables' order, as the input must be sorted by them.
   with `MISSING`.
 - **BY with CLASS:** without `NWAY`, SAS computes every combination of the
   CLASS variables within each BY group; SparkShift requires `NWAY` then.
+- **Missing combinations in FREQ tables:** for a table of several variables,
+  SAS's documentation describes "an observation that contains the missing value
+  frequency" without saying how combinations that are partly missing are
+  grouped. SparkShift writes one row for each combination of values that has a
+  missing value, as for a one-way table, each with missing percentages.
 - **VAR is needed:** without a `VAR` statement, SAS analyzes every numeric
   variable, which SparkShift cannot see; name the variables in `VAR` or in
   `statistic(variables)=`.

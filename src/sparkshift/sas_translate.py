@@ -59,6 +59,7 @@ from sparkshift.sas_parser import (
     Name,
     Number,
     OutputStatement,
+    ProcFreq,
     ProcMeans,
     ProcSort,
     Program,
@@ -69,6 +70,7 @@ from sparkshift.sas_parser import (
     Statement,
     String,
     SubsettingIf,
+    TablesStatement,
     Unary,
     WhereOption,
     WhereStatement,
@@ -260,8 +262,10 @@ class _SasTranslator:
                 self.data_step(step)
             elif isinstance(step, ProcSort):
                 self.proc_sort(step)
-            else:
+            elif isinstance(step, ProcMeans):
                 self.proc_means(step)
+            else:
+                self.proc_freq(step)
         if self.issues:
             raise UnsupportedSQLError(self.issues)
         return SasTranslation(tuple(self.outputs), tuple(self.warnings))
@@ -537,6 +541,87 @@ class _SasTranslator:
             return
         named = ir.Named(output.out.member.lower(), summary)
         self.created[output.out.member.lower()] = named
+        self.outputs.append(named)
+
+    def proc_freq(self, step: ProcFreq) -> None:
+        """PROC FREQ: one data set for each TABLES statement with OUT=, with
+        the frequency (COUNT) and percentage (PERCENT) of each combination
+        of the last table's values."""
+        source = self.procedure_input(step.data, "FREQ", step.span)
+        if source is None:
+            return
+        relation = self.procedure_rows(source, step.wheres, "FREQ")
+        outputs = [tables for tables in step.tables if tables.out is not None]
+        if not outputs:
+            self.unsupported(
+                "PROC FREQ without an OUT= data set",
+                step.span,
+                "Without OUT= in a TABLES statement, it prints tables; SparkShift "
+                "creates DataFrames. Add / OUT= to a TABLES statement.",
+            )
+        for tables in outputs:
+            self.freq_output(step, tables, relation)
+
+    def freq_output(
+        self, step: ProcFreq, tables: TablesStatement, relation: ir.Relation
+    ) -> None:
+        issues_before = len(self.issues)
+        assert tables.out is not None
+        self.check_procedure_output(tables.out, "FREQ")
+        if not tables.requests:
+            return  # its request is already reported
+        variables = _unique(list(tables.requests[-1]))
+        by = _unique([variable.name for variable in step.by])
+        keys = tuple(ir.Column((name,)) for name in (*by, *variables))
+        count = ir.Alias(ir.AggregateCall(ir.AggregateFunction.COUNT), "COUNT")
+        result: ir.Relation = ir.Aggregate(relation, keys, (count,))
+        counted = "COUNT"
+        if not tables.missing:
+            # Without MISSING, a combination with a missing value keeps its
+            # count but is left out of every percentage, which is missing for
+            # it: the helper column holds the counts that take part.
+            counted = _unique_helper("_counted", (*by, *variables))
+            complete = _all(
+                [_not(_is_missing(ir.Column((name,)))) for name in variables]
+            )
+            only_complete = ir.Case(((complete, ir.Column(("COUNT",))),), None)
+            result = ir.WithColumn(result, counted, only_complete)
+        result = ir.WithColumn(result, "PERCENT", _percentage(by, counted))
+        if tables.outpct:
+            if len(variables) != 2:
+                self.unsupported(
+                    "OUTPCT for a table that is not two-way",
+                    tables.span,
+                    "SparkShift computes PCT_ROW and PCT_COL for two-way tables.",
+                )
+            else:
+                row, column = variables
+                result = ir.WithColumn(
+                    result, "PCT_ROW", _percentage((*by, row), counted)
+                )
+                result = ir.WithColumn(
+                    result, "PCT_COL", _percentage((*by, column), counted)
+                )
+        if counted != "COUNT":
+            result = ir.DropColumns(result, (counted,))
+        # Ordered by the BY variables, then by the table's values; missing
+        # values come first.
+        descending = {v.name.lower(): v.descending for v in step.by}
+        order = [
+            ir.SortKey(
+                ir.Column((name,)),
+                descending=descending[name.lower()],
+                nulls_first=not descending[name.lower()],
+            )
+            for name in by
+        ]
+        order += [ir.SortKey(ir.Column((name,)), False, True) for name in variables]
+        result = ir.Sort(result, tuple(order))
+        result = self.dataset_options(result, tables.out, output_side=True)[0]
+        if len(self.issues) > issues_before:
+            return
+        named = ir.Named(tables.out.member.lower(), result)
+        self.created[tables.out.member.lower()] = named
         self.outputs.append(named)
 
     def procedure_input(
@@ -1705,6 +1790,29 @@ def _statistic(statistic: str, variable: ir.Expression) -> ir.Expression:
     largest = ir.AggregateCall(ir.AggregateFunction.MAX, (variable,))
     smallest = ir.AggregateCall(ir.AggregateFunction.MIN, (variable,))
     return ir.BinaryOp(ir.BinaryOperator.SUBTRACT, largest, smallest)
+
+
+def _percentage(partition: tuple[str, ...], counted: str) -> ir.Expression:
+    """The ``counted`` column as a percentage of its total in the partition;
+    missing where it is missing."""
+    count = ir.Column((counted,))
+    total = ir.WindowCall(
+        ir.AggregateCall(ir.AggregateFunction.SUM, (count,)),
+        tuple(ir.Column((name,)) for name in partition),
+    )
+    hundredfold = ir.BinaryOp(ir.BinaryOperator.MULTIPLY, count, ir.Literal(100))
+    return ir.BinaryOp(ir.BinaryOperator.DIVIDE, hundredfold, total)
+
+
+def _unique_helper(name: str, taken: tuple[str, ...]) -> str:
+    """A helper column name that is not one of ``taken``."""
+    lowered = {other.lower() for other in taken}
+    suffix = 1
+    candidate = name
+    while candidate.lower() in lowered:
+        suffix += 1
+        candidate = f"{name}_{suffix}"
+    return candidate
 
 
 def _all(conditions: list[ir.Expression]) -> ir.Expression:
