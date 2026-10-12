@@ -14,6 +14,7 @@ order 107 a missing customer. Product 1's name has leading and trailing
 blanks, product 4's trailing blanks only.
 """
 
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -31,6 +32,15 @@ def _result(columns: str, *rows: tuple[object, ...]) -> Snapshot:
     """Expected columns, written "name type, name type", and rows."""
     pairs = [column.split() for column in columns.split(", ")]
     return Snapshot(tuple((name, kind) for name, kind in pairs), rows)
+
+
+@dataclass(frozen=True)
+class Sorted:
+    """Expected rows in SAS's order: sorted by the ``keys`` columns, written
+    "a, b". Rows equal on every key may come in any order."""
+
+    keys: str
+    result: Snapshot
 
 
 SAS_SCENARIOS = {
@@ -560,6 +570,139 @@ SAS_SCENARIOS = {
         "where lowcase(country) = 'de' or sum(score, 1) > 5; keep customer_id; run;",
         _result("customer_id int", (1,), (5,), (6,), (7,), (7,)),
     ),
+    # --- PROC SORT ---------------------------------------------------------
+    # Missing values sort first: they are smaller than any number.
+    "PROC SORT puts missing values first": (
+        "proc sort data=customers(keep=customer_id score) out=by_score; by score; run;",
+        Sorted(
+            "score",
+            _result(
+                "customer_id int, score double",
+                (3, None),
+                (5, -1.25),
+                (4, 0.0),
+                (6, 2.5),
+                (2, 3.0),
+                (1, 4.5),
+                (7, 5.0),
+                (7, 5.0),
+            ),
+        ),
+    ),
+    # DESCENDING runs from the largest value to the smallest, so missing
+    # values come last.
+    "DESCENDING puts missing values last": (
+        "proc sort data=customers(keep=customer_id score) out=by_score; "
+        "by descending score; run;",
+        Sorted(
+            "score",
+            _result(
+                "customer_id int, score double",
+                (7, 5.0),
+                (7, 5.0),
+                (1, 4.5),
+                (2, 3.0),
+                (6, 2.5),
+                (4, 0.0),
+                (5, -1.25),
+                (3, None),
+            ),
+        ),
+    ),
+    # The second BY variable orders the rows that tie on the first.
+    "sorting by two variables, one descending": (
+        "proc sort data=orders(keep=order_id customer_id amount) out=sorted; "
+        "by customer_id descending amount; run;",
+        Sorted(
+            "customer_id, amount",
+            _result(
+                "order_id int, customer_id int, amount decimal(10,2)",
+                (107, None, Decimal("42.00")),
+                (101, 1, Decimal("120.50")),
+                (102, 1, Decimal("80.00")),
+                (109, 2, Decimal("80.00")),
+                (109, 2, Decimal("80.00")),
+                (103, 2, Decimal("0.00")),
+                (104, 3, Decimal("-15.75")),
+                (105, 3, None),
+                (106, 4, Decimal("999.99")),
+                (108, 99, Decimal("10.00")),
+            ),
+        ),
+    ),
+    # Text sorts in ASCII order: blank first, digits, upper case, then lower
+    # case. Product 1's name starts with blanks.
+    "text sorts in ASCII order": (
+        "proc sort data=products(keep=product_id name) out=by_name; "
+        "where name ne ' '; by name; run;",
+        Sorted(
+            "name",
+            _result(
+                "product_id int, name string",
+                (1, "  Widget  "),
+                (4, "Bolt   "),
+                (3, "Café Crème"),
+                (7, "ZIP-Tie"),
+                (2, "gadget"),
+            ),
+        ),
+    ),
+    # NODUPKEY keeps one observation for each BY value: customer 7's second,
+    # identical, row is dropped.
+    "NODUPKEY keeps one row per BY value": (
+        "proc sort data=customers(keep=customer_id name) out=unique nodupkey; "
+        "by descending customer_id; run;",
+        Sorted(
+            "customer_id",
+            _result(
+                "customer_id int, name string",
+                (7, "Grace"),
+                (6, None),
+                (5, ""),
+                (4, "Zoë"),
+                (3, "José"),
+                (2, "Bob"),
+                (1, "Alice"),
+            ),
+        ),
+    ),
+    # Without DATA=, PROC SORT sorts the data set created last; without OUT=,
+    # the sorted data replaces it.
+    "PROC SORT of the last data set, in place": (
+        "data scored; set customers(keep=customer_id score); where score ne .; "
+        "run; proc sort; by descending score customer_id; run;",
+        Sorted(
+            "score, customer_id",
+            _result(
+                "customer_id int, score double",
+                (7, 5.0),
+                (7, 5.0),
+                (1, 4.5),
+                (2, 3.0),
+                (6, 2.5),
+                (4, 0.0),
+                (5, -1.25),
+            ),
+        ),
+    ),
+    # The WHERE statement filters the input; OUT= options apply to the
+    # sorted output.
+    "PROC SORT with WHERE and OUT= options": (
+        "proc sort data=orders(keep=order_id status amount) "
+        "out=completed(drop=status); where status = 'completed'; by amount; run;",
+        Sorted(
+            "amount",
+            _result(
+                "order_id int, amount decimal(10,2)",
+                (108, Decimal("10.00")),
+                (107, Decimal("42.00")),
+                (102, Decimal("80.00")),
+                (109, Decimal("80.00")),
+                (109, Decimal("80.00")),
+                (101, Decimal("120.50")),
+            ),
+        ),
+    ),
 }
 
 
@@ -567,6 +710,10 @@ SAS_SCENARIOS = {
     ("program", "expected"), SAS_SCENARIOS.values(), ids=SAS_SCENARIOS.keys()
 )
 def test_sas_scenario(
-    spark_tables: "SparkSession", program: str, expected: Snapshot
+    spark_tables: "SparkSession", program: str, expected: Snapshot | Sorted
 ) -> None:
-    assert_sas_result(spark_tables, program, expected)
+    if isinstance(expected, Sorted):
+        keys = expected.keys.split(", ")
+        assert_sas_result(spark_tables, program, expected.result, keys)
+    else:
+        assert_sas_result(spark_tables, program, expected)

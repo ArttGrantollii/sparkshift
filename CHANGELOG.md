@@ -199,6 +199,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   work in conditions and comparisons. Other functions, `OF` variable lists,
   and arguments of the wrong type are rejected; `MOD` by a fraction is a
   review warning.
+- SAS `PROC SORT`: `DATA=` (or the data set created last), `OUT=` (or the
+  sorted data replaces the input), data set options, `WHERE`, `BY` with
+  `DESCENDING`, and `NODUPKEY`, as `.dropDuplicates(...)` and `.orderBy(...)`.
+  Missing values sort first, as SAS documents, and last with `DESCENDING`.
+  `NODUPKEY` warns that Spark may keep any row of a BY group, not the first.
+  Options that do not change the result are accepted; `DUPOUT=`,
+  `NOUNIQUEKEY`, and collating sequences are rejected.
+- `ir.DropDuplicates`, emitted as `.dropDuplicates([...])`.
 
 ### Changed
 

@@ -251,8 +251,30 @@ class DataStep:
 
 
 @dataclass(frozen=True)
+class ByVariable:
+    name: str
+    descending: bool
+
+
+@dataclass(frozen=True)
+class ProcSort:
+    """PROC SORT. Without DATA=, it sorts the data set created last; without
+    OUT=, the sorted data set replaces the one it sorts."""
+
+    data: Dataset | None
+    out: Dataset | None
+    by: tuple[ByVariable, ...]
+    nodupkey: bool
+    wheres: tuple[WhereStatement, ...]
+    span: Span
+
+
+Step = DataStep | ProcSort
+
+
+@dataclass(frozen=True)
 class Program:
-    steps: tuple[DataStep, ...]
+    steps: tuple[Step, ...]
     # Valid SAS that SparkShift does not translate.
     issues: tuple[Diagnostic, ...] = field(default=())
 
@@ -290,9 +312,24 @@ _NOT_SYMBOLS = ("^", "~", "¬")
 _OR_SYMBOLS = ("|", "!", "¦")
 _STEP_KEYWORDS = ("DATA", "PROC")
 _STEP_ENDS = ("RUN", "QUIT")
-# Statements valid in a DATA step that SparkShift does not translate yet; any
-# other statement there is reported by its first word.
-_ASSIGNMENT_HINT = "Assignments are not supported yet."
+# PROC SORT options that do not change the sorted data: they control
+# performance, stability (Spark's sort is not stable either way), or file
+# attributes.
+_SORT_OPTIONS_WITHOUT_EFFECT = frozenset(
+    {
+        "DATECOPY",
+        "EQUALS",
+        "FORCE",
+        "NOEQUALS",
+        "NOTHREADS",
+        "OVERWRITE",
+        "PRESORTED",
+        "SIZE",
+        "SORTSIZE",
+        "TAGSORT",
+        "THREADS",
+    }
+)
 
 
 class _Parser:
@@ -328,7 +365,9 @@ class _Parser:
             if first.is_keyword("DATA"):
                 steps.append(self.data_step())
             elif first.is_keyword("PROC"):
-                self.proc_step()
+                step = self.proc_step()
+                if step is not None:
+                    steps.append(step)
             elif first.is_keyword(*_STEP_ENDS):
                 self.index += 1  # a RUN with no step to end does nothing
             else:
@@ -356,19 +395,96 @@ class _Parser:
         last = self.statements[self.index - 1]
         return DataStep(outputs, tuple(statements), self.span(header[0], last[-1]))
 
-    def proc_step(self) -> None:
+    def proc_step(self) -> Step | None:
         header = self.statements[self.index]
         if len(header) < 2:
             raise self.error("PROC without a procedure name", header[0])
-        self.unsupported(f"PROC {header[1].text.upper()} step", header)
         self.index += 1
+        body: list[list[Token]] = []
+        last = header[-1]
         while self.index < len(self.statements):
-            first = self.statements[self.index][0]
-            if first.is_keyword(*_STEP_KEYWORDS):
-                return
+            statement = self.statements[self.index]
+            if statement[0].is_keyword(*_STEP_KEYWORDS):
+                break
             self.index += 1
-            if first.is_keyword(*_STEP_ENDS):
-                return
+            last = statement[-1]
+            if statement[0].is_keyword(*_STEP_ENDS):
+                break
+            body.append(statement)
+        span = self.span(header[0], last)
+        if header[1].is_keyword("SORT"):
+            return self.proc_sort(header, body, span)
+        self.unsupported(f"PROC {header[1].text.upper()} step", header)
+        return None
+
+    def proc_sort(
+        self, header: list[Token], body: list[list[Token]], span: Span
+    ) -> ProcSort:
+        tokens = _Tokens(header[2:], self)
+        data = out = None
+        nodupkey = False
+        while not tokens.at_end():
+            option = tokens.take_name("a PROC SORT option")
+            keyword = option.text.upper()
+            has_value = tokens.peek().is_symbol("=")
+            if keyword in ("DATA", "OUT") and has_value:
+                tokens.take()
+                dataset = self.dataset(tokens)
+                if keyword == "DATA":
+                    data = dataset
+                else:
+                    out = dataset
+                continue
+            if has_value:
+                tokens.take()
+                tokens.skip_option_value()
+                value = tokens.previous()
+                if value.kind is Kind.NUMBER and tokens.adjacent(value):
+                    tokens.take()  # the unit of a size such as 512M
+            if keyword == "NODUPKEY":
+                nodupkey = True
+            elif keyword not in _SORT_OPTIONS_WITHOUT_EFFECT:
+                name = f"{keyword}=" if has_value else keyword
+                self.unsupported(
+                    f"PROC SORT option {name}",
+                    [option],
+                    "SparkShift supports DATA=, OUT=, and NODUPKEY.",
+                )
+        by: list[ByVariable] = []
+        wheres: list[WhereStatement] = []
+        for statement in body:
+            first = statement[0]
+            rest = _Tokens(statement[1:], self)
+            if first.is_keyword("BY"):
+                if by:
+                    raise self.error("PROC SORT with a second BY statement", first)
+                by = self.by_variables(rest)
+            elif first.is_keyword("WHERE"):
+                condition = self.expression(rest)
+                rest.expect_end()
+                wheres.append(
+                    WhereStatement(condition, self.span(first, statement[-1]))
+                )
+            else:
+                self.unsupported(
+                    f"{first.text.upper()} statement in PROC SORT", statement
+                )
+        if not by:
+            raise self.error("PROC SORT without a BY statement", header[0])
+        return ProcSort(data, out, tuple(by), nodupkey, tuple(wheres), span)
+
+    def by_variables(self, tokens: "_Tokens") -> list[ByVariable]:
+        """BY a DESCENDING b: DESCENDING applies to the variable after it."""
+        variables = []
+        while not tokens.at_end():
+            name = tokens.take_name("a BY variable")
+            descending = name.is_keyword("DESCENDING") and not tokens.at_end()
+            if descending:
+                name = tokens.take_name("a variable after DESCENDING")
+            variables.append(ByVariable(name.text, descending))
+        if not variables:
+            raise self.error("BY names no variables", tokens.previous())
+        return variables
 
     def statement(self) -> Statement | None:
         """Parse the next DATA step statement, with the statements an IF or

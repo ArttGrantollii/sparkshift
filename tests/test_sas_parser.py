@@ -107,12 +107,12 @@ def test_a_data_step_ends_at_a_proc_step() -> None:
 
 def test_proc_steps_are_reported_and_skipped() -> None:
     program = parse_sas(
-        "proc sort data=a out=b; by x; run; "
+        "proc transpose data=a out=b; by x; run; "
         "proc sql; select 1; quit; "
         "data c; set b; run;"
     )
 
-    assert issues(program) == ["PROC SORT step", "PROC SQL step"]
+    assert issues(program) == ["PROC TRANSPOSE step", "PROC SQL step"]
     assert [step.outputs[0].member for step in program.steps] == ["c"]
 
 
@@ -639,3 +639,92 @@ def test_an_of_variable_list_is_reported_not_rejected() -> None:
 def test_an_unclosed_of_variable_list_is_an_error() -> None:
     with pytest.raises(SASParseError, match="Expected \\) to end the function call"):
         parse_sas("data a; set b; total = sum(of x1 x2; run;")
+
+
+# --- PROC SORT -----------------------------------------------------------------
+
+
+def test_proc_sort() -> None:
+    program = parse_sas(
+        "proc sort data=sales.orders(keep=a b) out=sorted nodupkey; "
+        "by a descending b; where a > 1; run;"
+    )
+
+    assert program.issues == ()
+    assert shape(program.steps) == (
+        (
+            "ProcSort",
+            ("Dataset", "sales", "orders", (("KeepOption", ("a", "b")),)),
+            ("Dataset", None, "sorted", ()),
+            (("ByVariable", "a", False), ("ByVariable", "b", True)),
+            True,
+            (("WhereStatement", binary(">", name("a"), number(1))),),
+        ),
+    )
+
+
+def test_proc_sort_without_data_or_out() -> None:
+    [step] = parse_sas("PROC SORT; BY x; RUN;").steps
+
+    assert shape(step) == (
+        "ProcSort",
+        None,
+        None,
+        (("ByVariable", "x", False),),
+        False,
+        (),
+    )
+
+
+def test_a_variable_named_descending() -> None:
+    [step] = parse_sas("proc sort data=a; by descending; run;").steps
+
+    assert shape(step)[3] == (("ByVariable", "descending", False),)
+
+
+def test_proc_sort_options_that_do_not_change_the_result() -> None:
+    program = parse_sas(
+        "proc sort data=a force tagsort sortsize=max equals noequals presorted "
+        "threads nothreads datecopy overwrite size=1G; by x; run;"
+    )
+
+    assert program.issues == ()
+
+
+def test_unsupported_proc_sort_options_and_statements() -> None:
+    program = parse_sas(
+        "proc sort data=a dupout=d nouniquekey sortseq=ascii; by x; "
+        "format x 8.; key y; run;"
+    )
+
+    assert issues(program) == [
+        "PROC SORT option DUPOUT=",
+        "PROC SORT option NOUNIQUEKEY",
+        "PROC SORT option SORTSEQ=",
+        "FORMAT statement in PROC SORT",
+        "KEY statement in PROC SORT",
+    ]
+    assert len(program.steps) == 1
+
+
+def test_a_proc_sort_ends_at_the_next_step() -> None:
+    program = parse_sas("proc sort data=a; by x; data b; set a; run;")
+
+    assert [type(step).__name__ for step in program.steps] == ["ProcSort", "DataStep"]
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ("proc sort data=a; run;", "PROC SORT without a BY statement"),
+        ("proc sort data=a; by x; by y; run;", "PROC SORT with a second BY statement"),
+        ("proc sort data=a; by; run;", "BY names no variables"),
+        ("proc sort data=a; by x-y; run;", "Expected a BY variable"),
+        ("proc sort data=a; by descending 1; run;", "Expected a variable after"),
+        ("proc sort 'a'; by x; run;", "Expected a PROC SORT option"),
+        ("proc sort data=a; by x; where x >; run;", "Unexpected"),
+    ],
+)
+def test_invalid_proc_sort(source: str, message: str) -> None:
+    with pytest.raises(SASParseError, match=message):
+        parse_sas(source)

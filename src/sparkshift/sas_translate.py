@@ -1,7 +1,7 @@
 """Translate a parsed SAS program into SparkShift's IR.
 
-Each DATA step becomes a named relation: a DataFrame variable in the
-generated code. The rules SAS follows, and their sources in the SAS
+Each DATA step and PROC SORT step becomes a named relation: a DataFrame
+variable in the generated code. The rules SAS follows, and their sources in the SAS
 documentation, are listed in docs/sas.md. In short:
 
 - Variables are dropped, kept, and renamed in this order: options on the
@@ -58,6 +58,7 @@ from sparkshift.sas_parser import (
     Missing,
     Name,
     Number,
+    ProcSort,
     Program,
     RenameOption,
     RenameStatement,
@@ -249,7 +250,10 @@ class _SasTranslator:
     def translation(self) -> SasTranslation:
         for step in self.program.steps:
             self.variables, self.input_columns = {}, None
-            self.data_step(step)
+            if isinstance(step, DataStep):
+                self.data_step(step)
+            else:
+                self.proc_sort(step)
         if self.issues:
             raise UnsupportedSQLError(self.issues)
         return SasTranslation(tuple(self.outputs), tuple(self.warnings))
@@ -335,6 +339,93 @@ class _SasTranslator:
             return
         named = ir.Named(output.member.lower(), relation)
         self.created[output.member.lower()] = named
+        self.outputs.append(named)
+
+    def proc_sort(self, step: ProcSort) -> None:
+        """PROC SORT: the input, filtered, without duplicate BY values with
+        NODUPKEY, sorted with missing values first (they are the smallest),
+        then the OUT= options."""
+        issues_before = len(self.issues)
+        source = step.data
+        if source is None or (
+            source.library is None and source.member.upper() == "_LAST_"
+        ):
+            if not self.outputs:
+                self.unsupported(
+                    "PROC SORT without DATA=",
+                    step.span,
+                    "SAS sorts the data set created last, which this program does "
+                    "not create; name it with DATA=.",
+                )
+                return
+            options = source.options if source is not None else ()
+            source = Dataset(None, self.outputs[-1].name, options, step.span)
+        if step.out is not None:
+            target = step.out
+            if target.library is not None and target.library.upper() != "WORK":
+                self.unsupported(
+                    f"PROC SORT writing to library {target.library.upper()}",
+                    target.span,
+                    _LIBRARY_HINT,
+                )
+        elif source.library is not None and source.library.upper() != "WORK":
+            self.unsupported(
+                f"PROC SORT replacing {source.library.upper()}.{source.member.upper()}",
+                source.span,
+                "Without OUT=, PROC SORT replaces the data set it sorts. Add "
+                "OUT= to name a WORK data set.",
+            )
+        relation, filtered = self.input_dataset(source)
+        self.input_columns = _input_columns(source)
+        for extra in step.wheres[1:]:
+            self.unsupported(
+                "second WHERE statement",
+                extra.span,
+                "Combine the conditions with AND in one WHERE statement.",
+            )
+        if step.wheres and filtered:
+            self.unsupported(
+                "WHERE statement and WHERE= in PROC SORT",
+                step.wheres[0].span,
+                "Combine the conditions in the WHERE= option.",
+            )
+        elif step.wheres:
+            condition = self.condition(step.wheres[0].condition)
+            if condition is not None:
+                relation = ir.Filter(relation, condition)
+        names = _unique([variable.name for variable in step.by])
+        if step.nodupkey:
+            relation = ir.DropDuplicates(relation, names)
+            by = {name.lower() for name in names}
+            if self.input_columns is None or not self.input_columns <= by:
+                self.warn(
+                    "NODUPKEY keeps any row of each BY group",
+                    step.span,
+                    "SAS keeps the first observation of each BY group, in the "
+                    "input's order; Spark's dropDuplicates keeps any one. The rows "
+                    "agree on the BY variables; other variables can differ.",
+                )
+        # A variable listed again sorts nothing more: its first place counts.
+        first_places = {}
+        for variable in step.by:
+            first_places.setdefault(variable.name.lower(), variable)
+        keys = tuple(
+            ir.SortKey(
+                ir.Column((variable.name,)),
+                descending=variable.descending,
+                # Missing values are the smallest: first, or last descending.
+                nulls_first=not variable.descending,
+            )
+            for variable in first_places.values()
+        )
+        relation = ir.Sort(relation, keys)
+        target = step.out or source
+        if step.out is not None:
+            relation = self.dataset_options(relation, step.out, output_side=True)[0]
+        if len(self.issues) > issues_before:
+            return
+        named = ir.Named(target.member.lower(), relation)
+        self.created[target.member.lower()] = named
         self.outputs.append(named)
 
     def check_statements(self, step: DataStep) -> None:

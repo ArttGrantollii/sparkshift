@@ -166,7 +166,7 @@ SparkShift is learning to convert SAS programs too. So far it converts DATA
 steps that read a data set, filter it with `WHERE`, compute new variables with
 assignments, arithmetic, and common functions (`SUM`, `ROUND`, `UPCASE`,
 `CATX`, and more), choose values with `IF`/`ELSE`, delete rows, and keep,
-drop, or rename variables:
+drop, or rename variables, and `PROC SORT` steps, with `NODUPKEY`:
 
 ```bash
 sparkshift convert low_scores.sas --dialect sas

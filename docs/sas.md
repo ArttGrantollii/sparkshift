@@ -14,8 +14,8 @@ checks. This verifies SparkShift against SAS's documented behavior, not
 against SAS itself.
 
 All rules come from SAS's public documentation at documentation.sas.com:
-*SAS 9.4 Language Reference: Concepts* and, for functions, *SAS 9.4 Functions
-and CALL Routines: Reference*.
+*SAS 9.4 Language Reference: Concepts*, *SAS 9.4 Functions and CALL Routines:
+Reference* for functions, and *Base SAS 9.4 Procedures Guide* for procedures.
 
 ## Supported so far
 
@@ -34,6 +34,7 @@ and CALL Routines: Reference*.
 | `LENGTH name $ n;` | Before a variable's first use; numbers only with length 8 |
 | Conditions | Comparisons (`=`, `^=`, `<`, `<=`, `>`, `>=` and `EQ`, `NE`, `LT`, `LE`, `GT`, `GE`); `AND`, `OR`, `NOT (...)`; `IN`, `NOT IN`; `BETWEEN ... AND`; `IS [NOT] MISSING` and `IS [NOT] NULL`; a number on its own. A comparison or condition used as a value is 1 or 0 |
 | Functions | `SUM`, `MEAN`, `MIN`, `MAX`, `N`, `NMISS`, `COALESCE`; `ROUND`, `INT`, `CEIL`, `FLOOR`, `ABS`, `MOD`; `UPCASE`, `LOWCASE`, `STRIP`, `TRIM`, `SUBSTR`, `LENGTH`; `CATS`, `CATX`, `COALESCEC`; `MISSING`. See [Functions](#functions) |
+| `PROC SORT` | `DATA=`, `OUT=` (with data set options), `NODUPKEY`, `BY` with `DESCENDING`, and `WHERE`. Options that do not change the result (`EQUALS`, `FORCE`, `TAGSORT`, `SORTSIZE=`, ...) are accepted. See [PROC SORT](#proc-sort) |
 | Comments | `/* ... */` anywhere, and `* ... ;` statements |
 
 Everything else is rejected with a list of every unsupported construct, for
@@ -41,7 +42,8 @@ example `RETAIN`, `BY` with `FIRST.`/`LAST.`, `OUTPUT`, `MERGE`, arrays, `DO`
 loops, other functions (date functions among them), `**`, `||`, date
 constants, variable lists such as `x1-x5` and `OF x1-x5`, macros (`%let`,
 `&name`), global statements such as `LIBNAME` and `OPTIONS`, `DATA _NULL_`,
-writing to a permanent library, and every PROC step.
+writing to a permanent library, PROC SORT's `DUPOUT=`, `NOUNIQUEKEY`, and
+collating sequences, and the other PROC steps.
 
 ## The rules
 
@@ -277,6 +279,45 @@ that is the length SAS gives its result:
   `F.when(F.length(<the CATX>) > F.lit(6), F.lit("")).otherwise(<the CATX>)`.
 - `COALESCEC`: SparkShift treats the length as unknown.
 
+### PROC SORT
+
+*Base SAS 9.4 Procedures Guide*, "PROC SORT Statement", "BY Statement", and
+"Concepts: SORT Procedure".
+
+**Order.** "PROC SORT first arranges the data set by the values in ascending
+order, by default, of the first BY variable", then the observations with the
+same value by the next BY variable, and so on. `DESCENDING` "reverses the sort
+order for the variable that immediately follows". Numbers sort in this order:
+"SAS missing values", "negative numeric values", "zero", "positive numeric
+values". So missing values come first, as Spark's `.asc()` puts NULLs, and
+last with `DESCENDING`, as `.desc()` does:
+
+```sas
+proc sort data=orders out=sorted;
+    by customer_id descending amount;
+run;
+```
+
+becomes `.orderBy(F.col("customer_id").asc(), F.col("amount").desc())`.
+Text sorts in the ASCII order on ASCII systems: "digits are sorted before
+uppercase letters, and uppercase letters are sorted before lowercase letters.
+The blank is the smallest character that you can display." Spark compares
+text by its UTF-8 bytes, which is the same order for ASCII text.
+
+**Data sets.** `OUT=` names the sorted data set; "without the OUT= option,
+PROC SORT replaces the original data set with the sorted observations", so
+the DataFrame variable is assigned again. Without `DATA=`, PROC SORT sorts the
+data set created last (`_LAST_`). The `WHERE` statement filters the input;
+`DATA=` and `OUT=` options work as in DATA steps, the `OUT=` options after the
+sort.
+
+**NODUPKEY** writes "only the first observation of each BY group to the output
+data set", and becomes `.dropDuplicates([...])` before the sort. SAS's first
+observation is the first in the input's order, but a Spark DataFrame has no
+such order, so `dropDuplicates` keeps any row of each group. SparkShift warns,
+unless `KEEP=` on the `DATA=` data set shows that every variable is a BY
+variable; then all rows of a group are the same.
+
 ## Limitations
 
 - **Column order of KEEP:** SAS keeps variables in the data set's order;
@@ -316,3 +357,14 @@ that is the length SAS gives its result:
 - **SUBSTR past the end:** SAS documents a length that runs past the end (it
   takes the rest), but not a position past the end of the variable. Spark
   returns an empty string, which compares as blank.
+- **Ties in a sort:** SAS's sort keeps the input's order for observations with
+  the same BY values (the default `EQUALS` "maintains the relative order of
+  the observations within the input data set"). Spark's sort does not, so
+  such rows can come in any order.
+- **Blank text in a sort:** for SAS, missing text, empty text, and text that
+  differs only in trailing blanks are equal. Spark sorts NULL before an empty
+  string, and `'a'` before `'a '`; with `NODUPKEY`, they are different BY
+  values.
+- **Order in later steps:** a SAS data set keeps its order. Spark does not
+  promise that later operations keep a sorted DataFrame's order; sort it again
+  just before writing it out if the order matters.

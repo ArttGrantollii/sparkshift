@@ -338,6 +338,10 @@ class _Emitter:
             case ir.Distinct(source=source):
                 start, calls = self.chain(source)
                 return start, [*calls, self.call("distinct", [])]
+            case ir.DropDuplicates(source=source, columns=columns):
+                start, calls = self.chain(source)
+                names = "[" + ", ".join(python_string(c) for c in columns) + "]"
+                return start, [*calls, self.call("dropDuplicates", [names])]
             case ir.Sort(source=source, keys=keys):
                 start, calls = self.chain(source)
                 return start, [*calls, self.call("orderBy", keys)]
@@ -764,6 +768,7 @@ def _walk(plan: ir.Relation) -> Iterator[ir.Relation]:
                 | ir.Aggregate(source=source)
                 | ir.Project(source=source)
                 | ir.Distinct(source=source)
+                | ir.DropDuplicates(source=source)
                 | ir.Sort(source=source)
                 | ir.Limit(source=source)
             ):

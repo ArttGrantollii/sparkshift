@@ -540,6 +540,19 @@ class Distinct:
 
 
 @dataclass(frozen=True)
+class DropDuplicates:
+    """Keep one row for each combination of values in ``columns``; which
+    row of a group is kept is not defined. NULLs compare as equal."""
+
+    source: "Relation"
+    columns: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.columns:
+            raise ValueError("DropDuplicates needs at least one column")
+
+
+@dataclass(frozen=True)
 class Sort:
     """Order rows by ``keys``, the first key deciding first. Rows equal on
     every key may come in any order."""
@@ -579,6 +592,7 @@ Relation: TypeAlias = (
     | Project
     | SetOperation
     | Distinct
+    | DropDuplicates
     | Sort
     | Limit
 )

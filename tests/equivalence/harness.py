@@ -98,17 +98,24 @@ def result_differences(
     return differences(expected, actual)
 
 
-def assert_sas_result(spark: "SparkSession", program: str, expected: Snapshot) -> None:
+def assert_sas_result(
+    spark: "SparkSession",
+    program: str,
+    expected: Snapshot,
+    order_keys: Sequence[str] | None = None,
+) -> None:
     """Assert that a SAS program's generated PySpark returns ``expected``.
 
     No SAS is available to produce a reference, so the expected rows are
     written by hand from the documented SAS rules each scenario names (see
     docs/sas.md). Rows are compared as a multiset; column names, order, and
-    types must match.
+    types must match. With ``order_keys``, the program's result is sorted:
+    rows must come in the expected order, except that rows equal on every
+    order key may come in any order (Spark's sort is not stable).
     """
     code = sparkshift.convert(program, dialect="sas").code
     actual = snapshot(run_generated(spark, code))
-    problems = differences(expected, actual)
+    problems = result_differences(expected, actual, order_keys, None)
     context = [f"SAS program:\n{program}", f"Generated code:\n{code}"]
     assert not problems, "\n\n".join([*context, *problems])
 

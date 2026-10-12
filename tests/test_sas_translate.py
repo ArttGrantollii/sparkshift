@@ -300,11 +300,11 @@ def test_conditions_of_an_untranslated_step_are_still_checked() -> None:
 
 def test_every_issue_in_the_program_is_reported() -> None:
     assert issues(
-        "proc sort data=a; by x; run;\n"
+        "proc transpose data=a; by x; run;\n"
         "data b; set a; where x = y; total = scan(z); run;\n"
         "data _null_; set b; run;"
     ) == [
-        "PROC SORT step",
+        "PROC TRANSPOSE step",
         "comparison of two variables",
         "function SCAN",
         "DATA _NULL_ step",
@@ -1049,3 +1049,140 @@ def test_a_date_function_says_dates_come_later() -> None:
 
     [issue] = caught.value.issues
     assert issue.hint == "Date functions are not supported yet."
+
+
+# --- PROC SORT -----------------------------------------------------------------
+
+
+def ascending(name: str) -> ir.SortKey:
+    # Missing values are the smallest: first when ascending.
+    return ir.SortKey(Column((name,)), descending=False, nulls_first=True)
+
+
+def descending(name: str) -> ir.SortKey:
+    return ir.SortKey(Column((name,)), descending=True, nulls_first=False)
+
+
+def test_proc_sort_orders_with_missing_values_first() -> None:
+    translation = translate(
+        "proc sort data=customers out=sorted; by country descending score; run;"
+    )
+
+    assert translation.datasets == (
+        ir.Named(
+            "sorted",
+            ir.Sort(
+                TableScan(("customers",)),
+                (ascending("country"), descending("score")),
+            ),
+        ),
+    )
+    assert translation.warnings == ()
+
+
+def test_proc_sort_without_out_replaces_the_data_set() -> None:
+    first, second = translate(
+        "data a; set t; run; proc sort data=a; by x; run;"
+    ).datasets
+
+    assert second == ir.Named("a", ir.Sort(first, (ascending("x"),)))
+
+
+@pytest.mark.parametrize("data", ["", " data=_last_", " data=_LAST_(keep=x y)"])
+def test_proc_sort_without_data_sorts_the_last_data_set(data: str) -> None:
+    _first, second, third = translate(
+        f"data a; set t; run; data b; set a; run; proc sort{data}; by x; run;"
+    ).datasets
+
+    assert third.name == "b"
+    assert isinstance(third.source, ir.Sort)
+    sorted_source = third.source.source
+    assert sorted_source is second or (
+        isinstance(sorted_source, ir.Project) and sorted_source.source is second
+    )
+
+
+def test_proc_sort_where_filters_before_sorting() -> None:
+    [dataset] = translate("proc sort data=t out=s; where x > 1; by y; run;").datasets
+
+    assert dataset.source == ir.Sort(ir.Filter(T, GREATER_1), (ascending("y"),))
+
+
+def test_proc_sort_applies_data_and_out_options_in_order() -> None:
+    [dataset] = translate(
+        "proc sort data=t(rename=(a=x)) out=s(drop=y rename=(x=z)); by x; run;"
+    ).datasets
+
+    renamed = ir.RenameByName(T, (("a", "x"),))
+    sorted_ = ir.Sort(renamed, (ascending("x"),))
+    assert dataset.source == ir.RenameByName(
+        ir.DropColumns(sorted_, ("y",)), (("x", "z"),)
+    )
+
+
+def test_nodupkey_drops_duplicate_by_values_before_sorting() -> None:
+    translation = translate("proc sort data=t out=s nodupkey; by a descending b; run;")
+
+    [dataset] = translation.datasets
+    assert dataset.source == ir.Sort(
+        ir.DropDuplicates(T, ("a", "b")), (ascending("a"), descending("b"))
+    )
+    assert [w.message for w in translation.warnings] == [
+        "NODUPKEY keeps any row of each BY group"
+    ]
+
+
+def test_nodupkey_keeping_only_by_variables_is_exact() -> None:
+    translation = translate("proc sort data=t(keep=a b) out=s nodupkey; by a b a; run;")
+
+    [dataset] = translation.datasets
+    assert isinstance(dataset.source, ir.Sort)
+    assert dataset.source.source == ir.DropDuplicates(ir.Project(T, (A, B)), ("a", "b"))
+    # A variable listed again sorts nothing more.
+    assert dataset.source.keys == (ascending("a"), ascending("b"))
+    # Only the KEEP= of two variables is a review item.
+    assert [w.message for w in translation.warnings] == ["KEEP of several variables"]
+
+
+@pytest.mark.parametrize(
+    ("program", "message"),
+    [
+        ("proc sort; by x; run;", "PROC SORT without DATA="),
+        (
+            "proc sort data=t out=perm.s; by x; run;",
+            "PROC SORT writing to library PERM",
+        ),
+        ("proc sort data=perm.t; by x; run;", "PROC SORT replacing PERM.T"),
+        (
+            "proc sort data=t(where=(x > 1)) out=s; where x < 5; by x; run;",
+            "WHERE statement and WHERE= in PROC SORT",
+        ),
+        (
+            "proc sort data=t out=s; where x > 1; where x < 5; by x; run;",
+            "second WHERE statement",
+        ),
+        ("proc sort data=t out=s; where scan(x) = 'a'; by x; run;", "function SCAN"),
+        (
+            "proc sort data=t out=s(where=(x > 1)); by x; run;",
+            "WHERE= option on the output data set",
+        ),
+    ],
+)
+def test_unsupported_proc_sorts(program: str, message: str) -> None:
+    assert issues(program) == [message]
+
+
+def test_proc_sort_into_work_and_from_a_permanent_library() -> None:
+    [dataset] = translate("proc sort data=perm.t out=work.s; by x; run;").datasets
+
+    assert dataset == ir.Named(
+        "s", ir.Sort(TableScan(("perm", "t")), (ascending("x"),))
+    )
+
+
+def test_a_data_step_reads_the_sorted_data_set() -> None:
+    sorted_, step = translate(
+        "proc sort data=t out=s; by x; run; data b; set s; run;"
+    ).datasets
+
+    assert step.source is sorted_

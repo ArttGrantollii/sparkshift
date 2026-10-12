@@ -1413,6 +1413,17 @@ def test_drop_columns_requires_names() -> None:
         ir.DropColumns(TableScan(("t",)), ())
 
 
+def test_duplicates_are_dropped_by_column_names() -> None:
+    plan = ir.DropDuplicates(TableScan(("t",)), ("id", "day"))
+
+    assert emit(plan).endswith('    .dropDuplicates(["id", "day"])\n)\n')
+
+
+def test_drop_duplicates_requires_columns() -> None:
+    with pytest.raises(ValueError, match="at least one column"):
+        ir.DropDuplicates(TableScan(("t",)), ())
+
+
 def test_renames_by_name_are_one_call_each() -> None:
     plan = ir.RenameByName(
         TableScan(("t",)), (("name", "customer_name"), ("id", "key"))
