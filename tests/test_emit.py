@@ -1469,6 +1469,25 @@ def test_a_dataset_named_result_does_not_clash() -> None:
     assert code == 'result_df = spark.table("t")\n\nresult = result_df\n'
 
 
+def test_with_column_sets_a_column() -> None:
+    short = ir.WithColumn(TableScan(("t",)), "net", BinaryOp(BinaryOperator.ADD, A, B))
+    long = ir.WithColumn(
+        TableScan(("t",)),
+        "a_rather_long_column_name",
+        ir.Case(((_condition("status", "completed"), Literal("done")),), A),
+    )
+
+    assert emit(short).endswith('    .withColumn("net", F.col("a") + F.col("b"))\n)\n')
+    assert emit(long).endswith(
+        "    .withColumn(\n"
+        '        "a_rather_long_column_name",\n'
+        '        F.when(F.col("status") == F.lit("completed"), F.lit("done"))\n'
+        '        .otherwise(F.col("a")),\n'
+        "    )\n"
+        ")\n"
+    )
+
+
 def test_emit_datasets_needs_a_dataset() -> None:
     with pytest.raises(ValueError, match="at least one data set"):
         emit_datasets([])

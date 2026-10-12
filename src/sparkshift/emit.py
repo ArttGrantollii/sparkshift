@@ -276,6 +276,12 @@ class _Emitter:
                     for old, new in renames
                 ]
                 return start, [*calls, *steps]
+            case ir.WithColumn(source=source, name=name, expression=expression):
+                start, calls = self.chain(source)
+                step = self.call(
+                    "withColumn", [python_string(name), expression], short=True
+                )
+                return start, [*calls, step]
             case ir.DropColumns(source=source, names=names):
                 start, calls = self.chain(source)
                 dropped = self.call("drop", [python_string(name) for name in names])
@@ -751,6 +757,7 @@ def _walk(plan: ir.Relation) -> Iterator[ir.Relation]:
             case (
                 ir.RenameColumns(source=source)
                 | ir.RenameByName(source=source)
+                | ir.WithColumn(source=source)
                 | ir.DropColumns(source=source)
                 | ir.RelationAlias(source=source)
                 | ir.Filter(source=source)
@@ -836,6 +843,8 @@ def _roots(node: ir.Relation) -> Sequence[ir.Expression]:
             return (condition,)
         case ir.Filter(condition=condition):
             return (condition,)
+        case ir.WithColumn(expression=expression):
+            return (expression,)
         case ir.Aggregate(keys=keys, aggregates=aggregates):
             return (*keys, *aggregates)
         case ir.Project(items=items):

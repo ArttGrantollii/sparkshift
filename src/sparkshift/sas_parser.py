@@ -181,8 +181,65 @@ class RenameStatement:
     span: Span
 
 
+@dataclass(frozen=True)
+class LengthStatement:
+    """LENGTH name $ 10 count 8: (name, is_text, length) for each variable."""
+
+    entries: tuple[tuple[str, bool, int], ...]
+    span: Span
+
+
+@dataclass(frozen=True)
+class Assignment:
+    name: str
+    value: Expression
+    span: Span
+
+
+@dataclass(frozen=True)
+class SubsettingIf:
+    """IF condition; keeps only the rows for which it is true."""
+
+    condition: Expression
+    span: Span
+
+
+@dataclass(frozen=True)
+class Delete:
+    span: Span
+
+
+@dataclass(frozen=True)
+class Block:
+    """DO; ... END;"""
+
+    statements: tuple["Statement", ...]
+    span: Span
+
+
+@dataclass(frozen=True)
+class IfThen:
+    """IF condition THEN statement, with the ELSE statement that follows it,
+    if any. An ELSE IF chain is an IfThen in ``otherwise``."""
+
+    condition: Expression
+    then: "Statement"
+    otherwise: "Statement | None"
+    span: Span
+
+
 Statement = (
-    SetStatement | WhereStatement | KeepStatement | DropStatement | RenameStatement
+    SetStatement
+    | WhereStatement
+    | KeepStatement
+    | DropStatement
+    | RenameStatement
+    | LengthStatement
+    | Assignment
+    | SubsettingIf
+    | Delete
+    | Block
+    | IfThen
 )
 
 
@@ -286,19 +343,17 @@ class _Parser:
         self.index += 1
         outputs = self.datasets(_Tokens(header[1:], self), "DATA")
         statements: list[Statement] = []
-        last = header
         while self.index < len(self.statements):
-            statement = self.statements[self.index]
-            first = statement[0]
+            first = self.statements[self.index][0]
             if first.is_keyword(*_STEP_KEYWORDS):
                 break  # the next step starts; SAS ends this one
-            self.index += 1
-            last = statement
             if first.is_keyword(*_STEP_ENDS):
+                self.index += 1
                 break
-            parsed = self.data_statement(statement)
+            parsed = self.statement()
             if parsed is not None:
                 statements.append(parsed)
+        last = self.statements[self.index - 1]
         return DataStep(outputs, tuple(statements), self.span(header[0], last[-1]))
 
     def proc_step(self) -> None:
@@ -315,10 +370,29 @@ class _Parser:
             if first.is_keyword(*_STEP_ENDS):
                 return
 
+    def statement(self) -> Statement | None:
+        """Parse the next DATA step statement, with the statements an IF or
+        DO takes with it (its ELSE, or its block up to END)."""
+        tokens = self.statements[self.index]
+        self.index += 1
+        return self.data_statement(tokens)
+
     def data_statement(self, statement: list[Token]) -> Statement | None:
         first = statement[0]
         tokens = _Tokens(statement[1:], self)
         span = self.span(statement[0], statement[-1])
+        if first.is_keyword("IF"):
+            return self.if_statement(statement)
+        if first.is_keyword("DO"):
+            return self.block(statement)
+        if first.is_keyword("DELETE") and len(statement) == 1:
+            return Delete(span)
+        if first.is_keyword("LENGTH"):
+            return LengthStatement(self.lengths(tokens), span)
+        if first.is_keyword("ELSE"):
+            raise self.error("ELSE without a matching IF", first)
+        if first.is_keyword("END") and len(statement) == 1:
+            raise self.error("END without a matching DO", first)
         if first.is_keyword("SET"):
             return SetStatement(self.datasets(tokens, "SET"), span)
         if first.is_keyword("WHERE"):
@@ -338,10 +412,90 @@ class _Parser:
             and len(statement) > 1
             and statement[1].is_symbol("=")
         ):
-            self.unsupported("assignment statement", statement, _ASSIGNMENT_HINT)
-            return None
+            tokens.take()
+            value = self.expression(tokens)
+            tokens.expect_end()
+            return Assignment(first.text, value, span)
         self.unsupported(self.statement_name(statement), statement)
         return None
+
+    def if_statement(self, statement: list[Token]) -> Statement | None:
+        """IF condition; (subsetting) or IF condition THEN statement, with the
+        ELSE statement that follows, if any."""
+        tokens = _Tokens(statement[1:], self)
+        condition = self.expression(tokens)
+        span = self.span(statement[0], statement[-1])
+        if tokens.at_end():
+            return SubsettingIf(condition, span)
+        then = tokens.take()
+        if not then.is_keyword("THEN"):
+            raise self.error(f"Expected THEN, found {then.text!r}", then)
+        if tokens.at_end():
+            raise self.error("THEN without a statement", then)
+        action = self.data_statement(tokens.rest())
+        otherwise = None
+        has_else = False
+        if self.index < len(self.statements):
+            following = self.statements[self.index]
+            if following[0].is_keyword("ELSE"):
+                if len(following) == 1:
+                    raise self.error("ELSE without a statement", following[0])
+                self.index += 1
+                has_else = True
+                otherwise = self.data_statement(following[1:])
+        if action is None or (has_else and otherwise is None):
+            return None  # an unsupported branch is already reported
+        return IfThen(condition, action, otherwise, span)
+
+    def block(self, statement: list[Token]) -> Statement | None:
+        """DO; ... END;. DO loops (DO i = ..., DO WHILE, DO UNTIL) are
+        reported, and their statements skipped."""
+        loop = len(statement) > 1
+        if loop:
+            self.unsupported(
+                "DO loop",
+                statement,
+                "Loops run row by row; only DO; ... END; blocks are supported.",
+            )
+        statements: list[Statement] = []
+        while self.index < len(self.statements):
+            current = self.statements[self.index]
+            first = current[0]
+            if first.is_keyword("END") and len(current) == 1:
+                self.index += 1
+                end = current[0]
+                if loop:
+                    return None
+                return Block(tuple(statements), self.span(statement[0], end))
+            if first.is_keyword(*_STEP_KEYWORDS, *_STEP_ENDS):
+                break
+            parsed = self.statement()
+            if parsed is not None:
+                statements.append(parsed)
+        raise self.error("DO without a matching END", statement[0])
+
+    def lengths(self, tokens: "_Tokens") -> tuple[tuple[str, bool, int], ...]:
+        """LENGTH a b $ 10 c 8: each length applies to the names before it."""
+        entries: list[tuple[str, bool, int]] = []
+        pending: list[str] = []
+        while not tokens.at_end():
+            token = tokens.take()
+            if token.kind is Kind.NAME:
+                pending.append(token.text)
+                continue
+            is_text = token.is_symbol("$")
+            length = tokens.take() if is_text else token
+            if (
+                length.kind is not Kind.NUMBER
+                or not length.text.isdigit()
+                or not pending
+            ):
+                raise self.error("Expected a variable name or a length", length)
+            entries += [(name, is_text, int(length.text)) for name in pending]
+            pending = []
+        if pending or not entries:
+            raise self.error("LENGTH without a length", tokens.previous())
+        return tuple(entries)
 
     def statement_name(self, statement: list[Token]) -> str:
         first = statement[0]
@@ -732,6 +886,10 @@ class _Tokens:
 
     def previous(self) -> Token:
         return self.tokens[self.index - 1] if self.index > 0 else self.sentinel
+
+    def rest(self) -> list[Token]:
+        """The tokens not read yet, as a statement of their own."""
+        return self.tokens[self.index :]
 
     def at_end(self) -> bool:
         return self.index >= len(self.tokens)

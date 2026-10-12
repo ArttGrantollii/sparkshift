@@ -177,6 +177,175 @@ SAS_SCENARIOS = {
         "data de_ids; set de; drop country; run;",
         _result("customer_id int", (5,), (6,)),
     ),
+    # --- Program statements (column types are Spark's; values follow SAS) ---
+    # Statements run in order; arithmetic on a missing value is missing.
+    "assignments run in order": (
+        "data net; set orders(keep=order_id amount discount); "
+        "net = amount * (1 - discount); doubled = net * 2; drop amount discount; run;",
+        _result(
+            "order_id int, net double, doubled double",
+            (101, 120.5, 241.0),
+            (102, 72.0, 144.0),
+            (103, None, None),
+            (104, -15.75, -31.5),
+            (105, None, None),
+            (106, 999.99, 1999.98),
+            (107, 42.0, 84.0),
+            (108, 10.0, 20.0),
+            (109, 72.0, 144.0),
+            (109, 72.0, 144.0),
+        ),
+    ),
+    # SAS sets the result of division by zero to a missing value.
+    "division by zero is missing": (
+        "data ratio; set orders(keep=order_id amount discount); "
+        "per_discount = amount / discount; drop amount discount; run;",
+        _result(
+            "order_id int, per_discount double",
+            (101, None),
+            (102, 800.0),
+            (103, None),
+            (104, None),
+            (105, None),
+            (106, None),
+            (107, None),
+            (108, None),
+            (109, 800.0),
+            (109, 800.0),
+        ),
+    ),
+    # A new text variable's length is that of the first value assigned to it,
+    # 'large', so 'medium' is truncated to 'mediu'. A missing amount is smaller
+    # than 50, so it is 'small'.
+    "the first value sets a text variable's length": (
+        "data sized; set orders(keep=order_id amount); "
+        "if amount > 100 then size = 'large'; "
+        "else if amount > 50 then size = 'medium'; "
+        "else size = 'small'; drop amount; run;",
+        _result(
+            "order_id int, size string",
+            (101, "large"),
+            (102, "mediu"),
+            (103, "small"),
+            (104, "small"),
+            (105, "small"),
+            (106, "large"),
+            (107, "small"),
+            (108, "small"),
+            (109, "mediu"),
+            (109, "mediu"),
+        ),
+    ),
+    "LENGTH keeps longer values": (
+        "data sized; set orders(keep=order_id amount); length size $ 6; "
+        "if amount > 100 then size = 'large'; "
+        "else if amount > 50 then size = 'medium'; "
+        "else size = 'small'; drop amount; run;",
+        _result(
+            "order_id int, size string",
+            (101, "large"),
+            (102, "medium"),
+            (103, "small"),
+            (104, "small"),
+            (105, "small"),
+            (106, "large"),
+            (107, "small"),
+            (108, "small"),
+            (109, "medium"),
+            (109, "medium"),
+        ),
+    ),
+    # Variables the step creates are missing until assigned; variables read
+    # from the input keep their values.
+    "without ELSE, a new variable is missing and an input variable kept": (
+        "data flagged; set orders(keep=order_id amount discount); "
+        "if amount > 100 then big = 1; if discount > 0 then discount = 0; "
+        "drop amount; run;",
+        _result(
+            "order_id int, discount double, big int",
+            (101, 0.0, 1),
+            (102, 0.0, None),
+            (103, None, None),
+            (104, 0.0, None),
+            (105, 0.0, None),
+            (106, 0.0, 1),
+            (107, 0.0, None),
+            (108, 0.0, None),
+            (109, 0.0, None),
+            (109, 0.0, None),
+        ),
+    ),
+    # DELETE and a subsetting IF see the values assigned before them; a number
+    # alone is true unless it is 0 or missing.
+    "DELETE and subsetting IF": (
+        "data kept; set orders(keep=order_id amount status); "
+        "if status = 'cancelled' then delete; net = amount - 10; if net; "
+        "keep order_id net; run;",
+        _result(
+            "order_id int, net decimal(11,2)",
+            (101, Decimal("110.50")),
+            (102, Decimal("70.00")),
+            (104, Decimal("-25.75")),
+            (106, Decimal("989.99")),
+            (107, Decimal("32.00")),
+            (109, Decimal("70.00")),
+            (109, Decimal("70.00")),
+        ),
+    ),
+    # The block changes amount, which its condition reads: the condition keeps
+    # its value from before the block, so big is set for both large orders.
+    "a block that changes its own condition": (
+        "data adjusted; set orders(keep=order_id amount); "
+        "if amount > 100 then do; amount = amount / 10; big = (amount > 100); end; "
+        "drop amount; run;",
+        _result(
+            "order_id int, big int",
+            (101, 0),
+            (102, None),
+            (103, None),
+            (104, None),
+            (105, None),
+            (106, 0),
+            (107, None),
+            (108, None),
+            (109, None),
+            (109, None),
+        ),
+    ),
+    # NOT of a missing value is true, so missing and zero are both kept.
+    "NOT of a number keeps zero and missing": (
+        "data zero; set orders(keep=order_id amount); net = amount - 10; "
+        "if not (net); keep order_id; run;",
+        _result("order_id int", (105,), (108,)),
+    ),
+    # A subsetting IF in a block deletes only the rows the block runs for:
+    # completed orders of 50 or less (orders 107 and 108).
+    "a subsetting IF inside a conditional block": (
+        "data big_completed; set orders(keep=order_id amount status); "
+        "if status = 'completed' then do; if amount > 50; end; keep order_id; run;",
+        _result(
+            "order_id int",
+            (101,),
+            (102,),
+            (103,),
+            (104,),
+            (105,),
+            (106,),
+            (109,),
+            (109,),
+        ),
+    ),
+    "arithmetic in WHERE": (
+        "data small; set orders(keep=order_id amount discount); "
+        "where amount * discount < 5; keep order_id; run;",
+        _result("order_id int", (101,), (103,), (104,), (105,), (106,), (107,), (108,)),
+    ),
+    # Both sides may be missing, the smallest value: 0 > . is true.
+    "comparing two values that may be missing": (
+        "data larger; set orders(keep=order_id amount discount); "
+        "if amount > discount * 1000; keep order_id; run;",
+        _result("order_id int", (101,), (103,), (106,), (107,), (108,)),
+    ),
 }
 
 

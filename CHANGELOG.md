@@ -177,6 +177,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every issue listed. SAS scenarios check the generated code on Spark against
   expected rows written by hand from the documented rules (docs/sas.md).
 - `SASParseError`, a subclass of `SQLParseError`, for invalid SAS programs.
+- SAS DATA step logic: assignments (in order, as `.withColumn`), arithmetic,
+  `IF ... THEN ... ELSE` with `ELSE IF` chains and `DO; ... END;` blocks,
+  subsetting `IF`, `DELETE`, and `LENGTH`. Following SAS: division by zero
+  gives a missing value; a number alone is true unless 0 or missing; without
+  `ELSE`, a new variable is missing and an input variable keeps its value; and
+  a new text variable takes the length of its first value, so longer values
+  are truncated, with a warning. Where the answer depends on input columns
+  SparkShift cannot see, it uses what the program shows (a variable read
+  before it is assigned, or `KEEP=` on the `SET` data set) or rejects the
+  statement with a hint.
 
 ### Changed
 

@@ -26,12 +26,17 @@ Concepts*, at documentation.sas.com.
 | `KEEP=`, `DROP=`, `RENAME=`, `WHERE=` on the input data set | |
 | `KEEP=`, `DROP=`, `RENAME=` on the output data set | |
 | `WHERE`, `KEEP`, `DROP`, `RENAME` statements | |
-| Conditions | Comparisons (`=`, `^=`, `<`, `<=`, `>`, `>=` and `EQ`, `NE`, `LT`, `LE`, `GT`, `GE`) of a variable with a constant; `AND`, `OR`, `NOT (...)`; `IN`, `NOT IN`; `BETWEEN ... AND`; `IS [NOT] MISSING` and `IS [NOT] NULL` |
+| Assignments | `net = amount * (1 - discount);`, written as `.withColumn(...)` in order |
+| Arithmetic | `+`, `-`, `*`, `/`, and a leading minus |
+| `IF ... THEN ...; ELSE ...;` | With `ELSE IF` chains and `DO; ... END;` blocks of the statements listed here |
+| Subsetting `IF condition;` and `DELETE` | |
+| `LENGTH name $ n;` | Before a variable's first use; numbers only with length 8 |
+| Conditions | Comparisons (`=`, `^=`, `<`, `<=`, `>`, `>=` and `EQ`, `NE`, `LT`, `LE`, `GT`, `GE`); `AND`, `OR`, `NOT (...)`; `IN`, `NOT IN`; `BETWEEN ... AND`; `IS [NOT] MISSING` and `IS [NOT] NULL`; a number on its own. A comparison or condition used as a value is 1 or 0 |
 | Comments | `/* ... */` anywhere, and `* ... ;` statements |
 
 Everything else is rejected with a list of every unsupported construct, for
-example assignments, `IF`, `RETAIN`, `BY`, `MERGE`, arrays, functions,
-arithmetic in conditions, date constants, variable lists such as `x1-x5`,
+example `RETAIN`, `BY` with `FIRST.`/`LAST.`, `OUTPUT`, `MERGE`, arrays, `DO`
+loops, functions, `**`, `||`, date constants, variable lists such as `x1-x5`,
 macros (`%let`, `&name`), global statements such as `LIBNAME` and `OPTIONS`,
 `DATA _NULL_`, writing to a permanent library, and every PROC step.
 
@@ -108,14 +113,85 @@ a variable's type, so `x is missing` becomes
 `F.col("x").isNull() | (F.rtrim(F.col("x")) == F.lit(""))`, which is right for
 both: a number is never blank.
 
+### Statements run in order
+
+A DATA step runs its statements in order for each row, so an assignment sees
+the ones before it. SparkShift writes each assignment as a `.withColumn(...)`,
+in the same order: an existing column keeps its place and a new one is added at
+the end, as SAS adds new variables after the input's.
+
+A subsetting `IF` and `DELETE` act where they appear, after the assignments
+before them; `WHERE` filters the input, before any statement.
+
+### Arithmetic and division by zero
+
+*"SAS Operators in Expressions":* "If a missing value is an operand for an
+arithmetic operator, the result is a missing value", as in Spark.
+
+*SAS Users blog, "Dividing by zero with SAS – myths and realities":* SAS "sets
+the result of division by zero to a missing value" and writes a note to the
+log. Spark would raise an error, so `/` becomes `F.try_divide(...)`, which
+returns NULL.
+
+### Conditions that are numbers
+
+*"SAS Operators in Expressions", Boolean Numeric Expressions:* "any numeric
+value other than 0 or missing is true, and a value of 0 or missing is false."
+So `if net;` becomes `F.col("net").isNotNull() & (F.col("net") != F.lit(0))`.
+A comparison used as a value, as in `big = (amount > 100);`, is 1 or 0.
+
+### IF without ELSE
+
+*Language Reference: Concepts, "Combining SAS Data Sets: Methods":* "Variables
+that are created by the DATA step are set to missing at the beginning of each
+iteration of the DATA step. Variables that are read from a data set are not."
+
+So `if amount > 100 then big = 1;` leaves `big` missing on other rows if the
+step creates it, but leaves an input variable's value unchanged. SparkShift
+cannot see the input's columns, so it uses what the program shows:
+
+- a variable read before it is assigned (`if amount < 0 then amount = 0;`), or
+  listed by `KEEP=` on the `SET` data set, is an input variable;
+- with `KEEP=` on the `SET` data set, a variable it does not list is new.
+
+Otherwise the assignment is rejected; adding an `ELSE` makes the meaning
+explicit.
+
+An `IF ... ELSE IF ... ELSE` chain that assigns one variable becomes a single
+`F.when(...).when(...).otherwise(...)`. Other blocks assign each variable under
+its condition. When a block changes a variable its condition reads, the
+condition is first saved in a helper column (`_if_1`), dropped afterwards, so
+it keeps its value from before the block.
+
+### Text length
+
+*SAS 9.4 Programmer's Guide: Essentials, "Examples: Create and Modify SAS
+Variables":* the length of a new text variable "is set to the length of the
+character value" first assigned to it; "you must use the longest possible value
+in the first statement that uses the variable", because "you cannot change the
+length with a subsequent LENGTH statement". When SAS assigns a value, "it pads
+the value with blanks or truncates the value on the right side, if necessary".
+
+So after `if amount > 100 then size = 'large'; else size = 'medium';`, SAS
+stores `'mediu'`. SparkShift does the same and warns. A `LENGTH` statement
+before the first assignment sets the length instead. When SparkShift cannot
+tell whether a variable is new (and so whether its first value sets its
+length), and a later value could be truncated, it rejects the assignment and
+suggests a `LENGTH` statement.
+
 ## Limitations
 
 - **Column order of KEEP:** SAS keeps variables in the data set's order;
   SparkShift cannot see that order and keeps them in the listed order. It warns
   whenever a `KEEP` names several variables.
-- **Variable types:** SparkShift cannot see whether a variable is a number or
-  text, which SAS compares differently. A comparison needs a constant on one
-  side to tell; comparing two variables is rejected.
+- **Variable types:** SparkShift cannot see whether an input variable is a
+  number or text, which SAS compares differently. A comparison needs a constant,
+  arithmetic, or a variable the step assigns on one side to tell; comparing two
+  input variables is rejected.
+- **Input text lengths:** SparkShift cannot see an input text variable's length,
+  so it never truncates values assigned to one.
+- **Number types:** SAS stores every number as a double; the generated code
+  keeps Spark's types (an integer stays an integer), with the same values.
 - **Text order:** ordering comparisons on text (`<`, `>`) ignore trailing
   blanks. They differ from SAS only for text that ends in characters that sort
   below a blank, such as tabs.

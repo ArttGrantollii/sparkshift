@@ -184,8 +184,9 @@ def test_data_step_statements() -> None:
 @pytest.mark.parametrize(
     ("statement", "message"),
     [
-        ("total = a + b", "assignment statement"),
-        ("if x > 1 then output", "IF statement"),
+        ("output", "OUTPUT statement"),
+        ("if x > 1 then output", "OUTPUT statement"),
+        ("if x > 1 then x = 1; else output", "OUTPUT statement"),
         ("retain total", "RETAIN statement"),
         ("by customer_id", "BY statement"),
         ("&code", "macro &code"),
@@ -461,9 +462,9 @@ def test_invalid_expressions(condition: str, message: str) -> None:
 
 
 def test_issues_quote_the_source_on_one_line() -> None:
-    program = parse_sas("data a; set b;\n  if x\n    then output;\nrun;")
+    program = parse_sas("data a; set b;\n  retain\n    total 0;\nrun;")
 
-    assert [issue.sql for issue in program.issues] == ["if x then output"]
+    assert [issue.sql for issue in program.issues] == ["retain total 0"]
 
 
 def test_spans_point_at_the_source() -> None:
@@ -474,3 +475,155 @@ def test_spans_point_at_the_source() -> None:
 
     assert source[span.start : span.end] == "(x = 1)"
     assert (span.line, span.column) == (3, 9)
+
+
+# --- Program statements ------------------------------------------------------
+
+
+def statements(body: str) -> tuple[object, ...]:
+    """The shapes of a DATA step's statements after SET."""
+    program = parse_sas(f"data a; set b; {body} run;")
+    assert program.issues == ()
+    return tuple(shape(s) for s in program.steps[0].statements[1:])
+
+
+def assign(variable: str, value: object) -> tuple[str, str, object]:
+    return ("Assignment", variable, value)
+
+
+def test_assignments() -> None:
+    assert statements("net = amount * (1 - discount); flag = .;") == (
+        assign(
+            "net", binary("*", name("amount"), binary("-", number(1), name("discount")))
+        ),
+        assign("flag", ("Missing",)),
+    )
+
+
+def test_subsetting_if_and_delete() -> None:
+    assert statements("if x > 1; delete;") == (
+        ("SubsettingIf", binary(">", name("x"), number(1))),
+        ("Delete",),
+    )
+
+
+def test_if_then_else_if_else() -> None:
+    [chain] = statements(
+        "if x > 1 then size = 'large'; else if x > 0 then size = 'small'; "
+        "else size = 'none';"
+    )
+
+    assert chain == (
+        "IfThen",
+        binary(">", name("x"), number(1)),
+        assign("size", string("large")),
+        (
+            "IfThen",
+            binary(">", name("x"), number(0)),
+            assign("size", string("small")),
+            assign("size", string("none")),
+        ),
+    )
+
+
+def test_if_then_without_else_and_with_delete() -> None:
+    assert statements("if x then delete; y = 1;") == (
+        ("IfThen", name("x"), ("Delete",), None),
+        assign("y", number(1)),
+    )
+
+
+def test_do_blocks_nest() -> None:
+    [block] = statements(
+        "if x then do; a = 1; if y then do; b = 2; end; end; else do; a = 0; end;"
+    )
+
+    assert block == (
+        "IfThen",
+        name("x"),
+        (
+            "Block",
+            (
+                assign("a", number(1)),
+                ("IfThen", name("y"), ("Block", (assign("b", number(2)),)), None),
+            ),
+        ),
+        ("Block", (assign("a", number(0)),)),
+    )
+    assert statements("do; a = 1; end;") == (("Block", (assign("a", number(1)),)),)
+
+
+def test_lengths_apply_to_the_names_before_them() -> None:
+    assert statements("length a b $ 10 n 8 c $3;") == (
+        (
+            "LengthStatement",
+            (("a", True, 10), ("b", True, 10), ("n", False, 8), ("c", True, 3)),
+        ),
+    )
+
+
+def test_unsupported_branches_and_loops_are_reported() -> None:
+    program = parse_sas(
+        "data a; set b; if x then output; else y = 1; "
+        "do i = 1 to 3; total = i; end; do while (x < 3); x = x + 1; end; "
+        "if y then z = 1; else output; run;"
+    )
+
+    assert issues(program) == [
+        "OUTPUT statement",
+        "DO loop",
+        "DO loop",
+        "OUTPUT statement",
+    ]
+    # Only the SET statement is left.
+    assert len(program.steps[0].statements) == 1
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        ("else x = 1;", "ELSE without a matching IF"),
+        ("end;", "END without a matching DO"),
+        ("if x y = 1;", "Expected THEN, found 'y'"),
+        ("if x then;", "THEN without a statement"),
+        ("if x then y = 1; else;", "ELSE without a statement"),
+        ("if x then do; y = 1;", "DO without a matching END"),
+        ("length a;", "LENGTH without a length"),
+        ("length $ 10;", "Expected a variable name or a length"),
+        ("length a $ b;", "Expected a variable name or a length"),
+        ("length a 1.5;", "Expected a variable name or a length"),
+        ("x = 1 2;", "Unexpected '2'"),
+    ],
+)
+def test_invalid_program_statements(body: str, message: str) -> None:
+    with pytest.raises(SASParseError, match=message):
+        parse_sas(f"data a; set b; {body} run;")
+
+
+@pytest.mark.parametrize(
+    "source", ["data a; set b; do; x = 1; run;", "data a; set b; do; x = 1;"]
+)
+def test_a_do_block_must_end_before_the_step_or_program(source: str) -> None:
+    with pytest.raises(SASParseError, match="DO without a matching END"):
+        parse_sas(source)
+
+
+def test_an_if_may_end_the_program() -> None:
+    [step] = parse_sas("data a; set b; if x then y = 1;").steps
+
+    assert shape(step.statements[-1]) == (
+        "IfThen",
+        name("x"),
+        assign("y", number(1)),
+        None,
+    )
+
+
+def test_unsupported_statements_in_a_block_are_reported() -> None:
+    program = parse_sas("data a; set b; do; output; y = 1; end; run;")
+
+    assert issues(program) == ["OUTPUT statement"]
+    assert shape(program.steps[0].statements[-1]) == (
+        "Block",
+        (assign("y", number(1)),),
+    )

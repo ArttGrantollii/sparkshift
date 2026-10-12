@@ -411,6 +411,16 @@ class RenameByName:
 
 
 @dataclass(frozen=True)
+class WithColumn:
+    """Set a column to an expression of the source's columns: an existing
+    column keeps its place, a new one is added at the end."""
+
+    source: "Relation"
+    name: str
+    expression: Expression
+
+
+@dataclass(frozen=True)
 class DropColumns:
     """Remove columns by name, such as helper columns a filter needed."""
 
@@ -560,6 +570,7 @@ Relation: TypeAlias = (
     | Named
     | RenameColumns
     | RenameByName
+    | WithColumn
     | DropColumns
     | RelationAlias
     | Join

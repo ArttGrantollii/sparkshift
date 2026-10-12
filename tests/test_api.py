@@ -79,7 +79,11 @@ def test_convert_generates_a_projection() -> None:
         ("SELECT 1; SELECT 2", None, sparkshift.MultipleStatementsError),
         ("DELETE FROM t", None, sparkshift.UnsupportedSQLError),
         ("data a; set b", "sas", sparkshift.SASParseError),
-        ("data a; set b; total = 1; run;", "sas", sparkshift.UnsupportedSQLError),
+        (
+            "data a; set b; total = upcase(x); run;",
+            "sas",
+            sparkshift.UnsupportedSQLError,
+        ),
     ],
 )
 def test_every_failure_is_a_sparkshift_error(
