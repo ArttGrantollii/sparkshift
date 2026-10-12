@@ -3,17 +3,18 @@
 [![CI](https://github.com/ArttGrantollii/sparkshift/actions/workflows/ci.yml/badge.svg)](https://github.com/ArttGrantollii/sparkshift/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-Convert SQL into readable, idiomatic, tested PySpark DataFrame code.
+Convert SQL and SAS programs into readable, idiomatic, tested PySpark DataFrame
+code.
 
-**[Try it in your browser](https://arttgrantollii.github.io/sparkshift/)**: nothing to install, and your SQL
+**[Try it in your browser](https://arttgrantollii.github.io/sparkshift/)**: nothing to install, and your code
 never leaves your browser.
 
 > **Status: pre-release.** SparkShift converts `SELECT` queries, including
 > joins, aggregation, ordering, window functions and `QUALIFY`, CTEs, set
-> operations, and subqueries, from generic SQL and six dialects (see below).
-> SAS support is in progress. Everything else
-> is rejected with a clear error. See [ROADMAP.md](ROADMAP.md) for what is
-> planned.
+> operations, and subqueries, from generic SQL and six dialects (see below),
+> and a documented subset of SAS: DATA steps and `PROC SORT`, `MEANS`,
+> `SUMMARY`, `FREQ`, and `SQL` (see [SAS](#sas)). Everything else is rejected
+> with a clear error. See [ROADMAP.md](ROADMAP.md) for what is planned.
 
 ## Goal
 
@@ -160,17 +161,19 @@ blocker's hint, an example file, and every file's status. The JSON has a
 The exit status is 0 when the report is produced, whatever it finds; 1 only
 when `--fail-under` is given and fewer files convert; and 2 for a usage error.
 
-## SAS (in progress)
+## SAS
 
-SparkShift is learning to convert SAS programs too. So far it converts DATA
-steps that read a data set, filter it with `WHERE`, compute new variables with
-assignments, arithmetic, and common functions (`SUM`, `ROUND`, `UPCASE`,
-`CATX`, and more), choose values with `IF`/`ELSE`, delete rows, and keep,
-drop, or rename variables, as well as `PROC SORT`, `PROC MEANS`/`SUMMARY`,
-`PROC FREQ`, and `PROC SQL` steps:
+SparkShift also converts SAS programs: DATA steps that read a data set, filter
+it with `WHERE`, compute new variables with assignments, arithmetic, and common
+functions (`SUM`, `ROUND`, `UPCASE`, `CATX`, and more), choose values with
+`IF`/`ELSE`, delete rows, and keep, drop, or rename variables, as well as
+`PROC SORT`, `PROC MEANS`/`SUMMARY`, `PROC FREQ`, and `PROC SQL` steps. A
+`.sas` file is converted as SAS (use `--dialect sas` for standard input), and
+`convert` and `report` take the `.sas` files of a directory along with its
+`.sql` files:
 
 ```bash
-sparkshift convert low_scores.sas --dialect sas
+sparkshift convert low_scores.sas
 ```
 
 ```sas
@@ -207,14 +210,15 @@ says so explicitly. Each data set becomes a DataFrame variable, and `result`
 is the last one. No SAS installation is available to test against: SAS
 support is verified against SAS's documented rules, with expected results
 written by hand. [docs/sas.md](docs/sas.md) lists what is supported, each rule
-with its source, and the limitations.
+with its source, and the limitations; the [examples](examples/README.md)
+include SAS programs.
 
 ## Playground
 
 The [playground](https://arttgrantollii.github.io/sparkshift/) runs SparkShift entirely in the browser, with
-[Pyodide](https://pyodide.org): paste SQL, pick a dialect, and get
-PySpark, without installing anything and without the SQL leaving the
-browser. **Copy link** shares a query; the query is kept after the `#` in
+[Pyodide](https://pyodide.org): paste SQL or a SAS program, pick a dialect
+(or SAS), and get PySpark, without installing anything and without the code
+leaving the browser. **Copy link** shares a query; the query is kept after the `#` in
 the link, which browsers never send to a server. Every commit that passes
 CI is published there. To run it locally (see
 [playground/](playground/README.md)):

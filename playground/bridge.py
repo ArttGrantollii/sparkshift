@@ -8,11 +8,12 @@ prints, so the playground and the CLI always agree.
 import json
 
 import sparkshift
-from sparkshift.dialects import SUPPORTED_DIALECTS
+from sparkshift.dialects import DIALECT_CHOICES
 
 
 def convert_for_page(sql: str, dialect: str) -> str:
-    """Convert ``sql`` (``dialect`` "" for generic SQL) and return JSON:
+    """Convert ``sql`` (``dialect`` "" for generic SQL, "sas" for a SAS
+    program) and return JSON:
 
     ``{"ok": true, "code": ..., "warnings": [...]}`` on success, or
     ``{"ok": false, "error": ..., "issues": [...]}`` when it cannot be
@@ -39,9 +40,10 @@ def convert_for_page(sql: str, dialect: str) -> str:
 
 
 def about() -> str:
-    """JSON with the SparkShift version and the dialects the page can offer."""
+    """JSON with the SparkShift version and the dialects the page can offer,
+    SAS last."""
     return json.dumps(
-        {"version": sparkshift.__version__, "dialects": list(SUPPORTED_DIALECTS)}
+        {"version": sparkshift.__version__, "dialects": list(DIALECT_CHOICES)}
     )
 
 

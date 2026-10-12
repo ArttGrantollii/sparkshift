@@ -62,12 +62,13 @@ def _download_locked_wheel(package: str, directory: Path) -> None:
 
 
 def _examples() -> list[dict[str, str]]:
-    """The examples gallery, generic SQL first, then by dialect."""
+    """The examples gallery: generic SQL first, then by dialect, then the SAS
+    programs."""
     paths = sorted(
         (ROOT / "examples" / "sql").rglob("*.sql"),
         key=lambda path: (path.parent.name != "generic", path.parent.name, path.name),
     )
-    return [
+    sql = [
         {
             "name": path.stem,
             "dialect": "" if path.parent.name == "generic" else path.parent.name,
@@ -75,6 +76,11 @@ def _examples() -> list[dict[str, str]]:
         }
         for path in paths
     ]
+    sas = [
+        {"name": path.stem, "dialect": "sas", "sql": path.read_text(encoding="utf-8")}
+        for path in sorted((ROOT / "examples" / "sas").glob("*.sas"))
+    ]
+    return sql + sas
 
 
 if __name__ == "__main__":

@@ -2,7 +2,13 @@
 
 SparkShift converts a subset of SAS into PySpark. This page lists what is
 supported, the SAS rules the generated code follows, and where each rule is
-documented. SAS support is **in progress** (see the [roadmap](../ROADMAP.md)).
+documented. Anything else is rejected with every unsupported construct listed.
+
+A `.sas` file is converted as SAS: `sparkshift convert job.sas`, or
+`convert(program, dialect="sas")` in Python. `convert` and `report` take the
+`.sas` files of a directory along with its `.sql` files (only the `.sas` files
+with `--dialect sas`), and the [playground](https://arttgrantollii.github.io/sparkshift/)
+has SAS in its dialect list.
 
 ## How SAS support is verified
 

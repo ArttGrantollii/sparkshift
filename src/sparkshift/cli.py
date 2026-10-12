@@ -1,13 +1,16 @@
 """The command line: ``sparkshift convert query.sql`` and
 ``sparkshift report queries/``.
 
-``convert`` converts one SQL file, standard input, or every ``.sql`` file in a
-directory. Generated code goes to standard output, or to the file or directory
-named by ``--output``; every message goes to standard error, so redirecting
-the output never captures an error message.
+``convert`` converts one SQL file or SAS program, standard input, or every
+``.sql`` and ``.sas`` file in a directory. Generated code goes to standard
+output, or to the file or directory named by ``--output``; every message goes
+to standard error, so redirecting the output never captures an error message.
 
-``report`` assesses a SQL file or every ``.sql`` file in a directory and
-reports how many convert and what blocks the rest, without writing code.
+``report`` assesses a file or every ``.sql`` and ``.sas`` file in a directory
+and reports how many convert and what blocks the rest, without writing code.
+
+A ``.sas`` file is always a SAS program; ``--dialect`` gives the dialect of
+the SQL files, and ``--dialect sas`` selects only the SAS programs.
 
 Exit codes:
     0  every query was converted (convert), or the report was produced
@@ -25,7 +28,7 @@ from pathlib import Path
 from sparkshift import __version__
 from sparkshift.api import convert
 from sparkshift.diagnostics import ConversionResult
-from sparkshift.dialects import DIALECT_CHOICES, SUPPORTED_DIALECTS
+from sparkshift.dialects import DIALECT_CHOICES, SAS, is_sas
 from sparkshift.errors import SparkShiftError
 from sparkshift.report import Report, assess, to_json, to_markdown, to_text, unreadable
 
@@ -64,22 +67,23 @@ def _parser() -> argparse.ArgumentParser:
         "convert",
         help="convert SQL queries into PySpark code",
         description=(
-            "Convert SQL queries into PySpark code: one file, standard input, "
-            "or every .sql file in a directory. The code assigns the result to "
-            "a DataFrame named `result` and expects a SparkSession named `spark`."
+            "Convert SQL queries and SAS programs into PySpark code: one file, "
+            "standard input, or every .sql and .sas file in a directory. The "
+            "code assigns the result to a DataFrame named `result` and expects "
+            "a SparkSession named `spark`."
         ),
     )
     convert_command.add_argument(
         "input",
-        help=f"SQL file or directory to convert, or {_STDIN} to read standard input",
+        help=f"file or directory to convert, or {_STDIN} to read standard input",
     )
     convert_command.add_argument(
         "-d",
         "--dialect",
         type=str.lower,
         choices=DIALECT_CHOICES,
-        help="SQL dialect of the input, or sas for a SAS program; omit it for "
-        "generic SQL",
+        help="SQL dialect of the input, or sas for SAS programs; omit it for "
+        "generic SQL. A .sas file is always a SAS program",
     )
     convert_command.add_argument(
         "-o",
@@ -93,20 +97,21 @@ def _parser() -> argparse.ArgumentParser:
 
     report_command = commands.add_parser(
         "report",
-        help="report how much of a set of SQL files converts, and what blocks the rest",
+        help="report how much of a set of files converts, and what blocks the rest",
         description=(
-            "Assess a SQL file or every .sql file in a directory: how many "
+            "Assess a file or every .sql and .sas file in a directory: how many "
             "convert, and which constructs block the others, ranked by the "
             "number of files they block. No code is written."
         ),
     )
-    report_command.add_argument("input", help="SQL file or directory to assess")
+    report_command.add_argument("input", help="file or directory to assess")
     report_command.add_argument(
         "-d",
         "--dialect",
         type=str.lower,
-        choices=SUPPORTED_DIALECTS,
-        help="SQL dialect of the input; omit it for generic SQL",
+        choices=DIALECT_CHOICES,
+        help="SQL dialect of the input, or sas for SAS programs only; omit it "
+        "for generic SQL. A .sas file is always a SAS program",
     )
     report_command.add_argument(
         "-f",
@@ -133,7 +138,8 @@ def _parser() -> argparse.ArgumentParser:
 def _convert_one(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int:
     name = "standard input" if arguments.input == _STDIN else arguments.input
     sql = _read(parser, arguments.input)
-    result = _conversion(parser.prog, sql, name, arguments.dialect)
+    dialect = _dialect_of(Path(arguments.input), arguments.dialect)
+    result = _conversion(parser.prog, sql, name, dialect)
     if result is None:
         return EXIT_NOT_CONVERTED
     if arguments.output is None:
@@ -146,16 +152,16 @@ def _convert_one(parser: argparse.ArgumentParser, arguments: argparse.Namespace)
 def _convert_directory(
     parser: argparse.ArgumentParser, arguments: argparse.Namespace
 ) -> int:
-    """Convert every .sql file under a directory, in sorted order, into a .py
-    file at the same relative path under the output directory. Files that
-    cannot be converted are reported, and get no output file."""
+    """Convert every .sql and .sas file under a directory, in sorted order,
+    into a .py file at the same relative path under the output directory.
+    Files that cannot be converted are reported, and get no output file."""
     source = Path(arguments.input)
     output: Path | None = arguments.output
     if output is None:
         parser.error(f"converting the directory {source} needs --output DIRECTORY")
     if output.exists() and not output.is_dir():
         parser.error(f"--output {output} must be a directory, not a file")
-    files = _sql_files(parser, source)
+    files = _source_files(parser, source, arguments.dialect)
 
     converted = 0
     for path in files:
@@ -163,7 +169,8 @@ def _convert_directory(
         if sql is None:
             print(f"{parser.prog}: cannot read {path}: {reason}", file=sys.stderr)
             continue
-        result = _conversion(parser.prog, sql, str(path), arguments.dialect)
+        dialect = _dialect_of(path, arguments.dialect)
+        result = _conversion(parser.prog, sql, str(path), dialect)
         if result is not None:
             _write(
                 parser,
@@ -182,8 +189,8 @@ def _convert_directory(
 
 
 def _report(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int:
-    """Assess a file, or every .sql file under a directory, and print or
-    write the report."""
+    """Assess a file, or every .sql and .sas file under a directory, and
+    print or write the report."""
     threshold: float | None = arguments.fail_under
     if threshold is not None and not 0 <= threshold <= 100:
         parser.error("--fail-under must be a percentage from 0 to 100")
@@ -192,7 +199,7 @@ def _report(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> i
         # Paths relative to the directory, the same on every platform.
         files = [
             (path, path.relative_to(source).as_posix())
-            for path in _sql_files(parser, source)
+            for path in _source_files(parser, source, arguments.dialect)
         ]
     elif source.is_file():
         files = [(source, arguments.input)]
@@ -205,7 +212,7 @@ def _report(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> i
         if sql is None:
             outcomes.append(unreadable(name, str(reason)))
         else:
-            outcomes.append(assess(name, sql, arguments.dialect))
+            outcomes.append(assess(name, sql, _dialect_of(path, arguments.dialect)))
     report = Report(arguments.input, arguments.dialect, tuple(outcomes))
 
     text = _REPORT_FORMATS[arguments.format](report)
@@ -225,13 +232,26 @@ def _report(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> i
     return EXIT_CONVERTED
 
 
-def _sql_files(parser: argparse.ArgumentParser, source: Path) -> list[Path]:
-    """Every .sql file under a directory, in sorted order. Exits with a usage
-    error if there are none."""
-    files = sorted(path for path in source.rglob("*.sql") if path.is_file())
+def _source_files(
+    parser: argparse.ArgumentParser, source: Path, dialect: str | None
+) -> list[Path]:
+    """Every .sql and .sas file under a directory (only .sas files with
+    --dialect sas), in sorted order. Exits with a usage error if there are
+    none."""
+    suffixes = (".sas",) if is_sas(dialect) else (".sql", ".sas")
+    files = sorted(
+        path
+        for path in source.rglob("*")
+        if path.suffix.lower() in suffixes and path.is_file()
+    )
     if not files:
-        parser.error(f"no .sql files in {source}")
+        parser.error(f"no {' or '.join(suffixes)} files in {source}")
     return files
+
+
+def _dialect_of(path: Path, dialect: str | None) -> str | None:
+    """The dialect to convert a file in: a .sas file is a SAS program."""
+    return SAS if path.suffix.lower() == ".sas" else dialect
 
 
 def _read_text(path: Path) -> tuple[str | None, str | None]:

@@ -4,6 +4,7 @@ import importlib
 import io
 import json
 import os
+import re
 import runpy
 import shutil
 import subprocess
@@ -71,6 +72,19 @@ def test_convert_a_sas_program_with_its_warnings(
     out, err = capsys.readouterr()
     assert out == sparkshift.convert(program, dialect="sas").code
     assert err.startswith(f"sparkshift: warning in {path}: KEEP of several variables")
+
+
+@pytest.mark.parametrize("arguments", [[], ["-d", "tsql"]])
+def test_a_sas_file_is_always_a_sas_program(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], arguments: list[str]
+) -> None:
+    program = "data big; set orders; where amount > 100; run;"
+    path = tmp_path / "JOB.SAS"
+    path.write_text(program, encoding="utf-8")
+
+    assert main(["convert", str(path), *arguments]) == EXIT_CONVERTED
+
+    assert capsys.readouterr().out == sparkshift.convert(program, dialect="sas").code
 
 
 def test_convert_reads_standard_input(
@@ -382,7 +396,85 @@ def test_directory_without_sql_files(
 
     err = usage_error(["convert", str(empty), "-o", str(tmp_path / "out")], capsys)
 
-    assert f"no .sql files in {empty}" in err
+    assert f"no .sql or .sas files in {empty}" in err
+
+
+SAS = "data big; set orders; where amount > 100; run;"
+
+
+@pytest.fixture
+def mixed(tmp_path: Path) -> Path:
+    """A directory of SQL queries and SAS programs."""
+    root = tmp_path / "jobs"
+    root.mkdir()
+    (root / "a_query.sql").write_text(
+        "SELECT TOP 2 name FROM customers", encoding="utf-8"
+    )
+    (root / "b_job.sas").write_text(SAS, encoding="utf-8")
+    return root
+
+
+def test_directory_converts_sql_and_sas_files(
+    mixed: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "out"
+
+    assert main(["convert", str(mixed), "-o", str(output), "-d", "tsql"]) == 0
+
+    assert (output / "a_query.py").read_text(encoding="utf-8") == sparkshift.convert(
+        "SELECT TOP 2 name FROM customers", dialect="tsql"
+    ).code
+    assert (output / "b_job.py").read_text(encoding="utf-8") == sparkshift.convert(
+        SAS, dialect="sas"
+    ).code
+    assert capsys.readouterr().err == "sparkshift: converted 2 of 2 files\n"
+
+
+def test_dialect_sas_selects_the_sas_programs(
+    mixed: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "out"
+
+    assert main(["convert", str(mixed), "-o", str(output), "-d", "sas"]) == 0
+
+    assert sorted(path.name for path in output.iterdir()) == ["b_job.py"]
+
+
+def test_directory_without_sas_files(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = tmp_path / "queries"
+    source.mkdir()
+    (source / "only.sql").write_text(SQL, encoding="utf-8")
+
+    arguments = ["convert", str(source), "-o", str(tmp_path / "out"), "-d", "sas"]
+    err = usage_error(arguments, capsys)
+
+    assert f"no .sas files in {source}" in err
+
+
+@pytest.mark.parametrize(
+    ("dialect", "language", "files"),
+    [
+        (None, "generic SQL; SAS for .sas files", 2),
+        ("tsql", "tsql; SAS for .sas files", 2),
+        ("sas", "SAS", 1),
+    ],
+)
+def test_report_names_the_languages(
+    mixed: Path,
+    capsys: pytest.CaptureFixture[str],
+    dialect: str | None,
+    language: str,
+    files: int,
+) -> None:
+    arguments = ["report", str(mixed)] + (["-d", dialect] if dialect else [])
+
+    assert main(arguments) == EXIT_CONVERTED
+
+    out = capsys.readouterr().out
+    assert out.startswith(f"SparkShift coverage report: {mixed} ({language})\n")
+    assert re.search(rf"^Files +{files}$", out, re.MULTILINE)
 
 
 def test_unwritable_output_directory_is_a_usage_error(
@@ -510,7 +602,7 @@ def test_report_usage_errors(
     assert f"cannot read {missing}: no such file or directory" in err
 
     err = usage_error(["report", str(empty)], capsys)
-    assert f"no .sql files in {empty}" in err
+    assert f"no .sql or .sas files in {empty}" in err
 
     err = usage_error(["report", str(empty), "-f", "html"], capsys)
     assert "invalid choice: 'html'" in err

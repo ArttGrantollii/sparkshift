@@ -9,6 +9,7 @@ const DIALECT_NAMES = {
   snowflake: "Snowflake",
   bigquery: "BigQuery",
   oracle: "Oracle",
+  sas: "SAS",
 };
 
 const elements = Object.fromEntries(
@@ -19,6 +20,7 @@ const elements = Object.fromEntries(
     "share",
     "status",
     "sql",
+    "language",
     "output",
     "code",
     "copy",
@@ -111,7 +113,13 @@ function loadExample(index) {
   convert();
 }
 
+// The input pane is named after its language: SQL, or a SAS program.
+function showInputLanguage() {
+  elements.language.textContent = elements.dialect.value === "sas" ? "SAS program" : "SQL";
+}
+
 function convert() {
+  showInputLanguage();
   if (convertForPage === null) {
     return;
   }
@@ -178,6 +186,7 @@ function highlight(code) {
 // --- Events -----------------------------------------------------------------
 
 elements.convert.addEventListener("click", convert);
+elements.dialect.addEventListener("change", showInputLanguage);
 elements.example.addEventListener("change", () => {
   loadExample(Number(elements.example.value));
   elements.example.value = "";

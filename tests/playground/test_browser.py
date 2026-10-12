@@ -111,14 +111,21 @@ def test_page_is_ready_with_every_dialect(session: dict) -> None:
         "snowflake",
         "bigquery",
         "oracle",
+        "sas",
     ]
 
 
 def test_every_example_matches_the_command_line(session: dict) -> None:
     page = session["page"]
-    examples = sorted((ROOT / "examples" / "sql").rglob("*.sql"))
+    examples = [
+        *(ROOT / "examples" / "sql").rglob("*.sql"),
+        *(ROOT / "examples" / "sas").glob("*.sas"),
+    ]
     labels = page.locator("#example option").all_text_contents()[1:]
     assert len(labels) == len(examples)
+    assert sum(label.startswith("SAS: ") for label in labels) == len(
+        list((ROOT / "examples" / "sas").glob("*.sas"))
+    )
 
     for index in range(len(examples)):
         page.select_option("#example", str(index))
@@ -176,6 +183,18 @@ def test_dialect_changes_the_translation(session: dict) -> None:
 
     assert page.text_content("#code") == sparkshift.convert(sql, dialect="tsql").code
     assert page.is_visible("#output")
+
+
+def test_a_sas_program(session: dict) -> None:
+    page = session["page"]
+    program = "data big; set orders; where amount > 100; run;"
+
+    convert_in_page(page, program, "sas")
+
+    assert page.text_content("#code") == sparkshift.convert(program, dialect="sas").code
+    assert page.text_content("#language") == "SAS program"
+    page.select_option("#dialect", "")
+    assert page.text_content("#language") == "SQL"
 
 
 def test_ctrl_enter_converts(session: dict) -> None:

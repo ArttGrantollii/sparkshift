@@ -9,10 +9,10 @@
       http-equiv="Content-Security-Policy"
       content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net 'wasm-unsafe-eval'; connect-src 'self' https://cdn.jsdelivr.net; style-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'"
     />
-    <title>SparkShift playground: SQL to PySpark</title>
+    <title>SparkShift playground: SQL and SAS to PySpark</title>
     <meta
       name="description"
-      content="Convert SQL into readable PySpark in your browser. Your SQL never leaves this page."
+      content="Convert SQL and SAS into readable PySpark in your browser. Your code never leaves this page."
     />
     <link rel="stylesheet" href="style.css" />
     <script src="https://cdn.jsdelivr.net/pyodide/v314.0.7/full/pyodide.js"></script>
@@ -22,8 +22,8 @@
     <header>
       <h1>SparkShift playground</h1>
       <p>
-        Convert SQL into readable PySpark. Everything runs in your browser: your
-        SQL never leaves this page.
+        Convert SQL and SAS into readable PySpark. Everything runs in your
+        browser: your code never leaves this page.
         <a href="https://github.com/ArttGrantollii/sparkshift">Source on GitHub</a>
       </p>
     </header>
@@ -58,7 +58,7 @@
 
       <div class="panes">
         <section aria-labelledby="sql-label">
-          <h2 id="sql-label"><label for="sql">SQL</label></h2>
+          <h2 id="sql-label"><label for="sql" id="language">SQL</label></h2>
           <textarea id="sql" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
         </section>
         <section aria-labelledby="output-label">

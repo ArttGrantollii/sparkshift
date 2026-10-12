@@ -7,7 +7,9 @@ suite uses (`customers`, `orders`, and `products`).
 Every example is verified: tests fail if a generated file differs from what
 SparkShift produces today, and each example runs on Apache Spark and must
 return the same result as the original SQL (written in Spark SQL where the
-dialect differs).
+dialect differs). The SAS programs, which no SAS installation runs here, must
+return rows written by hand from SAS's documented rules
+([docs/sas.md](../docs/sas.md)).
 
 | Dialect | Query | Generated PySpark | What it shows |
 |---|---|---|---|
@@ -19,8 +21,12 @@ dialect differs).
 | Snowflake | [latest_order_per_customer.sql](sql/snowflake/latest_order_per_customer.sql) | [latest_order_per_customer.py](pyspark/snowflake/latest_order_per_customer.py) | The PostgreSQL example's latest row per group, written with `QUALIFY`: a helper column, filtered and dropped |
 | BigQuery | [monthly_revenue.sql](sql/bigquery/monthly_revenue.sql) | [monthly_revenue.py](pyspark/bigquery/monthly_revenue.py) | `DATE_TRUNC(d, MONTH)`, which returns a date, in a subquery |
 | Oracle | [never_cancelled.sql](sql/oracle/never_cancelled.sql) | [never_cancelled.py](pyspark/oracle/never_cancelled.py) | `MINUS` as `subtract`; `NVL` |
+| SAS | [customer_ratings.sas](sas/customer_ratings.sas) | [customer_ratings.py](pyspark/sas/customer_ratings.py) | A DATA step with `CATX`, an `IF`/`ELSE IF` chain as one `F.when(...)`, then `PROC SORT` |
+| SAS | [revenue_by_country.sas](sas/revenue_by_country.sas) | [revenue_by_country.py](pyspark/sas/revenue_by_country.py) | `PROC SQL` with a join that matches missing values (`eqNullSafe`) and `GROUP BY` |
+| SAS | [status_counts.sas](sas/status_counts.sas) | [status_counts.py](pyspark/sas/status_counts.py) | `PROC FREQ`: counts, and percentages that leave missing values out |
 
-The generated files are produced by the command line, one folder per dialect:
+The generated files are produced by the command line, one folder per dialect
+and one for the SAS programs:
 
 ```bash
 uv run python examples/regenerate.py

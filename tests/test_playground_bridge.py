@@ -9,7 +9,7 @@ from types import ModuleType
 import pytest
 
 import sparkshift
-from sparkshift.dialects import SUPPORTED_DIALECTS
+from sparkshift.dialects import DIALECT_CHOICES
 
 BRIDGE = Path(__file__).parents[1] / "playground" / "bridge.py"
 
@@ -39,6 +39,14 @@ def test_empty_dialect_means_generic_sql(bridge: ModuleType) -> None:
     result = json.loads(bridge.convert_for_page("SELECT a FROM t", ""))
 
     assert result["code"] == sparkshift.convert("SELECT a FROM t").code
+
+
+def test_a_sas_program(bridge: ModuleType) -> None:
+    program = "data big; set orders; where amount > 100; run;"
+
+    result = json.loads(bridge.convert_for_page(program, "sas"))
+
+    assert result["code"] == sparkshift.convert(program, dialect="sas").code
 
 
 def test_unsupported_query_lists_each_issue(bridge: ModuleType) -> None:
@@ -90,5 +98,5 @@ def test_warnings_are_passed_on(
 def test_about(bridge: ModuleType) -> None:
     assert json.loads(bridge.about()) == {
         "version": sparkshift.__version__,
-        "dialects": list(SUPPORTED_DIALECTS),
+        "dialects": list(DIALECT_CHOICES),
     }

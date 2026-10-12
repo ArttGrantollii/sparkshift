@@ -293,7 +293,13 @@ def _sentence(label: str) -> str:
 
 
 def _dialect(report: Report) -> str:
-    return report.dialect or "generic SQL"
+    """The language of the files: .sas files are always SAS programs."""
+    if report.dialect == "sas":
+        return "SAS"
+    name = report.dialect or "generic SQL"
+    if any(outcome.path.lower().endswith(".sas") for outcome in report.outcomes):
+        name += "; SAS for .sas files"
+    return name
 
 
 def _columns(rows: Sequence[tuple[str, ...]], right: tuple[int, ...]) -> list[str]:

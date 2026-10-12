@@ -235,6 +235,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SUM` and the others are the per-row DATA step functions. Remerging,
   subqueries, `CALCULATED`, set operators, other joins, and other statements
   are rejected.
+- SAS everywhere SQL is: a `.sas` file is converted as SAS without
+  `--dialect`; `convert` and `report` take the `.sas` files of a directory
+  along with its `.sql` files (only the `.sas` files with `--dialect sas`),
+  and the report names the languages; the playground has SAS in its dialect
+  list and SAS examples; the examples gallery has three SAS programs, checked
+  on Spark against rows written by hand. Phase 4 (SAS) is complete.
 
 ### Changed
 

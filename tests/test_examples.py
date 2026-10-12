@@ -1,7 +1,8 @@
 """The examples gallery stays exactly what SparkShift generates today.
 
 Whether each example also returns the same result as its SQL on Spark is
-checked in tests/equivalence/test_example_queries.py.
+checked in tests/equivalence/test_example_queries.py, and for the SAS
+programs in tests/equivalence/test_sas_examples.py.
 """
 
 import importlib.util
@@ -14,6 +15,9 @@ from sparkshift.dialects import SUPPORTED_DIALECTS
 
 EXAMPLES = Path(__file__).parents[1] / "examples"
 SQL_FILES = sorted((EXAMPLES / "sql").rglob("*.sql"))
+SAS_FILES = sorted((EXAMPLES / "sas").glob("*.sas"))
+# Every example: SQL queries in a folder per dialect, then the SAS programs.
+SOURCES = SQL_FILES + SAS_FILES
 REGENERATE = "Run `uv run python examples/regenerate.py` and review the diff."
 
 
@@ -30,7 +34,7 @@ def example_id(sql_path: Path) -> str:
     return f"{sql_path.parent.name}/{sql_path.stem}"
 
 
-@pytest.mark.parametrize("sql_path", SQL_FILES, ids=example_id)
+@pytest.mark.parametrize("sql_path", SOURCES, ids=example_id)
 def test_generated_example_is_up_to_date(sql_path: Path) -> None:
     sql = sql_path.read_text(encoding="utf-8")
     expected = sparkshift.convert(sql, dialect=dialect_of(sql_path)).code
@@ -40,7 +44,7 @@ def test_generated_example_is_up_to_date(sql_path: Path) -> None:
     assert actual == expected, REGENERATE
 
 
-@pytest.mark.parametrize("sql_path", SQL_FILES, ids=example_id)
+@pytest.mark.parametrize("sql_path", SOURCES, ids=example_id)
 def test_generated_example_fits_the_line_length(sql_path: Path) -> None:
     lines = generated_path(sql_path).read_text(encoding="utf-8").splitlines()
 
@@ -50,7 +54,7 @@ def test_generated_example_fits_the_line_length(sql_path: Path) -> None:
 def test_every_generated_file_has_its_query() -> None:
     generated = sorted((EXAMPLES / "pyspark").rglob("*.py"))
 
-    assert generated == [generated_path(path) for path in SQL_FILES]
+    assert generated == sorted(generated_path(path) for path in SOURCES)
 
 
 def test_examples_cover_generic_sql_and_every_dialect() -> None:
@@ -64,6 +68,9 @@ def test_readme_links_every_example() -> None:
         folder, stem = sql_path.parent.name, sql_path.stem
         assert f"(sql/{folder}/{stem}.sql)" in readme
         assert f"(pyspark/{folder}/{stem}.py)" in readme
+    for sas_path in SAS_FILES:
+        assert f"(sas/{sas_path.name})" in readme
+        assert f"(pyspark/sas/{sas_path.stem}.py)" in readme
 
 
 def test_regenerate_script_reproduces_the_committed_files(tmp_path: Path) -> None:
@@ -76,7 +83,7 @@ def test_regenerate_script_reproduces_the_committed_files(tmp_path: Path) -> Non
 
     assert regenerate.regenerate(tmp_path) == 0
 
-    for sql_path in SQL_FILES:
+    for sql_path in SOURCES:
         assert generated_path(sql_path, tmp_path).read_bytes() == (
             generated_path(sql_path).read_bytes()
         )
