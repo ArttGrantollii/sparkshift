@@ -346,6 +346,220 @@ SAS_SCENARIOS = {
         "if amount > discount * 1000; keep order_id; run;",
         _result("order_id int", (101,), (103,), (106,), (107,), (108,)),
     ),
+    # --- Functions ---------------------------------------------------------
+    # SUM adds the values that are present: product 5's stock and product 6's
+    # price are missing.
+    "SUM skips missing values": (
+        "data totals; set products(keep=product_id price stock); "
+        "total = sum(price, stock); keep product_id total; run;",
+        _result(
+            "product_id int, total decimal(14,3)",
+            (1, Decimal("12.500")),
+            (2, Decimal("-2.500")),
+            (3, Decimal("7.125")),
+            (4, Decimal("-0.325")),
+            (5, Decimal("0.000")),
+            (6, Decimal("4.000")),
+            (7, Decimal("14.345")),
+        ),
+    ),
+    # With two or more arguments, SUM is missing when all of them are.
+    "SUM of only missing values is missing": (
+        "data totals; set products(keep=product_id price weight); "
+        "where product_id in (5, 6); total = sum(price, weight); "
+        "keep product_id total; run;",
+        _result("product_id int, total double", (5, 0.0), (6, None)),
+    ),
+    # MEAN divides by the number of values present: customer 3's score is
+    # missing, so its mean is its id.
+    "MEAN of the values that are present": (
+        "data means; set customers(keep=customer_id score); "
+        "average = mean(score, customer_id); keep customer_id average; run;",
+        _result(
+            "customer_id int, average double",
+            (1, 2.75),
+            (2, 2.5),
+            (3, 3.0),
+            (4, 2.0),
+            (5, 1.875),
+            (6, 4.25),
+            (7, 6.0),
+            (7, 6.0),
+        ),
+    ),
+    # MIN and MAX skip missing values, unlike the < operator, for which a
+    # missing value is the smallest.
+    "MIN and MAX skip missing values": (
+        "data bounds; set customers(keep=customer_id score); "
+        "low = min(score, 1); high = max(score, 1); drop score; run;",
+        _result(
+            "customer_id int, low double, high double",
+            (1, 1.0, 4.5),
+            (2, 1.0, 3.0),
+            (3, 1.0, 1.0),
+            (4, 0.0, 1.0),
+            (5, -1.25, 1.0),
+            (6, 1.0, 2.5),
+            (7, 1.0, 5.0),
+            (7, 1.0, 5.0),
+        ),
+    ),
+    "N and NMISS count present and missing values": (
+        "data counts; set orders(keep=order_id customer_id amount discount); "
+        "present = n(amount, discount); absent = nmiss(amount, discount, customer_id); "
+        "keep order_id present absent; run;",
+        _result(
+            "order_id int, present int, absent int",
+            (101, 2, 0),
+            (102, 2, 0),
+            (103, 1, 1),
+            (104, 2, 0),
+            (105, 1, 1),
+            (106, 2, 0),
+            (107, 2, 1),
+            (108, 2, 0),
+            (109, 2, 0),
+            (109, 2, 0),
+        ),
+    ),
+    # COALESCEC treats blank text as missing: customer 5's name is empty.
+    "COALESCE and COALESCEC take the first value present": (
+        "data labels; set customers(keep=customer_id name country score); "
+        "known = coalesce(score, 0); label = coalescec(name, country, 'unknown'); "
+        "keep customer_id known label; run;",
+        _result(
+            "customer_id int, known double, label string",
+            (1, 4.5, "Alice"),
+            (2, 3.0, "Bob"),
+            (3, 0.0, "José"),
+            (4, 0.0, "Zoë"),
+            (5, -1.25, "DE"),
+            (6, 2.5, "DE"),
+            (7, 5.0, "Grace"),
+            (7, 5.0, "Grace"),
+        ),
+    ),
+    # ROUND gives the result of decimal arithmetic, rounding halves away from
+    # zero: the double nearest 2.675 is slightly below it, yet it rounds up.
+    "ROUND rounds halves away from zero, as decimal arithmetic does": (
+        "data rounded; set products(keep=product_id weight); "
+        "cents = round(weight, 0.01); whole = round(weight); drop weight; run;",
+        _result(
+            "product_id int, cents double, whole double",
+            (1, 2.5, 3.0),
+            (2, -2.5, -3.0),
+            (3, 0.13, 0.0),
+            (4, 2.68, 3.0),
+            (5, 0.0, 0.0),
+            (6, None, None),
+            (7, 1.5, 2.0),
+        ),
+    ),
+    # Within 1E-12 of an integer counts as that integer, so CEIL, FLOOR, and
+    # INT give the id itself. INT truncates toward zero.
+    "INT, CEIL, and FLOOR are fuzzed": (
+        "data whole; set customers(keep=customer_id score); "
+        "up = ceil(customer_id + 1e-13); down = floor(customer_id - 1e-13); "
+        "near = int(customer_id - 1e-13); below = int(1e-13 - customer_id); "
+        "truncated = int(score - 3); drop score; run;",
+        _result(
+            "customer_id int, up bigint, down bigint, near bigint, below bigint, "
+            "truncated bigint",
+            (1, 1, 1, 1, -1, 1),
+            (2, 2, 2, 2, -2, 0),
+            (3, 3, 3, 3, -3, None),
+            (4, 4, 4, 4, -4, -3),
+            (5, 5, 5, 5, -5, -4),
+            (6, 6, 6, 6, -6, 0),
+            (7, 7, 7, 7, -7, 2),
+            (7, 7, 7, 7, -7, 2),
+        ),
+    ),
+    # A remainder has the sign of the dividend; the divisor's sign is ignored.
+    "MOD keeps the sign of the dividend": (
+        "data remainders; set products(keep=product_id stock); "
+        "by_3 = mod(stock, 3); by_minus_4 = mod(stock, -4); drop stock; run;",
+        _result(
+            "product_id int, by_3 int, by_minus_4 int",
+            (1, 1, 2),
+            (2, 0, 0),
+            (3, 1, 3),
+            (4, 0, -3),
+            (5, None, None),
+            (6, 1, 0),
+            (7, 2, 2),
+        ),
+    ),
+    # LENGTH counts up to the last character that is not blank, and is 1 for
+    # blank or missing text; CATS removes leading and trailing blanks. Product
+    # 3 is left out: SAS counts bytes.
+    "UPCASE, STRIP, SUBSTR, LENGTH, and CATS": (
+        "data names; set products(keep=product_id name category); "
+        "where product_id ne 3; "
+        "upper = upcase(name); stripped = strip(name); "
+        "code = substr(upcase(name), 1, 3); tail = substr(name, 5); "
+        "size = length(name); joined = cats(name, category); "
+        "drop name category; run;",
+        _result(
+            "product_id int, upper string, stripped string, code string, "
+            "tail string, size int, joined string",
+            (1, "  WIDGET  ", "Widget", "  W", "dget  ", 8, "Widgettools"),
+            (2, "GADGET", "gadget", "GAD", "et", 6, "gadgetTools"),
+            (4, "BOLT   ", "Bolt", "BOL", "   ", 4, "Bolt"),
+            (5, "", "", "", "", 1, "tools"),
+            (6, None, None, None, None, 1, "misc"),
+            (7, "ZIP-TIE", "ZIP-Tie", "ZIP", "Tie", 7, "ZIP-TieTools"),
+        ),
+    ),
+    # CATX adds no delimiter for a blank or missing item: customer 4's country
+    # is missing and customer 5's name is empty.
+    "CATS and CATX skip blank items": (
+        "data keys; set customers(keep=customer_id name country); "
+        "key = cats(name, '-', country); label = catx(', ', name, country); "
+        "keep customer_id key label; run;",
+        _result(
+            "customer_id int, key string, label string",
+            (1, "Alice-US", "Alice, US"),
+            (2, "Bob-US", "Bob, US"),
+            (3, "José-ES", "José, ES"),
+            (4, "Zoë-", "Zoë"),
+            (5, "-DE", "DE"),
+            (6, "-DE", "DE"),
+            (7, "Grace-FR", "Grace, FR"),
+            (7, "Grace-FR", "Grace, FR"),
+        ),
+    ),
+    # A CATX result longer than its variable is stored as a blank, not
+    # truncated: 'Alice US' and 'Grace FR' have 8 characters, 'José ES' 7.
+    "a CATX result too long for its variable is blank": (
+        "data short; set customers(keep=customer_id name country); "
+        "length label $ 6; label = catx(' ', name, country); "
+        "keep customer_id label; run;",
+        _result(
+            "customer_id int, label string",
+            (1, ""),
+            (2, "Bob US"),
+            (3, ""),
+            (4, "Zoë"),
+            (5, "DE"),
+            (6, "DE"),
+            (7, ""),
+            (7, ""),
+        ),
+    ),
+    # MISSING is true for a missing number and for blank or missing text.
+    "MISSING treats blank text as missing": (
+        "data incomplete; set customers(keep=customer_id name score); "
+        "where missing(name) or missing(score); keep customer_id; run;",
+        _result("customer_id int", (3,), (5,), (6,)),
+    ),
+    # Functions have a type, so they can be compared with constants and used
+    # as conditions. SUM(score, 1) is 1 for customer 3, whose score is missing.
+    "functions in a condition": (
+        "data chosen; set customers(keep=customer_id country score); "
+        "where lowcase(country) = 'de' or sum(score, 1) > 5; keep customer_id; run;",
+        _result("customer_id int", (1,), (5,), (6,), (7,), (7,)),
+    ),
 }
 
 

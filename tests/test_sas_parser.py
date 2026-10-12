@@ -627,3 +627,15 @@ def test_unsupported_statements_in_a_block_are_reported() -> None:
         "Block",
         (assign("y", number(1)),),
     )
+
+
+def test_an_of_variable_list_is_reported_not_rejected() -> None:
+    program = parse_sas("data a; set b; total = sum(of x1-x3 y) + 1; run;")
+
+    assert issues(program) == ["OF variable list"]
+    assert program.issues[0].sql == "sum(of x1-x3 y)"
+
+
+def test_an_unclosed_of_variable_list_is_an_error() -> None:
+    with pytest.raises(SASParseError, match="Expected \\) to end the function call"):
+        parse_sas("data a; set b; total = sum(of x1 x2; run;")

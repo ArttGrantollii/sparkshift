@@ -80,7 +80,7 @@ def test_convert_generates_a_projection() -> None:
         ("DELETE FROM t", None, sparkshift.UnsupportedSQLError),
         ("data a; set b", "sas", sparkshift.SASParseError),
         (
-            "data a; set b; total = upcase(x); run;",
+            "data a; set b; total = scan(x, 1); run;",
             "sas",
             sparkshift.UnsupportedSQLError,
         ),

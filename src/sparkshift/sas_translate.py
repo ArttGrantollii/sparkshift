@@ -17,6 +17,9 @@ documentation, are listed in docs/sas.md. In short:
   zero, give a missing value.
 - A new text variable's length is that of the first value assigned to it, or
   the length a LENGTH statement gives it first; longer values are truncated.
+- Functions follow their pages in SAS's function reference: statistics such
+  as SUM skip missing values, INT, CEIL, and FLOOR treat a value within 1E-12
+  of an integer as that integer, and CATX skips blank items.
 
 SparkShift never sees the input's columns. Where the result depends on them,
 it uses what the program shows: a variable read before it is assigned is an
@@ -29,6 +32,7 @@ unsupported construct at once.
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from decimal import Decimal
 
 from sparkshift import ir
 from sparkshift.diagnostics import Diagnostic
@@ -83,6 +87,69 @@ _ARITHMETIC = {
     "*": ir.BinaryOperator.MULTIPLY,
 }
 _CONDITIONS = (In, Between, IsMissing)
+
+# The SAS functions SparkShift translates, with the number of arguments each
+# takes: (fewest, most), where None means any number.
+_FUNCTIONS: dict[str, tuple[int, int | None]] = {
+    "SUM": (1, None),
+    "MEAN": (1, None),
+    "MIN": (1, None),
+    "MAX": (1, None),
+    "N": (1, None),
+    "NMISS": (1, None),
+    "COALESCE": (1, None),
+    "ROUND": (1, 2),
+    "INT": (1, 1),
+    "CEIL": (1, 1),
+    "FLOOR": (1, 1),
+    "ABS": (1, 1),
+    "MOD": (2, 2),
+    "UPCASE": (1, 1),
+    "LOWCASE": (1, 1),
+    "STRIP": (1, 1),
+    "TRIM": (1, 1),
+    "SUBSTR": (2, 3),
+    "LENGTH": (1, 1),
+    "CATS": (1, None),
+    "CATX": (2, None),
+    "COALESCEC": (1, None),
+    "MISSING": (1, 1),
+}
+_STATISTICS = frozenset({"SUM", "MEAN", "MIN", "MAX", "N", "NMISS", "COALESCE"})
+_ROUNDING = frozenset({"ROUND", "INT", "CEIL", "FLOOR", "ABS", "MOD"})
+_CONCATENATION = frozenset({"CATS", "CATX", "COALESCEC"})
+# Text functions that return their argument changed, at its length.
+_TEXT_FUNCTIONS = {
+    "UPCASE": "upper",
+    "LOWCASE": "lower",
+    "STRIP": "trim",
+    "TRIM": "rtrim",
+}
+_DATE_FUNCTIONS = frozenset(
+    {
+        "DATDIF",
+        "DATE",
+        "DATEPART",
+        "DATETIME",
+        "DAY",
+        "DHMS",
+        "HMS",
+        "INTCK",
+        "INTNX",
+        "MDY",
+        "MONTH",
+        "QTR",
+        "TIMEPART",
+        "TODAY",
+        "WEEKDAY",
+        "YEAR",
+        "YRDIF",
+    }
+)
+# INT, CEIL, and FLOOR give the integer a value is within 1E-12 of.
+_FUZZ = 1e-12
+# The length of a new variable assigned the result of CATS or CATX.
+_CAT_LENGTH = 200
 
 _KEEP_ORDER_HINT = (
     "SAS keeps variables in the data set's order; this code keeps them in the "
@@ -139,6 +206,12 @@ class _Value:
     constant: bool = False
     # The text of a text constant, as written.
     text: str = ""
+    # A text value's length in SAS, when known: a constant's, a variable's,
+    # or a function's result.
+    length: int | None = None
+    # SAS stores a blank, not a truncated value, when the result of CATS or
+    # CATX is longer than the variable.
+    blank_if_longer: bool = False
 
 
 @dataclass
@@ -549,11 +622,11 @@ class _SasTranslator:
         span: Span,
     ) -> ir.Expression:
         """A text value at the variable's length: SAS truncates longer values
-        on the right."""
+        on the right, or stores a blank for a longer result of CATS or CATX."""
         assert value.expression is not None
-        size = max(len(value.text), 1)
+        size = value.length
         if first and variable.length is None:
-            if not value.constant:
+            if size is None:
                 variable.length_unknown = new is not False
             elif new:
                 variable.length = size
@@ -561,7 +634,7 @@ class _SasTranslator:
                 variable.length_if_new = size
             return value.expression
         if variable.length is None:
-            longer = not value.constant or (
+            longer = size is None or (
                 variable.length_if_new is not None and size > variable.length_if_new
             )
             if variable.length_unknown or (
@@ -573,12 +646,9 @@ class _SasTranslator:
                     _LENGTH_HINT.format(name=name),
                 )
             return value.expression
-        if not value.constant:
-            return ir.FunctionCall(
-                "substring",
-                (value.expression, ir.Literal(1), ir.Literal(variable.length)),
-            )
-        if size > variable.length:
+        if size is not None and size <= variable.length:
+            return value.expression
+        if value.constant:
             stored = value.text[: variable.length]
             self.warn(
                 f"text truncated to the length of {name}",
@@ -588,7 +658,16 @@ class _SasTranslator:
                 "first assignment to keep longer values.",
             )
             return ir.Literal(stored)
-        return value.expression
+        if value.blank_if_longer:
+            too_long = ir.BinaryOp(
+                ir.BinaryOperator.GREATER,
+                ir.FunctionCall("length", (value.expression,)),
+                ir.Literal(variable.length),
+            )
+            return ir.Case(((too_long, ir.Literal("")),), value.expression)
+        return ir.FunctionCall(
+            "substring", (value.expression, ir.Literal(1), ir.Literal(variable.length))
+        )
 
     def is_new(self, name: str) -> bool | None:
         """Whether the step creates the variable: False if it is a column,
@@ -634,13 +713,19 @@ class _SasTranslator:
             case Name(name=name):
                 variable = self.variables.setdefault(name.lower(), _Variable())
                 variable.exists = True  # read, so it is a column
-                return _Value(variable.kind, ir.Column((name,)))
+                return _Value(variable.kind, ir.Column((name,)), length=variable.length)
             case Number(value=number):
                 return _Value("number", ir.Literal(number), constant=True)
             case Unary(op="-", operand=Number(value=number)):
                 return _Value("number", ir.Literal(-number), constant=True)
             case String(value=text):
-                return _Value("text", ir.Literal(text), constant=True, text=text)
+                return _Value(
+                    "text",
+                    ir.Literal(text),
+                    constant=True,
+                    text=text,
+                    length=max(len(text), 1),
+                )
             case Missing():
                 return _Value("number", None, constant=True)
             case Unary(op="+", operand=operand):
@@ -670,13 +755,8 @@ class _SasTranslator:
                     "SparkShift cannot see.",
                 )
                 return None
-            case Call(name=function):
-                self.unsupported(
-                    f"function {function.upper()}",
-                    expression.span,
-                    "SAS functions are not supported yet.",
-                )
-                return None
+            case Call():
+                return self.function(expression)
         # A comparison or logical expression: 1 if true, 0 if false.
         condition = self.condition(expression)
         if condition is None:
@@ -705,6 +785,285 @@ class _SasTranslator:
             return _Value("number", ir.FunctionCall("try_divide", (first, second)))
         return _Value("number", ir.BinaryOp(_ARITHMETIC[op], first, second))
 
+    # --- Functions -----------------------------------------------------------
+
+    def function(self, call: Call) -> _Value | None:
+        """A SAS function call, with the result SAS's documentation gives it
+        (see docs/sas.md)."""
+        name = call.name.upper()
+        if name not in _FUNCTIONS:
+            hint = (
+                "Date functions are not supported yet."
+                if name in _DATE_FUNCTIONS
+                else "The supported functions are listed in docs/sas.md."
+            )
+            self.unsupported(f"function {name}", call.span, hint)
+            return None
+        fewest, most = _FUNCTIONS[name]
+        count = len(call.arguments)
+        if count < fewest or (most is not None and count > most):
+            self.unsupported(
+                f"{name} with {_arguments(count)}",
+                call.span,
+                f"{name} takes {_argument_range(fewest, most)}.",
+            )
+            return None
+        if name in _STATISTICS:
+            return self.statistic(name, call)
+        if name in _ROUNDING:
+            return self.rounding(name, call)
+        if name in _CONCATENATION:
+            return self.concatenation(name, call)
+        if name == "MISSING":
+            missing = self.missing(call.arguments[0], name, call.span)
+            return (
+                None if missing is None else _Value("number", ir.Cast(missing, "int"))
+            )
+        return self.text_function(name, call)
+
+    def numbers(
+        self, name: str, arguments: tuple[Expression, ...]
+    ) -> list[_Value] | None:
+        """A function's numeric arguments; a variable of unseen type counts as
+        a number."""
+        values = [self.value(argument) for argument in arguments]
+        if None in values:
+            return None
+        numbers = [value for value in values if value is not None]
+        texts = [a for a, v in zip(arguments, numbers, strict=True) if v.kind == "text"]
+        for argument in texts:
+            self.unsupported(
+                f"text in {name}",
+                argument.span,
+                "Use COALESCEC for text."
+                if name == "COALESCE"
+                else "SAS would convert it to a number and write a note; convert "
+                "it explicitly.",
+            )
+        return None if texts else numbers
+
+    def texts(
+        self, name: str, arguments: tuple[Expression, ...]
+    ) -> list[_Value] | None:
+        """A function's text arguments; a variable of unseen type counts as
+        text."""
+        values = [self.value(argument) for argument in arguments]
+        if None in values:
+            return None
+        texts = [value for value in values if value is not None]
+        numbers = [
+            a for a, v in zip(arguments, texts, strict=True) if v.kind == "number"
+        ]
+        for argument in numbers:
+            self.unsupported(
+                f"number in {name}",
+                argument.span,
+                "SAS would convert it to text with a format first; SparkShift "
+                "does not.",
+            )
+        return None if numbers else texts
+
+    def statistic(self, name: str, call: Call) -> _Value | None:
+        """SUM, MEAN, MIN, MAX, N, NMISS, and COALESCE: they skip missing
+        values, and are missing only when every argument is."""
+        values = self.numbers(name, call.arguments)
+        if values is None:
+            return None
+        present = [v for v in values if v.expression is not None]
+        variables = [v.expression for v in present if not v.constant]
+        constants = len(present) - len(variables)
+        if name == "N":
+            counts = [ir.Cast(ir.IsNull(v, negated=True), "int") for v in variables]
+            return _Value("number", _total(constants, counts))
+        if name == "NMISS":
+            counts = [ir.Cast(ir.IsNull(v), "int") for v in variables]
+            return _Value("number", _total(len(values) - len(present), counts))
+        if not present:
+            return _Value("number", None, constant=True)
+        if len(present) == 1:
+            return _Value("number", present[0].expression, present[0].constant)
+        expressions = [v.expression for v in present if v.expression is not None]
+        if name in ("MIN", "MAX", "COALESCE"):
+            function = {"MIN": "least", "MAX": "greatest"}.get(name, "coalesce")
+            return _Value("number", ir.FunctionCall(function, tuple(expressions)))
+        # Missing values add nothing to the sum.
+        terms = [
+            e if v.constant else ir.FunctionCall("coalesce", (e, ir.Literal(0)))
+            for v, e in zip(present, expressions, strict=True)
+        ]
+        total = _sum(terms)
+        if name == "MEAN":
+            counts = [ir.Cast(ir.IsNull(v, negated=True), "int") for v in variables]
+            count = _total(constants, counts)
+            return _Value("number", ir.FunctionCall("try_divide", (total, count)))
+        if constants:
+            return _Value("number", total)
+        # SUM is missing when every argument is.
+        any_present = ir.IsNull(
+            ir.FunctionCall("coalesce", tuple(variables)), negated=True
+        )
+        return _Value("number", ir.Case(((any_present, total),), None))
+
+    def rounding(self, name: str, call: Call) -> _Value | None:
+        """ROUND, INT, CEIL, FLOOR, ABS, and MOD."""
+        values = self.numbers(name, call.arguments)
+        if values is None:
+            return None
+        if any(value.expression is None for value in values):
+            # A missing argument gives a missing result.
+            return _Value("number", None, constant=True)
+        value = values[0].expression
+        assert value is not None
+        ceil = ir.FunctionCall(
+            "ceil", (ir.BinaryOp(ir.BinaryOperator.SUBTRACT, value, ir.Literal(_FUZZ)),)
+        )
+        floor = ir.FunctionCall(
+            "floor", (ir.BinaryOp(ir.BinaryOperator.ADD, value, ir.Literal(_FUZZ)),)
+        )
+        result: ir.Expression | None
+        match name:
+            case "CEIL":
+                result = ceil
+            case "FLOOR":
+                result = floor
+            case "INT":
+                negative = ir.BinaryOp(ir.BinaryOperator.LESS, value, ir.Literal(0))
+                result = ir.Case(((negative, ceil),), floor)
+            case "ABS":
+                result = ir.FunctionCall("abs", (value,))
+            case "ROUND":
+                result = self.rounded(call, value)
+            case _:
+                result = self.remainder(call, value)
+        return None if result is None else _Value("number", result)
+
+    def rounded(self, call: Call, value: ir.Expression) -> ir.Expression | None:
+        if len(call.arguments) == 1:
+            return ir.FunctionCall("round", (value,))
+        unit = call.arguments[1]
+        places = _decimal_places(_constant_number(unit))
+        if places is None:
+            self.unsupported(
+                "ROUND to a unit that is not a power of 10",
+                unit.span,
+                "SparkShift supports units such as 1, 10, and 0.01, for which SAS "
+                "rounds as decimal arithmetic does, as F.round does.",
+            )
+            return None
+        if places == 0:
+            return ir.FunctionCall("round", (value,))
+        return ir.FunctionCall("round", (value, ir.Literal(places)))
+
+    def remainder(self, call: Call, value: ir.Expression) -> ir.Expression | None:
+        divisor = call.arguments[1]
+        number = _constant_number(divisor)
+        if number is None or number == 0:
+            self.unsupported(
+                "MOD by a divisor that is not a constant other than 0",
+                divisor.span,
+                "SAS's MOD does not allow 0 as the divisor; SparkShift needs it "
+                "to be a constant.",
+            )
+            return None
+        if number != int(number):
+            self.warn(
+                "MOD by a divisor that is not a whole number",
+                call.span,
+                "SAS makes a remainder that is very close to 0 or to the divisor "
+                "exactly 0 (MOD(0.3, 0.1) is 0); Spark keeps the exact remainder of "
+                "the stored values, which can differ for double columns.",
+            )
+        return ir.BinaryOp(ir.BinaryOperator.MODULO, value, ir.Literal(number))
+
+    def text_function(self, name: str, call: Call) -> _Value | None:
+        """UPCASE, LOWCASE, STRIP, TRIM, SUBSTR, and LENGTH."""
+        values = self.texts(name, call.arguments[:1])
+        if values is None:
+            return None
+        text = values[0]
+        assert text.expression is not None
+        if name == "LENGTH":
+            # The position of the last character that is not blank; 1 for
+            # blank or missing text.
+            trimmed = ir.FunctionCall("rtrim", (text.expression,))
+            length = ir.FunctionCall("length", (trimmed,))
+            return _Value(
+                "number", ir.FunctionCall("greatest", (length, ir.Literal(1)))
+            )
+        if name in _TEXT_FUNCTIONS:
+            result = ir.FunctionCall(_TEXT_FUNCTIONS[name], (text.expression,))
+            return _Value("text", result, length=text.length)
+        bounds = [_constant_number(argument) for argument in call.arguments[1:]]
+        positions = [int(b) for b in bounds if b is not None and b == int(b) and b >= 1]
+        if len(positions) < len(bounds):
+            self.unsupported(
+                "SUBSTR with a position or length that is not a positive whole number",
+                call.span,
+                "SparkShift supports constant positions and lengths, such as "
+                "SUBSTR(code, 2, 3).",
+            )
+            return None
+        if len(positions) == 1:
+            # Without a length, SAS takes the rest of the text.
+            result = ir.FunctionCall(
+                "substr", (text.expression, ir.Literal(positions[0]))
+            )
+        else:
+            start, size = positions
+            result = ir.FunctionCall(
+                "substring", (text.expression, ir.Literal(start), ir.Literal(size))
+            )
+        return _Value("text", result, length=text.length)
+
+    def concatenation(self, name: str, call: Call) -> _Value | None:
+        """CATS, CATX, and COALESCEC, which treat blank text as missing."""
+        arguments = call.arguments
+        delimiter = ""
+        if name == "CATX":
+            first, arguments = arguments[0], arguments[1:]
+            if not isinstance(first, String):
+                self.unsupported(
+                    "CATX with a delimiter that is not a text constant",
+                    first.span,
+                    "SAS keeps a delimiter's trailing blanks, which for a variable "
+                    "depend on a length SparkShift cannot see.",
+                )
+                return None
+            delimiter = first.value
+        values = self.texts(name, arguments)
+        if values is None:
+            return None
+        items: list[ir.Expression] = []
+        for value in values:
+            assert value.expression is not None
+            if value.constant:
+                # Blank constants add nothing.
+                kept = (
+                    value.text.rstrip(" ")
+                    if name == "COALESCEC"
+                    else value.text.strip(" ")
+                )
+                if kept:
+                    items.append(ir.Literal(kept))
+            elif name == "CATS":
+                items.append(ir.FunctionCall("trim", (value.expression,)))
+            else:
+                # Blank text is missing: concat_ws and coalesce skip it.
+                trimmed = "trim" if name == "CATX" else "rtrim"
+                stripped = ir.FunctionCall(trimmed, (value.expression,))
+                items.append(ir.FunctionCall("nullif", (stripped, ir.Literal(""))))
+        if name == "COALESCEC":
+            if not any(isinstance(item, ir.Literal) for item in items):
+                # Every argument is missing: a string of length zero.
+                items.append(ir.Literal(""))
+            if len(items) == 1:
+                return _Value("text", items[0])
+            return _Value("text", ir.FunctionCall("coalesce", tuple(items)))
+        if not items:
+            return _Value("text", ir.Literal(""), length=_CAT_LENGTH)
+        result = ir.FunctionCall("concat_ws", (ir.Literal(delimiter), *items))
+        return _Value("text", result, length=_CAT_LENGTH, blank_if_longer=True)
+
     # --- Conditions ----------------------------------------------------------
 
     def condition(self, expression: Expression) -> ir.Expression | None:
@@ -729,20 +1088,28 @@ class _SasTranslator:
             case Between():
                 return self.between(expression)
             case IsMissing(expression=inner, negated=negated):
-                value = self.value(inner)
-                if value is None:
+                missing = self.missing(inner, "IS MISSING", expression.span)
+                if missing is None:
                     return None
-                if value.constant:
-                    self.unsupported("IS MISSING on a constant", expression.span)
-                    return None
-                assert value.expression is not None
-                missing = (
-                    ir.IsNull(value.expression)
-                    if value.kind == "number"
-                    else _is_missing(value.expression)
-                )
                 return _not(missing) if negated else missing
+            case Call(name=name, arguments=(inner,)) if name.upper() == "MISSING":
+                return self.missing(inner, "MISSING", expression.span)
         return self.truth(expression)
+
+    def missing(
+        self, expression: Expression, what: str, span: Span
+    ) -> ir.Expression | None:
+        """Whether a value is missing: a missing number, or blank text."""
+        value = self.value(expression)
+        if value is None:
+            return None
+        if value.constant:
+            self.unsupported(f"{what} on a constant", span)
+            return None
+        assert value.expression is not None
+        if value.kind == "number":
+            return ir.IsNull(value.expression)
+        return _is_missing(value.expression)
 
     def truth(self, expression: Expression) -> ir.Expression | None:
         """A number standing alone as a condition: true unless it is 0 or
@@ -1062,6 +1429,53 @@ def _and(guard: ir.Expression | None, condition: ir.Expression) -> ir.Expression
 
 def _not(condition: ir.Expression) -> ir.Expression:
     return ir.UnaryOp(ir.UnaryOperator.NOT, condition)
+
+
+def _sum(terms: list[ir.Expression]) -> ir.Expression:
+    total = terms[0]
+    for term in terms[1:]:
+        total = ir.BinaryOp(ir.BinaryOperator.ADD, total, term)
+    return total
+
+
+def _total(constant: int, terms: list[ir.Expression]) -> ir.Expression:
+    """The sum of the terms and a constant count."""
+    parts = terms + ([ir.Literal(constant)] if constant else [])
+    return _sum(parts) if parts else ir.Literal(0)
+
+
+def _constant_number(expression: Expression) -> int | float | None:
+    match expression:
+        case Number(value=number):
+            return number
+        case Unary(op="-", operand=Number(value=number)):
+            return -number
+    return None
+
+
+def _decimal_places(unit: int | float | None) -> int | None:
+    """The places F.round takes for a rounding unit that is a power of 10 (2
+    for 0.01, -1 for 10), or None. SAS rounds to these as decimal arithmetic
+    does, down to 1E-15."""
+    if unit is None or unit <= 0:
+        return None
+    digits = Decimal(repr(unit)).normalize().as_tuple()
+    assert isinstance(digits.exponent, int)  # a finite number
+    if digits.digits != (1,) or -digits.exponent > 15:
+        return None
+    return -digits.exponent
+
+
+def _arguments(count: int) -> str:
+    return f"{count} argument" + ("" if count == 1 else "s")
+
+
+def _argument_range(fewest: int, most: int | None) -> str:
+    if most is None:
+        return f"at least {_arguments(fewest)}"
+    if most == fewest:
+        return _arguments(fewest)
+    return f"{fewest} or {most} arguments"
 
 
 def _unique(names: list[str]) -> tuple[str, ...]:

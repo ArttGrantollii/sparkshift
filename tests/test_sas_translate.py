@@ -230,7 +230,7 @@ def test_logical_operators() -> None:
         ("x + 1 = 'a'", "comparison of text with a number"),
         ("'a' + 1 > 2", "arithmetic on text"),
         ("-'a' > 2", "arithmetic on text"),
-        ("upcase(x) = 'A'", "function UPCASE"),
+        ("scan(x) = 'A'", "function SCAN"),
         ("x || 'a' = 'b'", "concatenation with ||"),
         ("x ** 2 > 1", "the ** operator"),
         ("x", "a variable whose type SparkShift cannot see as a condition"),
@@ -246,18 +246,18 @@ def test_logical_operators() -> None:
         ("x between 1 and 'b'", "BETWEEN of text and numbers"),
         ("x + 1 between 'a' and 'b'", "BETWEEN of text and numbers"),
         ("1 is missing", "IS MISSING on a constant"),
-        ("x = 1 and upcase(x) = 'A'", "function UPCASE"),
-        ("upcase(x) = 'A' or x = 1", "function UPCASE"),
-        ("not (upcase(x) = 'A')", "function UPCASE"),
-        ("x in (upcase(y))", "function UPCASE"),
-        ("upcase(x) in (1)", "function UPCASE"),
-        ("upcase(x) is missing", "function UPCASE"),
-        ("x between upcase(a) and 'b'", "function UPCASE"),
-        ("x = upcase(y)", "function UPCASE"),
-        ("upcase(y) + 1 > 0", "function UPCASE"),
-        ("x * upcase(y) > 0", "function UPCASE"),
-        ("-upcase(y) > 0", "function UPCASE"),
-        ("upcase(y)", "function UPCASE"),
+        ("x = 1 and scan(x) = 'A'", "function SCAN"),
+        ("scan(x) = 'A' or x = 1", "function SCAN"),
+        ("not (scan(x) = 'A')", "function SCAN"),
+        ("x in (scan(y))", "function SCAN"),
+        ("scan(x) in (1)", "function SCAN"),
+        ("scan(x) is missing", "function SCAN"),
+        ("x between scan(a) and 'b'", "function SCAN"),
+        ("x = scan(y)", "function SCAN"),
+        ("scan(y) + 1 > 0", "function SCAN"),
+        ("x * scan(y) > 0", "function SCAN"),
+        ("-scan(y) > 0", "function SCAN"),
+        ("scan(y)", "function SCAN"),
     ],
 )
 def test_unsupported_conditions(where: str, message: str) -> None:
@@ -291,9 +291,9 @@ def test_conditions_of_an_untranslated_step_are_still_checked() -> None:
         "SET with several data sets",
         "comparison of two variables",
     ]
-    assert issues("data a; where upcase(x) = 'A'; total = y ** 2; run;") == [
+    assert issues("data a; where scan(x) = 'A'; total = y ** 2; run;") == [
         "DATA step without a SET statement",
-        "function UPCASE",
+        "function SCAN",
         "the ** operator",
     ]
 
@@ -301,12 +301,12 @@ def test_conditions_of_an_untranslated_step_are_still_checked() -> None:
 def test_every_issue_in_the_program_is_reported() -> None:
     assert issues(
         "proc sort data=a; by x; run;\n"
-        "data b; set a; where x = y; total = upcase(z); run;\n"
+        "data b; set a; where x = y; total = scan(z); run;\n"
         "data _null_; set b; run;"
     ) == [
         "PROC SORT step",
         "comparison of two variables",
-        "function UPCASE",
+        "function SCAN",
         "DATA _NULL_ step",
     ]
 
@@ -691,17 +691,17 @@ def test_a_numeric_length_declares_a_number() -> None:
         ("length n 4;", "numeric LENGTH 4"),
         ("y = x ** 2;", "the ** operator"),
         ("y = x || 'a';", "concatenation with ||"),
-        ("y = upcase(x);", "function UPCASE"),
+        ("y = scan(x);", "function SCAN"),
         ("y = 'a' * 2;", "arithmetic on text"),
         ("y = x = z;", "comparison of two variables"),
-        ("if y = 1 then x = upcase(z); else x = 1;", "function UPCASE"),
-        ("if upcase(z) = 'A' then x = 1; else x = 2;", "function UPCASE"),
-        ("if upcase(z) = 'A' then do; x = 1; end; else x = 2;", "function UPCASE"),
+        ("if y = 1 then x = scan(z); else x = 1;", "function SCAN"),
+        ("if scan(z) = 'A' then x = 1; else x = 2;", "function SCAN"),
+        ("if scan(z) = 'A' then do; x = 1; end; else x = 2;", "function SCAN"),
         (
             "if x then y = 1; else y = 2;",
             "a variable whose type SparkShift cannot see as a condition",
         ),
-        ("if x > 1;  if upcase(z);", "function UPCASE"),
+        ("if x > 1;  if scan(z);", "function SCAN"),
     ],
 )
 def test_unsupported_program_statements(body: str, message: str) -> None:
@@ -730,3 +730,322 @@ def test_statements_in_blocks_count_for_keep_drop_and_rename() -> None:
 
     assert isinstance(relation, ir.Project)
     assert relation.items == (Y,)
+
+
+# --- Functions -----------------------------------------------------------------
+
+A = Column(("a",))
+B = Column(("b",))
+
+
+def value_of(expression: str) -> ir.Expression:
+    """The IR of an expression assigned to y."""
+    relation = step(f"y = {expression};")
+    assert isinstance(relation, ir.WithColumn)
+    return relation.expression
+
+
+def coalesced(variable: ir.Expression) -> ir.Expression:
+    return FunctionCall("coalesce", (variable, Literal(0)))
+
+
+def is_present(variable: ir.Expression) -> ir.Expression:
+    return ir.Cast(IsNull(variable, negated=True), "int")
+
+
+def plus(left: ir.Expression, right: ir.Expression) -> ir.Expression:
+    return BinaryOp(BinaryOperator.ADD, left, right)
+
+
+def blank_is_null(variable: ir.Expression, trim: str = "trim") -> ir.Expression:
+    return FunctionCall("nullif", (FunctionCall(trim, (variable,)), Literal("")))
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        # SUM is missing only when every argument is.
+        (
+            "sum(a, b)",
+            ir.Case(
+                (
+                    (
+                        IsNull(FunctionCall("coalesce", (A, B)), negated=True),
+                        plus(coalesced(A), coalesced(B)),
+                    ),
+                ),
+                None,
+            ),
+        ),
+        # With a constant, the sum is never missing.
+        ("sum(a, 1)", plus(coalesced(A), Literal(1))),
+        ("sum(a, .)", A),
+        ("sum(a)", A),
+        ("sum(.)", Literal(None)),
+        (
+            "mean(a, b)",
+            FunctionCall(
+                "try_divide",
+                (plus(coalesced(A), coalesced(B)), plus(is_present(A), is_present(B))),
+            ),
+        ),
+        (
+            "mean(a, 4)",
+            FunctionCall(
+                "try_divide",
+                (plus(coalesced(A), Literal(4)), plus(is_present(A), Literal(1))),
+            ),
+        ),
+        ("min(a, b, 0)", FunctionCall("least", (A, B, Literal(0)))),
+        ("max(a, .)", A),
+        ("coalesce(a, b, 0)", FunctionCall("coalesce", (A, B, Literal(0)))),
+        ("n(a, b)", plus(is_present(A), is_present(B))),
+        ("n(a, 1, .)", plus(is_present(A), Literal(1))),
+        ("n(.)", Literal(0)),
+        ("nmiss(a, ., 2)", plus(ir.Cast(IsNull(A), "int"), Literal(1))),
+    ],
+)
+def test_statistics_skip_missing_values(
+    expression: str, expected: ir.Expression
+) -> None:
+    assert value_of(expression) == expected
+
+
+CEIL_A = FunctionCall("ceil", (BinaryOp(BinaryOperator.SUBTRACT, A, Literal(1e-12)),))
+FLOOR_A = FunctionCall("floor", (BinaryOp(BinaryOperator.ADD, A, Literal(1e-12)),))
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        ("round(a)", FunctionCall("round", (A,))),
+        ("round(a, 1)", FunctionCall("round", (A,))),
+        ("round(a, 0.01)", FunctionCall("round", (A, Literal(2)))),
+        ("round(a, .001)", FunctionCall("round", (A, Literal(3)))),
+        ("round(a, 100)", FunctionCall("round", (A, Literal(-2)))),
+        ("round(a, 1e-15)", FunctionCall("round", (A, Literal(15)))),
+        # Within 1E-12 of an integer counts as that integer.
+        ("ceil(a)", CEIL_A),
+        ("floor(a)", FLOOR_A),
+        (
+            "int(a)",
+            ir.Case(((BinaryOp(BinaryOperator.LESS, A, Literal(0)), CEIL_A),), FLOOR_A),
+        ),
+        ("abs(a)", FunctionCall("abs", (A,))),
+        ("mod(a, 3)", BinaryOp(BinaryOperator.MODULO, A, Literal(3))),
+        ("mod(a, -2)", BinaryOp(BinaryOperator.MODULO, A, Literal(-2))),
+        ("round(.)", Literal(None)),
+        ("mod(a, .)", Literal(None)),
+    ],
+)
+def test_rounding_functions(expression: str, expected: ir.Expression) -> None:
+    assert value_of(expression) == expected
+
+
+def test_mod_by_a_fraction_is_a_review_item() -> None:
+    assert warnings("y = mod(a, 0.5);") == [
+        "MOD by a divisor that is not a whole number"
+    ]
+    assert warnings("y = mod(a, 2);") == []
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        ("upcase(a)", FunctionCall("upper", (A,))),
+        ("lowcase(a)", FunctionCall("lower", (A,))),
+        ("strip(a)", FunctionCall("trim", (A,))),
+        ("trim(a)", FunctionCall("rtrim", (A,))),
+        ("substr(a, 2, 3)", FunctionCall("substring", (A, Literal(2), Literal(3)))),
+        ("substr(a, 2)", FunctionCall("substr", (A, Literal(2)))),
+        # The last character that is not blank; 1 for blank text.
+        (
+            "length(a)",
+            FunctionCall(
+                "greatest",
+                (FunctionCall("length", (FunctionCall("rtrim", (A,)),)), Literal(1)),
+            ),
+        ),
+        (
+            "cats(a, ' x ', ' ', b)",
+            FunctionCall(
+                "concat_ws",
+                (
+                    Literal(""),
+                    FunctionCall("trim", (A,)),
+                    Literal("x"),
+                    FunctionCall("trim", (B,)),
+                ),
+            ),
+        ),
+        (
+            "catx(', ', a, b)",
+            FunctionCall(
+                "concat_ws", (Literal(", "), blank_is_null(A), blank_is_null(B))
+            ),
+        ),
+        ("cats(' ')", Literal("")),
+        (
+            "coalescec(a, b)",
+            FunctionCall(
+                "coalesce",
+                (blank_is_null(A, "rtrim"), blank_is_null(B, "rtrim"), Literal("")),
+            ),
+        ),
+        # A text constant that is not blank ends the search.
+        (
+            "coalescec(a, ' ', 'none ')",
+            FunctionCall("coalesce", (blank_is_null(A, "rtrim"), Literal("none"))),
+        ),
+        ("coalescec(' ')", Literal("")),
+        (
+            "missing(a)",
+            ir.Cast(
+                BinaryOp(
+                    BinaryOperator.OR,
+                    IsNull(A),
+                    BinaryOp(
+                        BinaryOperator.EQUAL, FunctionCall("rtrim", (A,)), Literal("")
+                    ),
+                ),
+                "int",
+            ),
+        ),
+        ("missing(a + 1)", ir.Cast(IsNull(plus(A, Literal(1))), "int")),
+    ],
+)
+def test_text_functions(expression: str, expected: ir.Expression) -> None:
+    assert value_of(expression) == expected
+
+
+def test_function_names_ignore_case() -> None:
+    assert value_of("UpCase(a)") == FunctionCall("upper", (A,))
+
+
+def test_functions_are_typed_in_conditions() -> None:
+    upper = FunctionCall("upper", (A,))
+    # Two text values can be compared: the functions show their type.
+    assert condition("upcase(a) = lowcase(b)") == BinaryOp(
+        BinaryOperator.EQUAL, text(upper), text(FunctionCall("lower", (B,)))
+    )
+    assert condition("missing(a)") == BinaryOp(
+        BinaryOperator.OR,
+        IsNull(A),
+        BinaryOp(BinaryOperator.EQUAL, FunctionCall("rtrim", (A,)), Literal("")),
+    )
+    total = value_of("sum(a, 1)")
+    assert condition("sum(a, 1)") == BinaryOp(
+        BinaryOperator.AND,
+        IsNull(total, negated=True),
+        BinaryOp(BinaryOperator.NOT_EQUAL, total, Literal(0)),
+    )
+
+
+def test_a_function_keeps_its_arguments_length() -> None:
+    # UPCASE gives code the length of name, 2 here, so 'abc' is truncated.
+    body = "name = 'ab'; code = upcase(name); code = 'abc';"
+    assert warnings(body, "t(keep=x)") == ["text truncated to the length of code"]
+
+
+def test_a_value_that_fits_needs_no_substring() -> None:
+    # Exactly as long as the variable: nothing is cut.
+    relation = step("length s $ 3; s = upcase('abc');")
+
+    assert relation == ir.WithColumn(T, "s", FunctionCall("upper", (Literal("abc"),)))
+
+
+def test_cats_gives_a_new_variable_length_200() -> None:
+    body = "full = cats(a, b); full = 'x';"
+    relation = step(body, "t(keep=a b)")
+
+    assert isinstance(relation, ir.WithColumn)
+    assert relation.expression == Literal("x")
+    assert warnings(body, "t(keep=a b)") == ["KEEP of several variables"]
+
+
+def test_a_cats_result_longer_than_the_variable_is_blank() -> None:
+    relation = step("length full $ 5; full = cats(a, b);")
+
+    assert isinstance(relation, ir.WithColumn)
+    cats = FunctionCall(
+        "concat_ws",
+        (Literal(""), FunctionCall("trim", (A,)), FunctionCall("trim", (B,))),
+    )
+    too_long = BinaryOp(
+        BinaryOperator.GREATER, FunctionCall("length", (cats,)), Literal(5)
+    )
+    assert relation.expression == ir.Case(((too_long, Literal("")),), cats)
+
+
+def test_a_substr_result_longer_than_the_variable_is_truncated() -> None:
+    relation = step("length code $ 2; code = substr(a, 2);")
+
+    assert isinstance(relation, ir.WithColumn)
+    assert relation.expression == FunctionCall(
+        "substring", (FunctionCall("substr", (A, Literal(2))), Literal(1), Literal(2))
+    )
+
+
+def test_a_coalescec_result_has_an_unknown_length() -> None:
+    assert issues("data a; set t(keep=a b); s = coalescec(a, b); s = 'x'; run;") == [
+        "text assigned to s that SAS may truncate"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("expression", "message"),
+    [
+        ("scan(a, 1)", "function SCAN"),
+        ("today()", "function TODAY"),
+        ("sum()", "SUM with 0 arguments"),
+        ("abs(a, b)", "ABS with 2 arguments"),
+        ("substr(a)", "SUBSTR with 1 argument"),
+        ("catx(',')", "CATX with 1 argument"),
+        ("sum(a, 'x')", "text in SUM"),
+        ("coalesce(a, 'x')", "text in COALESCE"),
+        ("upcase(1)", "number in UPCASE"),
+        ("upcase(a + 1)", "number in UPCASE"),
+        ("cats(a, 1)", "number in CATS"),
+        ("length(.)", "number in LENGTH"),
+        ("round(a, 0.5)", "ROUND to a unit that is not a power of 10"),
+        ("round(a, b)", "ROUND to a unit that is not a power of 10"),
+        ("round(a, -1)", "ROUND to a unit that is not a power of 10"),
+        ("round(a, 1e-16)", "ROUND to a unit that is not a power of 10"),
+        ("mod(a, 0)", "MOD by a divisor that is not a constant other than 0"),
+        ("mod(a, b)", "MOD by a divisor that is not a constant other than 0"),
+        (
+            "substr(a, b, 2)",
+            "SUBSTR with a position or length that is not a positive whole number",
+        ),
+        (
+            "substr(a, 0)",
+            "SUBSTR with a position or length that is not a positive whole number",
+        ),
+        (
+            "substr(a, 1, 2.5)",
+            "SUBSTR with a position or length that is not a positive whole number",
+        ),
+        ("catx(d, a, b)", "CATX with a delimiter that is not a text constant"),
+        ("missing(1)", "MISSING on a constant"),
+        ("sum(of a b)", "OF variable list"),
+        ("upcase(scan(a, 1))", "function SCAN"),
+        ("sum(scan(a, 1), 1)", "function SCAN"),
+        ("round(scan(a, 1))", "function SCAN"),
+        ("catx(' ', scan(a, 1))", "function SCAN"),
+        ("missing(scan(a, 1))", "function SCAN"),
+    ],
+)
+def test_unsupported_function_calls(expression: str, message: str) -> None:
+    assert issues(f"data a; set t; y = {expression}; run;") == [message]
+
+
+def test_every_text_argument_is_reported() -> None:
+    assert issues("data a; set t; y = sum('a', 'b'); run;") == ["text in SUM"] * 2
+
+
+def test_a_date_function_says_dates_come_later() -> None:
+    with pytest.raises(UnsupportedSQLError) as caught:
+        translate("data a; set t; y = year(d); run;")
+
+    [issue] = caught.value.issues
+    assert issue.hint == "Date functions are not supported yet."

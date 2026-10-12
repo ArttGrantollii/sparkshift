@@ -816,6 +816,21 @@ class _Parser:
 
     def call(self, name: Token, tokens: "_Tokens") -> Expression:
         tokens.take()
+        if tokens.peek().is_keyword("OF") and tokens.peek(1).kind is Kind.NAME:
+            # SUM(OF x1-x3 y): a variable list.
+            depth = 1
+            while depth and not tokens.at_end():
+                token = tokens.take()
+                depth += token.is_symbol("(") - token.is_symbol(")")
+            if depth:
+                raise self.error("Expected ) to end the function call", tokens.peek())
+            span = self.span(name, tokens.previous())
+            self.unsupported(
+                "OF variable list",
+                span,
+                "List the variables separated by commas, as in SUM(a, b, c).",
+            )
+            return Missing(span)
         arguments: list[Expression] = []
         while not tokens.peek().is_symbol(")"):
             arguments.append(self.expression(tokens))

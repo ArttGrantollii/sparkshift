@@ -164,8 +164,9 @@ when `--fail-under` is given and fewer files convert; and 2 for a usage error.
 
 SparkShift is learning to convert SAS programs too. So far it converts DATA
 steps that read a data set, filter it with `WHERE`, compute new variables with
-assignments and arithmetic, choose values with `IF`/`ELSE`, delete rows, and
-keep, drop, or rename variables:
+assignments, arithmetic, and common functions (`SUM`, `ROUND`, `UPCASE`,
+`CATX`, and more), choose values with `IF`/`ELSE`, delete rows, and keep,
+drop, or rename variables:
 
 ```bash
 sparkshift convert low_scores.sas --dialect sas

@@ -13,8 +13,9 @@ written by hand** from the rules below. Each scenario names the rule it
 checks. This verifies SparkShift against SAS's documented behavior, not
 against SAS itself.
 
-All rules come from SAS's public documentation: *SAS 9.4 Language Reference:
-Concepts*, at documentation.sas.com.
+All rules come from SAS's public documentation at documentation.sas.com:
+*SAS 9.4 Language Reference: Concepts* and, for functions, *SAS 9.4 Functions
+and CALL Routines: Reference*.
 
 ## Supported so far
 
@@ -32,13 +33,15 @@ Concepts*, at documentation.sas.com.
 | Subsetting `IF condition;` and `DELETE` | |
 | `LENGTH name $ n;` | Before a variable's first use; numbers only with length 8 |
 | Conditions | Comparisons (`=`, `^=`, `<`, `<=`, `>`, `>=` and `EQ`, `NE`, `LT`, `LE`, `GT`, `GE`); `AND`, `OR`, `NOT (...)`; `IN`, `NOT IN`; `BETWEEN ... AND`; `IS [NOT] MISSING` and `IS [NOT] NULL`; a number on its own. A comparison or condition used as a value is 1 or 0 |
+| Functions | `SUM`, `MEAN`, `MIN`, `MAX`, `N`, `NMISS`, `COALESCE`; `ROUND`, `INT`, `CEIL`, `FLOOR`, `ABS`, `MOD`; `UPCASE`, `LOWCASE`, `STRIP`, `TRIM`, `SUBSTR`, `LENGTH`; `CATS`, `CATX`, `COALESCEC`; `MISSING`. See [Functions](#functions) |
 | Comments | `/* ... */` anywhere, and `* ... ;` statements |
 
 Everything else is rejected with a list of every unsupported construct, for
 example `RETAIN`, `BY` with `FIRST.`/`LAST.`, `OUTPUT`, `MERGE`, arrays, `DO`
-loops, functions, `**`, `||`, date constants, variable lists such as `x1-x5`,
-macros (`%let`, `&name`), global statements such as `LIBNAME` and `OPTIONS`,
-`DATA _NULL_`, writing to a permanent library, and every PROC step.
+loops, other functions (date functions among them), `**`, `||`, date
+constants, variable lists such as `x1-x5` and `OF x1-x5`, macros (`%let`,
+`&name`), global statements such as `LIBNAME` and `OPTIONS`, `DATA _NULL_`,
+writing to a permanent library, and every PROC step.
 
 ## The rules
 
@@ -179,6 +182,101 @@ tell whether a variable is new (and so whether its first value sets its
 length), and a later value could be truncated, it rejects the assignment and
 suggests a `LENGTH` statement.
 
+### Functions
+
+*SAS 9.4 Functions and CALL Routines: Reference*, one page per function. A
+function's arguments must have the type it takes: a number where it takes
+numbers and text where it takes text (a variable of unseen type is taken to
+have the right one). SAS would convert the other type and write a note;
+SparkShift rejects it. Function results have a known type, so they can be
+compared with each other: `upcase(a) = upcase(b)` is supported.
+
+**Statistics skip missing values.** `SUM`, `MEAN`, `MIN`, and `MAX` use the
+arguments that are present, and are missing only when all of them are
+("returns the sum of the nonmissing arguments"; MIN "returns a missing value
+(.) only if all arguments are missing"). `N` and `NMISS` count the arguments
+that are present and missing; `COALESCE` returns the first one present. Note
+that `MIN(x, 1)` is 1 for a missing `x`, while `x < 1` is true: the functions
+skip missing values, the operators treat them as the smallest.
+
+| SAS | PySpark |
+|---|---|
+| `sum(a, b)` | `F.when(F.coalesce(a, b).isNotNull(), F.coalesce(a, F.lit(0)) + F.coalesce(b, F.lit(0)))` |
+| `sum(a, 1)` | `F.coalesce(a, F.lit(0)) + F.lit(1)`: never missing |
+| `mean(a, b)` | `F.try_divide(<the sum>, a.isNotNull().cast("int") + b.isNotNull().cast("int"))` |
+| `min(a, b)`, `max(a, b)` | `F.least(a, b)`, `F.greatest(a, b)`, which skip NULLs |
+| `n(a, b)`, `nmiss(a, b)` | `a.isNotNull().cast("int") + ...`, `a.isNull().cast("int") + ...` |
+| `coalesce(a, b)` | `F.coalesce(a, b)` |
+
+**Rounding.** *ROUND:* "The ROUND function returns the value that is based on
+decimal arithmetic": `ROUND(x, 0.01)` of the double nearest 2.675, which is
+slightly below it, is 2.68. When the value is halfway between two multiples,
+"the ROUND function rounds up the absolute value and restores the original
+sign": `ROUND(-2.5)` is -3. Spark's `F.round` does the same on doubles (it
+rounds the value's shortest decimal form, half away from zero), so
+`round(x, 0.01)` becomes `F.round(x, 2)` and `round(x, 100)` becomes
+`F.round(x, -2)`. SparkShift supports rounding units that are powers of 10,
+down to 1E-15; SAS handles other units, such as 0.25, with extra steps that
+have no Spark equivalent, so they are rejected.
+
+*INT, CEIL, FLOOR:* "If the argument is within 1E-12 of an integer, the
+function returns that integer." Spark has no such fuzzing: `CEIL` of
+`0.1 * 3 * 10`, stored as 3.0000000000000004, is 4 in Spark and 3 in SAS. So
+`ceil(x)` becomes `F.ceil(x - F.lit(1e-12))` and `floor(x)` becomes
+`F.floor(x + F.lit(1e-12))`. `INT` truncates toward zero: "If the value of
+argument is positive, the INT function has the same result as the FLOOR
+function. If the value of argument is negative, the INT function has the same
+result as the CEIL function."
+
+*MOD:* "When the result is nonzero, the result has the same sign as the first
+argument. The sign of the second argument is ignored", as with Spark's `%`.
+The divisor "cannot be 0"; SparkShift needs it to be a constant. For
+arguments that are not whole numbers, SAS makes a remainder that is very
+close to 0 or to the divisor exactly 0 (`MOD(0.3, 0.1)` is 0), without saying
+how close. SparkShift warns when the divisor is not a whole number.
+
+**Text.** `UPCASE`, `LOWCASE`, `STRIP` (leading and trailing blanks), and
+`TRIM` (trailing blanks) become `F.upper`, `F.lower`, `F.trim`, and
+`F.rtrim`. *LENGTH:* "returns an integer that represents the position of the
+rightmost non-blank character", and "if the value of string is blank, LENGTH
+returns a value of 1", so it becomes
+`F.greatest(F.length(F.rtrim(x)), F.lit(1))`; missing text is blank, so it is
+1 too. *SUBSTR:* "If you omit length, SAS extracts the remainder of the
+expression"; SparkShift supports constant positions and lengths.
+
+*CATS, CATX:* CATS removes leading and trailing blanks from each item and
+joins them. CATX also puts the delimiter between items, but "if item-i
+contains at least one non-blank character": "Blank items do not produce
+delimiters at the beginning or end of the result, nor do blank items produce
+multiple consecutive delimiters." So `catx(', ', a, b)` becomes
+`F.concat_ws(", ", F.nullif(F.trim(a), F.lit("")), ...)`: `concat_ws` skips
+NULLs. The delimiter must be a text constant, used as written. Items must be
+text: SAS writes numbers with the BESTw. format first, which SparkShift does
+not reproduce.
+
+*COALESCEC:* "A character value is considered missing if it has a length of
+zero or if all the characters are blank. If all the values of all the
+arguments are missing, the COALESCEC function returns a string with a length
+of zero."
+
+*MISSING:* returns 1 for a missing number, and for text "that contains all
+blanks or has a length of zero"; 0 otherwise. In a condition it becomes the
+same test as `IS MISSING`.
+
+**Lengths of function results.** A new text variable gets its length from the
+first value assigned to it (see [Text length](#text-length)). For a function,
+that is the length SAS gives its result:
+
+- `UPCASE`, `LOWCASE`, `STRIP`, `TRIM`, and `SUBSTR`: "that variable is given
+  the length of the argument" (the first argument for `SUBSTR`). That length
+  is known when the argument is a constant or a variable the step assigns.
+- `CATS` and `CATX`: "that variable is given a length of 200 bytes". When the
+  result is longer than the variable, SAS "changes the result to a blank value
+  in the DATA step" rather than truncating it, so after
+  `length label $ 6;`, `label = catx(' ', name, country);` is
+  `F.when(F.length(<the CATX>) > F.lit(6), F.lit("")).otherwise(<the CATX>)`.
+- `COALESCEC`: SparkShift treats the length as unknown.
+
 ## Limitations
 
 - **Column order of KEEP:** SAS keeps variables in the data set's order;
@@ -200,3 +298,21 @@ suggests a `LENGTH` statement.
 - **NOT needs parentheses:** in SAS, `NOT` binds more tightly than a comparison
   (`not x = 1` means `(not x) = 1`). SparkShift requires `NOT (...)`, so the
   meaning is never in doubt.
+- **Characters, not bytes:** SAS's `LENGTH` function and variable lengths count
+  bytes; Spark counts characters. They differ for text that is not ASCII, such
+  as `'Café'` (4 characters, 5 bytes in UTF-8).
+- **Upper and lower case:** `F.upper` and `F.lower` change the case of every
+  Unicode letter. SAS's result for letters outside the English alphabet
+  depends on its encoding and locale settings.
+- **Long CATS and CATX results:** a result longer than 200 characters, stored
+  in a new variable, is blank in SAS; SparkShift keeps it.
+- **CATS and CATX of numbers:** a variable of unseen type is taken to be text.
+  If it is a number, SAS writes it with the BESTw. format, which can differ from
+  Spark's text form (for example for 0.1 + 0.2).
+- **Rounding near a half:** SAS also rounds away from zero values that are
+  only approximately halfway, within about 1E-12 of the value, such as
+  0.4999999999999; Spark rounds them down.
+- **MOD of fractions:** see [Functions](#functions); SparkShift warns.
+- **SUBSTR past the end:** SAS documents a length that runs past the end (it
+  takes the rest), but not a position past the end of the variable. Spark
+  returns an empty string, which compares as blank.

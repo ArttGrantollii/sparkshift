@@ -187,6 +187,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SparkShift cannot see, it uses what the program shows (a variable read
   before it is assigned, or `KEEP=` on the `SET` data set) or rejects the
   statement with a hint.
+- SAS functions: `SUM`, `MEAN`, `MIN`, `MAX`, `N`, `NMISS`, `COALESCE`,
+  `ROUND`, `INT`, `CEIL`, `FLOOR`, `ABS`, `MOD`, `UPCASE`, `LOWCASE`, `STRIP`,
+  `TRIM`, `SUBSTR`, `LENGTH`, `CATS`, `CATX`, `COALESCEC`, and `MISSING`, each
+  following its page in SAS's function reference: statistics skip missing
+  values; `INT`, `CEIL`, and `FLOOR` treat a value within 1E-12 of an integer
+  as that integer; `LENGTH` ignores trailing blanks and is 1 for blank text;
+  `CATX` adds no delimiter for blank items; and text results get SAS's
+  lengths (200 for `CATS` and `CATX`, which give a blank, not a truncated
+  value, when the result does not fit). Function results are typed, so they
+  work in conditions and comparisons. Other functions, `OF` variable lists,
+  and arguments of the wrong type are rejected; `MOD` by a fraction is a
+  review warning.
 
 ### Changed
 
