@@ -225,6 +225,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   within BY groups (window sums); missing values come first in the order.
   PROC FREQ without `OUT=`, its `OUTPUT` statement, `SPARSE`, `OUTCUM`, and
   grouped requests are rejected.
+- SAS `PROC SQL`: `CREATE TABLE ... AS SELECT` with `DISTINCT`, `AS` names,
+  data set options in `FROM`, table aliases and `table.column`, `INNER` and
+  `LEFT JOIN ... ON`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, and
+  summary functions (`COUNT(*)`, `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, ...).
+  Conditions follow SAS's missing-value rules, as PROC SQL does: a missing
+  value is smaller than any number, and a join matches missing values
+  (`eqNullSafe`, with a warning about text). With two or more arguments,
+  `SUM` and the others are the per-row DATA step functions. Remerging,
+  subqueries, `CALCULATED`, set operators, other joins, and other statements
+  are rejected.
 
 ### Changed
 

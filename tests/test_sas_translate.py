@@ -1549,3 +1549,287 @@ def test_proc_freq_reads_the_last_data_set_and_a_where_statement() -> None:
 )
 def test_unsupported_proc_freq(program: str, message: str) -> None:
     assert issues(program) == [message]
+
+
+# --- PROC SQL ------------------------------------------------------------------
+
+
+def sql(query: str) -> ir.Relation:
+    [dataset] = translate(f"proc sql; create table out as {query}; quit;").datasets
+    assert dataset.name == "out"
+    return dataset.source
+
+
+def sql_warnings(query: str) -> list[str]:
+    translation = translate(f"proc sql; create table out as {query}; quit;")
+    return [warning.message for warning in translation.warnings]
+
+
+def sql_issues(query: str) -> list[str]:
+    return issues(f"proc sql; create table out as {query}; quit;")
+
+
+def test_a_query_follows_sas_rules_for_missing_values() -> None:
+    relation = sql("select x, y * 2 as twice from t where x > 1")
+
+    twice = ir.Alias(BinaryOp(BinaryOperator.MULTIPLY, Y, Literal(2)), "twice")
+    assert relation == ir.Project(ir.Filter(T, GREATER_1), (X, twice))
+
+
+def test_select_star_keeps_every_column() -> None:
+    assert sql("select * from t where x > 1") == ir.Filter(T, GREATER_1)
+
+
+def test_a_join_matches_missing_values_with_a_warning() -> None:
+    relation = sql(
+        "select c.name, o.amount from customers c left join orders as o on c.id = o.id"
+    )
+
+    customers = ir.RelationAlias(TableScan(("customers",)), "c")
+    orders = ir.RelationAlias(TableScan(("orders",)), "o")
+    condition = ir.NullSafeEqual(Column(("c", "id")), Column(("o", "id")))
+    joined = ir.Join(customers, orders, ir.JoinKind.LEFT, condition)
+    assert relation == ir.Project(
+        joined, (Column(("c", "name")), Column(("o", "amount")))
+    )
+    assert sql_warnings("select * from customers c join orders o on c.id ne o.id") == [
+        "equality of two columns"
+    ]
+
+
+def test_a_qualified_column_names_its_table() -> None:
+    assert sql("select t.x from t") == ir.Project(
+        ir.RelationAlias(T, "t"), (Column(("t", "x")),)
+    )
+
+
+def test_group_by_with_summary_functions_and_having() -> None:
+    relation = sql(
+        "select a, count(*) as n, sum(x) as total from t group by a having count(*) > 1"
+    )
+
+    count = ir.AggregateCall(ir.AggregateFunction.COUNT)
+    having = BinaryOp(
+        BinaryOperator.AND,
+        IsNull(count, negated=True),
+        BinaryOp(BinaryOperator.GREATER, count, Literal(1)),
+    )
+    summary = ir.Aggregate(
+        T,
+        (A,),
+        (
+            ir.Alias(count, "n"),
+            ir.Alias(aggregate(ir.AggregateFunction.SUM, X), "total"),
+            ir.Alias(having, "_having"),
+        ),
+    )
+    assert relation == ir.Project(
+        ir.Filter(summary, Column(("_having",))),
+        (A, Column(("n",)), Column(("total",))),
+    )
+
+
+def test_a_summary_of_all_rows() -> None:
+    assert sql("select count(*) as n, avg(x) as mean from t") == ir.Aggregate(
+        T,
+        (),
+        (
+            ir.Alias(ir.AggregateCall(ir.AggregateFunction.COUNT), "n"),
+            ir.Alias(aggregate(ir.AggregateFunction.AVG, X), "mean"),
+        ),
+    )
+
+
+def test_selected_columns_come_in_the_select_order() -> None:
+    relation = sql("select count(distinct x) as n, a from t group by a")
+
+    count = ir.AggregateCall(ir.AggregateFunction.COUNT, (X,), distinct=True)
+    assert relation == ir.Project(
+        ir.Aggregate(T, (A,), (ir.Alias(count, "n"),)), (Column(("n",)), A)
+    )
+
+
+@pytest.mark.parametrize(
+    ("function", "expected"),
+    [
+        (
+            "sum(distinct x)",
+            ir.AggregateCall(ir.AggregateFunction.SUM, (X,), distinct=True),
+        ),
+        ("nmiss(x)", aggregate(ir.AggregateFunction.COUNT_IF, IsNull(X))),
+        ("freq(x)", aggregate(ir.AggregateFunction.COUNT, X)),
+        ("std(x)", aggregate(ir.AggregateFunction.STDDEV_SAMP, X)),
+    ],
+)
+def test_summary_functions(function: str, expected: ir.Expression) -> None:
+    relation = sql(f"select {function} as v from t")
+
+    assert isinstance(relation, ir.Aggregate)
+    assert relation.aggregates == (ir.Alias(expected, "v"),)
+
+
+def test_sum_of_two_columns_is_computed_for_each_row() -> None:
+    relation = sql("select sum(x, y) as s from t")
+
+    total = ir.Case(
+        (
+            (
+                IsNull(FunctionCall("coalesce", (X, Y)), negated=True),
+                plus(coalesced(X), coalesced(Y)),
+            ),
+        ),
+        None,
+    )
+    assert relation == ir.Project(T, (ir.Alias(total, "s"),))
+
+
+def test_order_by_name_position_and_distinct() -> None:
+    relation = sql("select distinct a, x from t order by 2 desc, a")
+
+    assert relation == ir.Sort(
+        ir.Distinct(ir.Project(T, (A, X))), (descending("x"), ascending("a"))
+    )
+    assert sql("select * from t order by x") == ir.Sort(T, (ascending("x"),))
+
+
+def test_create_table_options_and_data_set_options() -> None:
+    [dataset] = translate(
+        "proc sql; create table out(drop=x) as select a, x from t(where=(x > 1)); quit;"
+    ).datasets
+
+    assert dataset.source == ir.DropColumns(
+        ir.Project(ir.Filter(T, GREATER_1), (A, X)), ("x",)
+    )
+
+
+def test_several_tables_in_one_step_and_a_later_data_step() -> None:
+    first, second, third = translate(
+        "proc sql; create table a as select x from t; "
+        "create table b as select x from a; quit; data c; set b; run;"
+    ).datasets
+
+    assert second.source == ir.Project(first, (X,))
+    assert third.source is second
+
+
+@pytest.mark.parametrize(
+    ("query", "message"),
+    [
+        ("select x + 1 from t", "computed column without a name"),
+        ("select a, x from t group by a", "column x neither grouped nor summarized"),
+        ("select a, sum(x) as s from t", "column a neither grouped nor summarized"),
+        ("select x from t where sum(x) > 1", "summary function in WHERE"),
+        (
+            "select x from t having x > 1",
+            "HAVING without GROUP BY or a summary function",
+        ),
+        (
+            "select a, sum(x) as s from t group by a having x > 1",
+            "HAVING on a column neither grouped nor summarized",
+        ),
+        (
+            "select a from t order by x",
+            "ORDER BY something other than a selected column",
+        ),
+        (
+            "select a from t order by 2",
+            "ORDER BY something other than a selected column",
+        ),
+        ("select a, x as a from t", "two columns named a"),
+        ("select *, x from t", "* with other columns"),
+        ("select * from t group by a", "* with GROUP BY or a summary function"),
+        ("select sum(x) as s from t group by x + 1", "GROUP BY of an expression"),
+        ("select avg(distinct x) as m from t", "AVG(DISTINCT ...)"),
+        ("select sum(*) as s from t", "SUM(*)"),
+        ("select sum(.) as s from t", "SUM of a missing value"),
+        (
+            "select max(sum(x)) as m from t",
+            "summary function inside a summary function",
+        ),
+        ("select x from t where x < y", "comparison of two variables"),
+        ("select x from t join u on t.a = scan(u.b, 1)", "function SCAN"),
+        ("select scan(x, 1) as s from t", "function SCAN"),
+        ("select a, count(*) as a from t group by a", "two columns named a"),
+        ("select sum(scan(x, 1)) as s from t", "function SCAN"),
+        (
+            "select a, sum(x) as s from t group by a having scan(a) = 'b'",
+            "function SCAN",
+        ),
+    ],
+)
+def test_unsupported_proc_sql(query: str, message: str) -> None:
+    assert sql_issues(query) == [message]
+
+
+def test_proc_sql_into_a_permanent_library() -> None:
+    assert issues("proc sql; create table perm.out as select x from t; quit;") == [
+        "CREATE TABLE in library PERM"
+    ]
+    assert issues(
+        "proc sql; create table out(where=(x > 1)) as select x from t; quit;"
+    ) == ["WHERE= option on the output data set"]
+
+
+@pytest.mark.parametrize(
+    "having",
+    [
+        "not (sum(x) > 1)",
+        "count(*) in (1, 2)",
+        "sum(x) between 1 and 5",
+        "sum(x) is missing",
+    ],
+)
+def test_summary_functions_in_any_condition(having: str) -> None:
+    relation = sql(f"select a, count(*) as n from t group by a having {having}")
+
+    assert isinstance(relation, ir.Project)
+    assert isinstance(relation.source, ir.Filter)
+
+
+@pytest.mark.parametrize(
+    "where",
+    ["not (t.x = 1)", "t.x in (1, 2)", "t.x between 1 and 2", "t.x is missing"],
+)
+def test_qualified_columns_in_any_condition(where: str) -> None:
+    relation = sql(f"select x from t where {where}")
+
+    assert isinstance(relation, ir.Project)
+    assert isinstance(relation.source, ir.Filter)
+    assert relation.source.source == ir.RelationAlias(T, "t")
+
+
+@pytest.mark.parametrize(
+    "item",
+    ["-a", "a in (1, 2)", "a between 1 and 2", "a is missing"],
+)
+def test_grouped_columns_in_any_expression(item: str) -> None:
+    relation = sql(f"select {item} as v, count(*) as n from t group by a")
+
+    # The grouped column a is not selected, so a select drops it.
+    assert isinstance(relation, ir.Project)
+    assert isinstance(relation.source, ir.Aggregate)
+    assert relation.source.keys == (A,)
+
+
+def test_a_column_inside_an_expression_must_be_grouped() -> None:
+    assert sql_issues("select (x between 1 and 2) as v, count(*) as n from t") == [
+        "column x neither grouped nor summarized"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("program", "message"),
+    [
+        (
+            "data a; set t; y = count(*); run;",
+            "COUNT(*) outside a query's SELECT or HAVING",
+        ),
+        (
+            "data a; set t; y = count(distinct x); run;",
+            "COUNT(DISTINCT) outside a query's SELECT or HAVING",
+        ),
+        ("data a; set t; y = t.x; run;", "qualified name"),
+    ],
+)
+def test_sql_constructs_in_a_data_step(program: str, message: str) -> None:
+    assert issues(program) == [message]

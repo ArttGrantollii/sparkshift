@@ -62,11 +62,17 @@ from sparkshift.sas_parser import (
     ProcFreq,
     ProcMeans,
     ProcSort,
+    ProcSql,
     Program,
+    Qualified,
     RenameOption,
     RenameStatement,
     SetStatement,
     Span,
+    SqlCreate,
+    SqlItem,
+    SqlQuery,
+    SqlTable,
     Statement,
     String,
     SubsettingIf,
@@ -155,6 +161,21 @@ _DATE_FUNCTIONS = frozenset(
 _STATISTICS_COMPUTED = frozenset(
     {"N", "NMISS", "SUM", "MEAN", "MIN", "MAX", "RANGE", "STD", "VAR"}
 )
+# PROC SQL's summary functions, and the PROC MEANS statistic each computes.
+_SQL_SUMMARIES = {
+    "AVG": "MEAN",
+    "MEAN": "MEAN",
+    "COUNT": "N",
+    "FREQ": "N",
+    "N": "N",
+    "SUM": "SUM",
+    "MIN": "MIN",
+    "MAX": "MAX",
+    "NMISS": "NMISS",
+    "RANGE": "RANGE",
+    "STD": "STD",
+    "VAR": "VAR",
+}
 # INT, CEIL, and FLOOR give the integer a value is within 1E-12 of.
 _FUZZ = 1e-12
 # The length of a new variable assigned the result of CATS or CATX.
@@ -254,6 +275,11 @@ class _SasTranslator:
         self.variables: dict[str, _Variable] = {}
         self.input_columns: set[str] | None = None
         self.helpers = 0
+        # In PROC SQL: columns may be qualified, and an equality of two
+        # columns is translated with a warning. While ``aggregating``, a
+        # summary function with one argument summarizes rows, as in SQL.
+        self.sql = False
+        self.aggregating = False
 
     def translation(self) -> SasTranslation:
         for step in self.program.steps:
@@ -264,8 +290,10 @@ class _SasTranslator:
                 self.proc_sort(step)
             elif isinstance(step, ProcMeans):
                 self.proc_means(step)
-            else:
+            elif isinstance(step, ProcFreq):
                 self.proc_freq(step)
+            else:
+                self.proc_sql(step)
         if self.issues:
             raise UnsupportedSQLError(self.issues)
         return SasTranslation(tuple(self.outputs), tuple(self.warnings))
@@ -623,6 +651,301 @@ class _SasTranslator:
         named = ir.Named(tables.out.member.lower(), result)
         self.created[tables.out.member.lower()] = named
         self.outputs.append(named)
+
+    def proc_sql(self, step: ProcSql) -> None:
+        """PROC SQL: each CREATE TABLE ... AS SELECT creates a data set.
+        Conditions follow SAS's rules, as in a WHERE statement: PROC SQL
+        "follows the SAS convention for handling missing values"."""
+        self.sql = True
+        for statement in step.statements:
+            self.variables, self.input_columns = {}, None
+            self.sql_create(statement)
+        self.sql = False
+
+    def sql_create(self, statement: SqlCreate) -> None:
+        issues_before = len(self.issues)
+        target = statement.target
+        if target.library is not None and target.library.upper() != "WORK":
+            self.unsupported(
+                f"CREATE TABLE in library {target.library.upper()}",
+                target.span,
+                _LIBRARY_HINT,
+            )
+        relation = self.sql_query(statement.query)
+        if relation is None or len(self.issues) > issues_before:
+            return
+        relation = self.dataset_options(relation, target, output_side=True)[0]
+        if len(self.issues) > issues_before:
+            return
+        named = ir.Named(target.member.lower(), relation)
+        self.created[target.member.lower()] = named
+        self.outputs.append(named)
+
+    def sql_query(self, query: SqlQuery) -> ir.Relation | None:
+        qualified = bool(query.joins) or _qualifies(query)
+        relation = self.sql_source(query.table, qualified)
+        for join in query.joins:
+            right = self.sql_source(join.table, True)
+            condition = self.condition(join.condition)
+            if condition is not None:
+                kind = ir.JoinKind.LEFT if join.kind == "left" else ir.JoinKind.INNER
+                relation = ir.Join(relation, right, kind, condition)
+        if query.where is not None:
+            if _has_summary(query.where):
+                self.unsupported(
+                    "summary function in WHERE",
+                    query.span,
+                    "Filter on a summary function with HAVING.",
+                )
+                return None
+            condition = self.condition(query.where)
+            if condition is not None:
+                relation = ir.Filter(relation, condition)
+        summarized = bool(query.group_by) or any(
+            item.expression is not None and _has_summary(item.expression)
+            for item in query.items
+        )
+        if query.having is not None and not summarized:
+            self.unsupported(
+                "HAVING without GROUP BY or a summary function",
+                query.span,
+                "Use WHERE to filter rows.",
+            )
+            return None
+        if summarized:
+            selected = self.sql_summary(query, relation)
+        else:
+            selected = self.sql_projection(query, relation)
+        if selected is None:
+            return None
+        relation, names = selected
+        if query.distinct:
+            relation = ir.Distinct(relation)
+        if query.order_by:
+            keys = self.sql_order(query, names)
+            if keys is None:
+                return None
+            relation = ir.Sort(relation, keys)
+        return relation
+
+    def sql_source(self, table: SqlTable, qualified: bool) -> ir.Relation:
+        """A table of the FROM clause, with its data set options, named by its
+        alias (or member name) when columns are qualified."""
+        relation, _ = self.input_dataset(table.dataset)
+        if qualified:
+            relation = ir.RelationAlias(relation, table.alias or table.dataset.member)
+        return relation
+
+    def sql_projection(
+        self, query: SqlQuery, relation: ir.Relation
+    ) -> tuple[ir.Relation, list[str] | None] | None:
+        """The SELECT list of a query without GROUP BY or summary functions,
+        and the output columns' names (None with *)."""
+        if len(query.items) == 1 and query.items[0].expression is None:
+            return relation, None
+        items: list[ir.Expression] = []
+        names: list[str] = []
+        for item in query.items:
+            if item.expression is None:
+                self.unsupported(
+                    "* with other columns",
+                    item.span,
+                    "List the columns, or select * alone.",
+                )
+                return None
+            output = self.sql_column(item)
+            if output is None:
+                return None
+            expression, name = output
+            items.append(expression)
+            names.append(name)
+        if not self.check_names(names, query):
+            return None
+        return ir.Project(relation, tuple(items)), names
+
+    def sql_column(self, item: SqlItem) -> tuple[ir.Expression, str] | None:
+        """A SELECT item as an output column and its name. A column keeps its
+        name; a computed value needs AS."""
+        assert item.expression is not None
+        value = self.value(item.expression)
+        if value is None:
+            return None
+        expression = value.expression or ir.Literal(None)
+        match item.expression:
+            case Name(name=name) | Qualified(name=name) if item.alias is None:
+                return expression, name
+        if item.alias is None:
+            self.unsupported(
+                "computed column without a name",
+                item.span,
+                "Name it with AS; SAS would name it _TEMA001.",
+            )
+            return None
+        return ir.Alias(expression, item.alias), item.alias
+
+    def sql_summary(
+        self, query: SqlQuery, relation: ir.Relation
+    ) -> tuple[ir.Relation, list[str]] | None:
+        """A query with GROUP BY or summary functions: one row for each group,
+        or for all rows without GROUP BY."""
+        keys: list[ir.Expression] = []
+        key_names: list[str] = []
+        for expression in query.group_by:
+            if not isinstance(expression, Name | Qualified):
+                self.unsupported(
+                    "GROUP BY of an expression",
+                    query.span,
+                    "Group by columns; compute expressions in an earlier step.",
+                )
+                return None
+            value = self.value(expression)
+            assert value is not None and value.expression is not None
+            keys.append(value.expression)
+            key_names.append(expression.name)
+        grouped = {name.lower() for name in key_names}
+        aggregates: list[ir.Expression] = []
+        names: list[str] = []
+        self.aggregating = True
+        try:
+            for item in query.items:
+                if item.expression is None:
+                    self.unsupported(
+                        "* with GROUP BY or a summary function",
+                        item.span,
+                        "List the columns.",
+                    )
+                    return None
+                loose = _bare_columns(item.expression) - grouped
+                if loose:
+                    self.unsupported(
+                        f"column {sorted(loose)[0]} neither grouped nor summarized",
+                        item.span,
+                        "SAS would remerge the summary with every row; group by "
+                        "the column or summarize it.",
+                    )
+                    return None
+                if isinstance(item.expression, Name | Qualified) and item.alias is None:
+                    names.append(item.expression.name)
+                    continue
+                output = self.sql_column(item)
+                if output is None:
+                    return None
+                aggregate, name = output
+                aggregates.append(aggregate)
+                names.append(name)
+            having = None
+            if query.having is not None:
+                if _bare_columns(query.having) - grouped:
+                    self.unsupported(
+                        "HAVING on a column neither grouped nor summarized",
+                        query.span,
+                    )
+                    return None
+                having = self.condition(query.having)
+                if having is None:
+                    return None
+        finally:
+            self.aggregating = False
+        if not self.check_names(names, query):
+            return None
+        helper = _unique_helper("_having", tuple(names))
+        if having is not None:
+            aggregates.append(ir.Alias(having, helper))
+        result: ir.Relation = ir.Aggregate(relation, tuple(keys), tuple(aggregates))
+        if having is not None:
+            result = ir.Filter(result, ir.Column((helper,)))
+        produced = key_names + [a.name for a in aggregates if isinstance(a, ir.Alias)]
+        if [n.lower() for n in produced] != [n.lower() for n in names]:
+            result = ir.Project(result, tuple(ir.Column((n,)) for n in names))
+        return result, names
+
+    def summary(self, call: Call) -> _Value | None:
+        """A summary function over the rows of a group: COUNT(*), COUNT(x),
+        SUM(x), AVG(x), ... They skip missing values, as in SAS and Spark."""
+        name = call.name.upper()
+        if call.star:
+            if name not in ("COUNT", "FREQ", "N"):
+                self.unsupported(f"{name}(*)", call.span)
+                return None
+            return _Value("number", ir.AggregateCall(ir.AggregateFunction.COUNT))
+        if call.distinct and name not in ("COUNT", "SUM"):
+            self.unsupported(f"{name}(DISTINCT ...)", call.span)
+            return None
+        if _has_summary(call.arguments[0]):
+            self.unsupported("summary function inside a summary function", call.span)
+            return None
+        self.aggregating = False
+        try:
+            value = self.value(call.arguments[0])
+        finally:
+            self.aggregating = True
+        if value is None:
+            return None
+        if value.expression is None:
+            self.unsupported(f"{name} of a missing value", call.span)
+            return None
+        statistic = _SQL_SUMMARIES[name]
+        if statistic in ("N", "SUM") and call.distinct:
+            function = (
+                ir.AggregateFunction.COUNT
+                if statistic == "N"
+                else ir.AggregateFunction.SUM
+            )
+            return _Value(
+                "number",
+                ir.AggregateCall(function, (value.expression,), distinct=True),
+            )
+        return _Value("number", _statistic(statistic, value.expression))
+
+    def check_names(self, names: list[str], query: SqlQuery) -> bool:
+        """Whether the output columns have different names."""
+        seen: set[str] = set()
+        for name in names:
+            if name.lower() in seen:
+                self.unsupported(
+                    f"two columns named {name}",
+                    query.span,
+                    "Give each column its own name with AS.",
+                )
+                return False
+            seen.add(name.lower())
+        return True
+
+    def sql_order(
+        self, query: SqlQuery, names: list[str] | None
+    ) -> tuple[ir.SortKey, ...] | None:
+        """ORDER BY output columns, by name or position. Missing values come
+        first, or last in descending order."""
+        keys = []
+        for order in query.order_by:
+            name: str | None = None
+            match order.expression:
+                case Number(value=int(position)) if names and 1 <= position <= len(
+                    names
+                ):
+                    name = names[position - 1]
+                case Name(name=column) | Qualified(name=column):
+                    if names is None:
+                        name = column
+                    else:
+                        name = next(
+                            (n for n in names if n.lower() == column.lower()), None
+                        )
+            if name is None:
+                self.unsupported(
+                    "ORDER BY something other than a selected column",
+                    query.span,
+                    "Order by a column of the SELECT list, by name or position.",
+                )
+                return None
+            keys.append(
+                ir.SortKey(
+                    ir.Column((name,)),
+                    descending=order.descending,
+                    nulls_first=not order.descending,
+                )
+            )
+        return tuple(keys)
 
     def procedure_input(
         self, data: Dataset | None, procedure: str, span: Span
@@ -1054,6 +1377,11 @@ class _SasTranslator:
                 variable = self.variables.setdefault(name.lower(), _Variable())
                 variable.exists = True  # read, so it is a column
                 return _Value(variable.kind, ir.Column((name,)), length=variable.length)
+            case Qualified(qualifier=qualifier, name=name):
+                if not self.sql:
+                    self.unsupported("qualified name", expression.span)
+                    return None
+                return _Value("unknown", ir.Column((qualifier, name)))
             case Number(value=number):
                 return _Value("number", ir.Literal(number), constant=True)
             case Unary(op="-", operand=Number(value=number)):
@@ -1131,6 +1459,14 @@ class _SasTranslator:
         """A SAS function call, with the result SAS's documentation gives it
         (see docs/sas.md)."""
         name = call.name.upper()
+        if self.aggregating and _is_summary(call):
+            return self.summary(call)
+        if call.star or call.distinct:
+            what = "*" if call.star else "DISTINCT"
+            self.unsupported(
+                f"{name}({what}) outside a query's SELECT or HAVING", call.span
+            )
+            return None
         if name not in _FUNCTIONS:
             hint = (
                 "Date functions are not supported yet."
@@ -1485,6 +1821,17 @@ class _SasTranslator:
             self.unsupported("comparison of two constants", span)
             return None
         kinds = {first.kind, second.kind}
+        if kinds == {"unknown"} and self.sql and op in ("=", "^="):
+            assert first.expression is not None and second.expression is not None
+            self.warn(
+                "equality of two columns",
+                span,
+                "For numbers this is SAS's comparison, where missing equals missing. "
+                "SAS also ignores trailing blanks in text and treats empty text as "
+                "missing; this code compares text values as they are.",
+            )
+            equal = ir.NullSafeEqual(first.expression, second.expression)
+            return equal if op == "=" else _not(equal)
         if kinds == {"unknown"}:
             self.unsupported("comparison of two variables", span, _TWO_VARIABLES_HINT)
             return None
@@ -1628,6 +1975,8 @@ def _variables(expression: Expression) -> set[str]:
             return _variables(inner)
         case Call(arguments=arguments):
             return set().union(*(_variables(a) for a in arguments))
+        case Qualified(name=name):
+            return {name.lower()}
     return set()
 
 
@@ -1813,6 +2162,81 @@ def _unique_helper(name: str, taken: tuple[str, ...]) -> str:
         suffix += 1
         candidate = f"{name}_{suffix}"
     return candidate
+
+
+def _is_summary(call: Call) -> bool:
+    """Whether a call in PROC SQL summarizes rows: COUNT(*), or a summary
+    function with one argument (with two or more, SUM, MIN, and the others
+    are the DATA step functions, computed for each row)."""
+    return call.name.upper() in _SQL_SUMMARIES and (
+        call.star or len(call.arguments) == 1
+    )
+
+
+def _has_summary(expression: Expression) -> bool:
+    match expression:
+        case Call() if _is_summary(expression):
+            return True
+        case Call(arguments=arguments):
+            return any(_has_summary(argument) for argument in arguments)
+        case Binary(left=left, right=right):
+            return _has_summary(left) or _has_summary(right)
+        case Unary(operand=operand) | IsMissing(expression=operand):
+            return _has_summary(operand)
+        case In(expression=inner, values=values):
+            return any(_has_summary(e) for e in (inner, *values))
+        case Between(expression=inner, low=low, high=high):
+            return any(_has_summary(e) for e in (inner, low, high))
+    return False
+
+
+def _bare_columns(expression: Expression) -> set[str]:
+    """The columns an expression reads outside summary functions, lower
+    case."""
+    match expression:
+        case Name(name=name) | Qualified(name=name):
+            return {name.lower()}
+        case Call() if _is_summary(expression):
+            return set()
+        case Call(arguments=arguments):
+            return set().union(*(_bare_columns(a) for a in arguments))
+        case Binary(left=left, right=right):
+            return _bare_columns(left) | _bare_columns(right)
+        case Unary(operand=operand) | IsMissing(expression=operand):
+            return _bare_columns(operand)
+        case In(expression=inner, values=values):
+            return set().union(*(_bare_columns(e) for e in (inner, *values)))
+        case Between(expression=inner, low=low, high=high):
+            return _bare_columns(inner) | _bare_columns(low) | _bare_columns(high)
+    return set()
+
+
+def _qualifies(query: SqlQuery) -> bool:
+    """Whether a query refers to a column as table.column."""
+    expressions = [item.expression for item in query.items]
+    expressions += [query.where, query.having, *query.group_by]
+    expressions += [order.expression for order in query.order_by]
+    return any(
+        expression is not None and _has_qualified(expression)
+        for expression in expressions
+    )
+
+
+def _has_qualified(expression: Expression) -> bool:
+    match expression:
+        case Qualified():
+            return True
+        case Call(arguments=arguments):
+            return any(_has_qualified(argument) for argument in arguments)
+        case Binary(left=left, right=right):
+            return _has_qualified(left) or _has_qualified(right)
+        case Unary(operand=operand) | IsMissing(expression=operand):
+            return _has_qualified(operand)
+        case In(expression=inner, values=values):
+            return any(_has_qualified(e) for e in (inner, *values))
+        case Between(expression=inner, low=low, high=high):
+            return any(_has_qualified(e) for e in (inner, low, high))
+    return False
 
 
 def _all(conditions: list[ir.Expression]) -> ir.Expression:

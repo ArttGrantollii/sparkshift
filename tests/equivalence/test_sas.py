@@ -891,6 +891,91 @@ SAS_SCENARIOS = {
             ),
         ),
     ),
+    # --- PROC SQL ----------------------------------------------------------
+    # "PROC SQL treats missing values as smaller than nonmissing values", so
+    # a missing score is less than 3, as in a DATA step.
+    "PROC SQL: a missing value is smaller in WHERE": (
+        "proc sql; create table low as select customer_id, score from customers "
+        "where score < 3; quit;",
+        _result(
+            "customer_id int, score double", (3, None), (4, 0.0), (5, -1.25), (6, 2.5)
+        ),
+    ),
+    # Following SAS's rules, a missing value equals a missing value: order
+    # 106, whose status is missing, matches itself.
+    "PROC SQL: a join matches missing values": (
+        "proc sql; create table same as select a.order_id, b.order_id as other "
+        "from orders a inner join orders b on a.status = b.status "
+        "where a.order_id = 106; quit;",
+        _result("order_id int, other int", (106, 106)),
+    ),
+    # Order 107 has no customer and order 108 an unknown one.
+    "PROC SQL: a left join": (
+        "proc sql; create table named as select o.order_id, c.name "
+        "from orders o left join customers c on o.customer_id = c.customer_id; "
+        "quit;",
+        _result(
+            "order_id int, name string",
+            (101, "Alice"),
+            (102, "Alice"),
+            (103, "Bob"),
+            (104, "José"),
+            (105, "José"),
+            (106, "Zoë"),
+            (107, None),
+            (108, None),
+            (109, "Bob"),
+            (109, "Bob"),
+        ),
+    ),
+    # GROUP BY keeps missing values as a group (order 106 has no status).
+    # In HAVING, a missing sum is smaller than 500: the pending group stays.
+    "PROC SQL: GROUP BY, summary functions, and HAVING": (
+        "proc sql; create table by_status as select status, count(*) as orders, "
+        "sum(amount) as total, avg(discount) as average_discount from orders "
+        "group by status having sum(amount) < 500 order by status; quit;",
+        Sorted(
+            "status",
+            _result(
+                "status string, orders bigint, total decimal(20,2), "
+                "average_discount double",
+                ("cancelled", 1, Decimal("0.00"), None),
+                ("completed", 6, Decimal("412.50"), 0.05),
+                ("pending", 1, None, 0.25),
+                ("refunded", 1, Decimal("-15.75"), 0.0),
+            ),
+        ),
+    ),
+    "PROC SQL: a summary of all rows": (
+        "proc sql; create table overall as select count(*) as customers, "
+        "count(score) as scored, nmiss(score) as unscored, min(score) as low "
+        "from customers; quit;",
+        _result(
+            "customers bigint, scored bigint, unscored bigint, low double",
+            (8, 7, 1, -1.25),
+        ),
+    ),
+    # With two arguments, SUM is the DATA step function, computed for each row
+    # and skipping missing values. DISTINCT removes order 109's second row.
+    "PROC SQL: SUM of two columns, DISTINCT, and ORDER BY": (
+        "proc sql; create table totals as select distinct customer_id, "
+        "sum(amount, discount) as total from orders where customer_id ne . "
+        "order by 1, total desc; quit;",
+        Sorted(
+            "customer_id, total",
+            _result(
+                "customer_id int, total double",
+                (1, 120.5),
+                (1, 80.1),
+                (2, 80.1),
+                (2, 0.0),
+                (3, 0.25),
+                (3, -15.75),
+                (4, 999.99),
+                (99, 10.0),
+            ),
+        ),
+    ),
 }
 
 

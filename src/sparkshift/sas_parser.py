@@ -100,13 +100,37 @@ class IsMissing:
 
 @dataclass(frozen=True)
 class Call:
+    """A function call. In PROC SQL, ``star`` marks COUNT(*) and ``distinct``
+    COUNT(DISTINCT x)."""
+
     name: str
     arguments: tuple["Expression", ...]
+    span: Span
+    star: bool = False
+    distinct: bool = False
+
+
+@dataclass(frozen=True)
+class Qualified:
+    """table.column, in PROC SQL."""
+
+    qualifier: str
+    name: str
     span: Span
 
 
 Expression = (
-    Name | Number | String | Missing | Binary | Unary | In | Between | IsMissing | Call
+    Name
+    | Qualified
+    | Number
+    | String
+    | Missing
+    | Binary
+    | Unary
+    | In
+    | Between
+    | IsMissing
+    | Call
 )
 
 
@@ -327,7 +351,63 @@ class ProcFreq:
     span: Span
 
 
-Step = DataStep | ProcSort | ProcMeans | ProcFreq
+@dataclass(frozen=True)
+class SqlItem:
+    """One item of a SELECT list: ``expression`` is None for *."""
+
+    expression: Expression | None
+    alias: str | None
+    span: Span
+
+
+@dataclass(frozen=True)
+class SqlTable:
+    dataset: Dataset
+    alias: str | None
+
+
+@dataclass(frozen=True)
+class SqlJoin:
+    kind: str  # "inner" or "left"
+    table: SqlTable
+    condition: Expression
+
+
+@dataclass(frozen=True)
+class SqlOrder:
+    expression: Expression
+    descending: bool
+
+
+@dataclass(frozen=True)
+class SqlQuery:
+    distinct: bool
+    items: tuple[SqlItem, ...]
+    table: SqlTable
+    joins: tuple[SqlJoin, ...]
+    where: Expression | None
+    group_by: tuple[Expression, ...]
+    having: Expression | None
+    order_by: tuple[SqlOrder, ...]
+    span: Span
+
+
+@dataclass(frozen=True)
+class SqlCreate:
+    """CREATE TABLE target AS query."""
+
+    target: Dataset
+    query: SqlQuery
+    span: Span
+
+
+@dataclass(frozen=True)
+class ProcSql:
+    statements: tuple[SqlCreate, ...]
+    span: Span
+
+
+Step = DataStep | ProcSort | ProcMeans | ProcFreq | ProcSql
 
 
 @dataclass(frozen=True)
@@ -463,6 +543,48 @@ _MEANS_OPTIONS_WITHOUT_EFFECT = frozenset(
 )
 # Options with a value, accepted only with the value that is the default.
 _MEANS_DEFAULT_VALUES = {"VARDEF": "DF", "ORDER": "UNFORMATTED"}
+# PROC SQL options that change only the printed output, or messages.
+_SQL_OPTIONS_WITHOUT_EFFECT = frozenset(
+    {
+        "DOUBLE",
+        "ERRORSTOP",
+        "EXEC",
+        "FEEDBACK",
+        "NODOUBLE",
+        "NOERRORSTOP",
+        "NOFEEDBACK",
+        "NONUMBER",
+        "NOPRINT",
+        "NOSTIMER",
+        "NOTHREADS",
+        "NOWARNRECURS",
+        "NUMBER",
+        "PRINT",
+        "STIMER",
+        "THREADS",
+        "WARNRECURS",
+    }
+)
+# Words that end a table reference in a FROM clause.
+_SQL_CLAUSE_WORDS = (
+    "CROSS",
+    "EXCEPT",
+    "FULL",
+    "GROUP",
+    "HAVING",
+    "INNER",
+    "INTERSECT",
+    "JOIN",
+    "LEFT",
+    "NATURAL",
+    "ON",
+    "ORDER",
+    "OUTER",
+    "RIGHT",
+    "UNION",
+    "WHERE",
+)
+_OTHER_JOINS = ("RIGHT", "FULL", "CROSS", "NATURAL")
 # PROC FREQ and TABLES options that change only the printed output.
 _FREQ_OPTIONS_WITHOUT_EFFECT = frozenset({"COMPRESS", "NLEVELS", "NOPRINT", "PAGE"})
 _TABLES_OPTIONS_WITHOUT_EFFECT = frozenset(
@@ -567,6 +689,8 @@ class _Parser:
             return self.proc_means(header, body, span)
         if header[1].is_keyword("FREQ"):
             return self.proc_freq(header, body, span)
+        if header[1].is_keyword("SQL"):
+            return self.proc_sql(header, body, span)
         self.unsupported(f"PROC {header[1].text.upper()} step", header)
         return None
 
@@ -749,15 +873,224 @@ class _Parser:
                 self.unsupported(f"TABLES option {name}", [option])
         return TablesStatement(tuple(requests), out, missing, outpct, span)
 
+    def proc_sql(
+        self, header: list[Token], body: list[list[Token]], span: Span
+    ) -> ProcSql:
+        tokens = _Tokens(header[2:], self)
+        while not tokens.at_end():
+            option = tokens.take_name("a PROC SQL option")
+            keyword = option.text.upper()
+            value = self.option_value(tokens) if tokens.peek().is_symbol("=") else None
+            if not (value is None and keyword in _SQL_OPTIONS_WITHOUT_EFFECT):
+                name = f"{keyword}={value}" if value is not None else keyword
+                self.unsupported(f"PROC SQL option {name}", [option])
+        statements = []
+        for statement in body:
+            created = self.sql_statement(statement)
+            if created is not None:
+                statements.append(created)
+        return ProcSql(tuple(statements), span)
+
+    def sql_statement(self, statement: list[Token]) -> SqlCreate | None:
+        """CREATE TABLE name AS SELECT ...; other statements are reported."""
+        first = statement[0]
+        span = self.span(first, statement[-1])
+        tokens = _Tokens(statement, self)
+        if not (first.is_keyword("CREATE") and tokens.peek(1).is_keyword("TABLE")):
+            hint = (
+                "A query on its own prints a report; write CREATE TABLE name AS "
+                "SELECT ... to create a data set."
+                if first.is_keyword("SELECT")
+                else None
+            )
+            self.unsupported(
+                f"{first.text.upper()} statement in PROC SQL", statement, hint
+            )
+            return None
+        tokens.take()
+        tokens.take()
+        target = self.dataset(tokens)
+        if not tokens.peek().is_keyword("AS"):
+            self.unsupported(
+                "CREATE TABLE without AS SELECT",
+                statement,
+                "SparkShift creates tables from a query: CREATE TABLE name AS SELECT.",
+            )
+            return None
+        tokens.take()
+        query = self.sql_query(tokens)
+        return None if query is None else SqlCreate(target, query, span)
+
+    def sql_query(self, tokens: "_Tokens") -> SqlQuery | None:
+        """SELECT ... FROM ... [JOIN ... ON ...] [WHERE] [GROUP BY] [HAVING]
+        [ORDER BY]. Returns None after reporting a construct it skips."""
+        select = tokens.take()
+        if not select.is_keyword("SELECT"):
+            raise self.error("Expected SELECT", select)
+        distinct = tokens.peek().is_keyword("DISTINCT")
+        if distinct:
+            tokens.take()
+        items = [self.sql_item(tokens)]
+        while tokens.peek().is_symbol(","):
+            tokens.take()
+            items.append(self.sql_item(tokens))
+        if not tokens.peek().is_keyword("FROM"):
+            found = tokens.peek().text or "end of statement"
+            raise self.error(f"Expected FROM, found {found!r}", tokens.peek())
+        tokens.take()
+        table = self.sql_table(tokens)
+        joins = []
+        while True:
+            kind = self.join_kind(tokens)
+            if kind is None:
+                break
+            joined = self.sql_table(tokens)
+            on = tokens.take()
+            if not on.is_keyword("ON"):
+                raise self.error("Expected ON after the joined table", on)
+            joins.append(SqlJoin(kind, joined, self.expression(tokens)))
+        if tokens.peek().is_symbol(",") or tokens.peek().is_keyword(*_OTHER_JOINS):
+            self.unsupported(
+                f"{tokens.peek().text.upper()} join",
+                tokens.rest(),
+                "SparkShift supports INNER JOIN and LEFT JOIN with ON.",
+            )
+            return None
+        where = having = None
+        group_by: list[Expression] = []
+        order_by: list[SqlOrder] = []
+        if tokens.peek().is_keyword("WHERE"):
+            tokens.take()
+            where = self.expression(tokens)
+        if tokens.peek().is_keyword("GROUP"):
+            tokens.take()
+            self.expect_keyword(tokens, "BY")
+            group_by = self.sql_list(tokens)
+        if tokens.peek().is_keyword("HAVING"):
+            tokens.take()
+            having = self.expression(tokens)
+        if tokens.peek().is_keyword("ORDER"):
+            tokens.take()
+            self.expect_keyword(tokens, "BY")
+            for expression in self.sql_list(tokens, orders=True):
+                order_by.append(expression)
+        if not tokens.at_end():
+            token = tokens.peek()
+            self.unsupported(
+                f"{token.text.upper()} in a query",
+                tokens.rest(),
+                "SparkShift supports SELECT, FROM, JOIN, WHERE, GROUP BY, HAVING, "
+                "and ORDER BY.",
+            )
+            return None
+        span = self.span(select, tokens.previous())
+        return SqlQuery(
+            distinct,
+            tuple(items),
+            table,
+            tuple(joins),
+            where,
+            tuple(group_by),
+            having,
+            tuple(order_by),
+            span,
+        )
+
+    def sql_item(self, tokens: "_Tokens") -> SqlItem:
+        """An item of the SELECT list: *, or an expression with an optional AS
+        alias and column modifiers such as FORMAT=."""
+        first = tokens.peek()
+        if first.is_symbol("*"):
+            tokens.take()
+            return SqlItem(None, None, self.span(first, first))
+        expression = self.expression(tokens)
+        alias = None
+        if tokens.peek().is_keyword("AS"):
+            tokens.take()
+            alias_token = tokens.take_name("a column name after AS")
+            if alias_token.is_keyword("FROM"):
+                raise self.error("Expected a column name after AS", alias_token)
+            alias = alias_token.text
+        while tokens.peek().kind is Kind.NAME and tokens.peek(1).is_symbol("="):
+            modifier = tokens.take()
+            self.option_value(tokens)
+            if not modifier.is_keyword("FORMAT", "INFORMAT", "LABEL"):
+                self.unsupported(
+                    f"column modifier {modifier.text.upper()}=", [modifier]
+                )
+        return SqlItem(expression, alias, self.span(first, tokens.previous()))
+
+    def sql_table(self, tokens: "_Tokens") -> SqlTable:
+        dataset = self.dataset(tokens)
+        alias = None
+        if tokens.peek().is_keyword("AS"):
+            tokens.take()
+            alias_token = tokens.take_name("a table alias after AS")
+            if alias_token.is_keyword(*_SQL_CLAUSE_WORDS):
+                raise self.error("Expected a table alias after AS", alias_token)
+            alias = alias_token.text
+        elif tokens.peek().kind is Kind.NAME and not tokens.peek().is_keyword(
+            *_SQL_CLAUSE_WORDS
+        ):
+            alias = tokens.take().text
+        return SqlTable(dataset, alias)
+
+    def join_kind(self, tokens: "_Tokens") -> str | None:
+        """INNER JOIN, JOIN, or LEFT [OUTER] JOIN, taken from the tokens."""
+        if tokens.peek().is_keyword("JOIN"):
+            tokens.take()
+            return "inner"
+        if tokens.peek().is_keyword("INNER") and tokens.peek(1).is_keyword("JOIN"):
+            tokens.take()
+            tokens.take()
+            return "inner"
+        if tokens.peek().is_keyword("LEFT"):
+            tokens.take()
+            if tokens.peek().is_keyword("OUTER"):
+                tokens.take()
+            self.expect_keyword(tokens, "JOIN")
+            return "left"
+        return None
+
+    def sql_list(self, tokens: "_Tokens", *, orders: bool = False) -> list:
+        """Expressions separated by commas, as in GROUP BY; with ``orders``,
+        each may be followed by ASC or DESC."""
+        found: list = []
+        while True:
+            expression = self.expression(tokens)
+            if orders:
+                descending = tokens.peek().is_keyword("DESC")
+                if descending or tokens.peek().is_keyword("ASC"):
+                    tokens.take()
+                found.append(SqlOrder(expression, descending))
+            else:
+                found.append(expression)
+            if not tokens.peek().is_symbol(","):
+                return found
+            tokens.take()
+
+    def expect_keyword(self, tokens: "_Tokens", keyword: str) -> None:
+        token = tokens.take()
+        if not token.is_keyword(keyword):
+            found = token.text or "end of statement"
+            raise self.error(f"Expected {keyword}, found {found!r}", token)
+
     def option_value(self, tokens: "_Tokens") -> str:
         """The value of an option after its equals sign, upper case: one
-        token, a parenthesized group, or a size such as 512M."""
+        token or a parenthesized group, with the tokens written right after
+        it, as in the size 512M or the format DOLLAR8.2."""
         tokens.take()
         start = tokens.index
         tokens.skip_option_value()
-        value = tokens.previous()
-        if value.kind is Kind.NUMBER and tokens.adjacent(value):
-            tokens.take()  # the unit of a size such as 512M
+        while (
+            not tokens.at_end()
+            and tokens.adjacent(tokens.previous())
+            and (
+                tokens.peek().kind in (Kind.NAME, Kind.NUMBER)
+                or tokens.peek().is_symbol(".")
+            )
+        ):
+            tokens.take()
         return "".join(
             token.text for token in tokens.tokens[start : tokens.index]
         ).upper()
@@ -1233,7 +1566,10 @@ class _Parser:
 
     def in_list(self, left: Expression, tokens: "_Tokens", negated: bool) -> Expression:
         tokens.take()
-        tokens.expect_symbol("(")
+        opening = tokens.expect_symbol("(")
+        if tokens.peek().is_keyword("SELECT"):
+            subquery = self.subquery(opening, tokens)
+            return In(left, (subquery,), negated, self.span_of(left, subquery))
         values: list[Expression] = []
         ranges = False
         while not tokens.peek().is_symbol(")"):
@@ -1342,7 +1678,28 @@ class _Parser:
         if token.kind is Kind.NAME:
             if tokens.peek().is_symbol("("):
                 return self.call(token, tokens)
+            following = tokens.peek()
+            if (
+                following.is_symbol(".")
+                and tokens.adjacent(token)
+                and tokens.peek(1).kind is Kind.NAME
+                and tokens.peek(1).start == following.end
+            ):
+                # table.column, in PROC SQL.
+                tokens.take()
+                column = tokens.take()
+                return Qualified(token.text, column.text, self.span(token, column))
+            if token.is_keyword("CALCULATED") and following.kind is Kind.NAME:
+                column = tokens.take()
+                self.unsupported(
+                    "CALCULATED",
+                    [token, column],
+                    "Repeat the expression the column is calculated from.",
+                )
+                return Name(column.text, self.span(token, column))
             return Name(token.text, span)
+        if token.is_symbol("(") and tokens.peek().is_keyword("SELECT"):
+            return self.subquery(token, tokens)
         if token.is_symbol("("):
             inner = self.expression(tokens)
             closing = tokens.expect_symbol(")")
@@ -1350,6 +1707,19 @@ class _Parser:
         raise self.error(
             f"Unexpected {token.text or 'end of statement'!r} in an expression", token
         )
+
+    def subquery(self, opening: Token, tokens: "_Tokens") -> Expression:
+        """(SELECT ...) in PROC SQL: reported, and skipped to its closing
+        parenthesis."""
+        depth = 1
+        while depth and not tokens.at_end():
+            token = tokens.take()
+            depth += token.is_symbol("(") - token.is_symbol(")")
+        if depth:
+            raise self.error("Expected ) to end the subquery", tokens.peek())
+        span = self.span(opening, tokens.previous())
+        self.unsupported("subquery", span, "Subqueries are not supported yet.")
+        return Missing(span)
 
     def call(self, name: Token, tokens: "_Tokens") -> Expression:
         tokens.take()
@@ -1368,6 +1738,16 @@ class _Parser:
                 "List the variables separated by commas, as in SUM(a, b, c).",
             )
             return Missing(span)
+        if tokens.peek().is_symbol("*") and tokens.peek(1).is_symbol(")"):
+            # COUNT(*), in PROC SQL.
+            tokens.take()
+            closing = tokens.take()
+            return Call(name.text, (), self.span(name, closing), star=True)
+        distinct = tokens.peek().is_keyword("DISTINCT") and not tokens.peek(
+            1
+        ).is_symbol(")", ",")
+        if distinct:
+            tokens.take()
         arguments: list[Expression] = []
         while not tokens.peek().is_symbol(")"):
             arguments.append(self.expression(tokens))
@@ -1376,7 +1756,9 @@ class _Parser:
             elif not tokens.peek().is_symbol(")"):
                 raise self.error("Expected , or ) in a function call", tokens.peek())
         closing = tokens.take()
-        return Call(name.text, tuple(arguments), self.span(name, closing))
+        return Call(
+            name.text, tuple(arguments), self.span(name, closing), distinct=distinct
+        )
 
     # --- Helpers -------------------------------------------------------------
 

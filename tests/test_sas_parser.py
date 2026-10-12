@@ -108,11 +108,11 @@ def test_a_data_step_ends_at_a_proc_step() -> None:
 def test_proc_steps_are_reported_and_skipped() -> None:
     program = parse_sas(
         "proc transpose data=a out=b; by x; run; "
-        "proc sql; select 1; quit; "
+        "proc report data=b; column x; quit; "
         "data c; set b; run;"
     )
 
-    assert issues(program) == ["PROC TRANSPOSE step", "PROC SQL step"]
+    assert issues(program) == ["PROC TRANSPOSE step", "PROC REPORT step"]
     assert [step.outputs[0].member for step in program.steps] == ["c"]
 
 
@@ -406,9 +406,11 @@ def test_arithmetic_and_calls() -> None:
             name("a"),
             binary("*", name("b"), ("Unary", "-", binary("**", name("c"), number(2)))),
         ),
-        binary("||", ("Call", "f", (name("x"), string("y"))), name("z")),
+        binary("||", ("Call", "f", (name("x"), string("y")), False, False), name("z")),
     )
-    assert where("x = f()")[0] == binary("=", name("x"), ("Call", "f", ()))
+    assert where("x = f()")[0] == binary(
+        "=", name("x"), ("Call", "f", (), False, False)
+    )
     assert where("x = a / 2 - +b")[0] == binary(
         "=",
         name("x"),
@@ -908,3 +910,128 @@ def test_unsupported_proc_freq_options_and_statements() -> None:
 def test_invalid_proc_freq(source: str, message: str) -> None:
     with pytest.raises(SASParseError, match=message):
         parse_sas(source)
+
+
+# --- PROC SQL ------------------------------------------------------------------
+
+
+def query_shape(source: str) -> object:
+    """The shape of the query of a PROC SQL CREATE TABLE statement."""
+    program = parse_sas(f"proc sql; create table out as {source}; quit;")
+    assert program.issues == ()
+    [step] = program.steps
+    [statement] = step.statements
+    return shape(statement.query)
+
+
+def test_a_proc_sql_query() -> None:
+    assert query_shape(
+        "select distinct c.name, sum(o.amount) as total format=dollar8. "
+        "from sales.customers(keep=id name) as c "
+        "inner join orders o on c.id = o.customer_id "
+        "left outer join notes on c.id = notes.id "
+        "where o.status = 'completed' "
+        "group by c.name having count(*) > 1 order by 2 desc, name"
+    ) == (
+        "SqlQuery",
+        True,
+        (
+            ("SqlItem", ("Qualified", "c", "name"), None),
+            (
+                "SqlItem",
+                ("Call", "sum", (("Qualified", "o", "amount"),), False, False),
+                "total",
+            ),
+        ),
+        (
+            "SqlTable",
+            ("Dataset", "sales", "customers", (("KeepOption", ("id", "name")),)),
+            "c",
+        ),
+        (
+            (
+                "SqlJoin",
+                "inner",
+                ("SqlTable", ("Dataset", None, "orders", ()), "o"),
+                binary(
+                    "=", ("Qualified", "c", "id"), ("Qualified", "o", "customer_id")
+                ),
+            ),
+            (
+                "SqlJoin",
+                "left",
+                ("SqlTable", ("Dataset", None, "notes", ()), None),
+                binary("=", ("Qualified", "c", "id"), ("Qualified", "notes", "id")),
+            ),
+        ),
+        binary("=", ("Qualified", "o", "status"), string("completed")),
+        (("Qualified", "c", "name"),),
+        binary(">", ("Call", "count", (), True, False), number(1)),
+        (("SqlOrder", number(2), True), ("SqlOrder", name("name"), False)),
+    )
+
+
+def test_select_star_and_count_distinct() -> None:
+    assert query_shape("select *, count(distinct id) as n from t join u on a = b")[
+        2
+    ] == (
+        ("SqlItem", None, None),
+        ("SqlItem", ("Call", "count", (name("id"),), False, True), "n"),
+    )
+
+
+def test_proc_sql_options_and_statements() -> None:
+    program = parse_sas(
+        "proc sql noprint outobs=10; select * from t; "
+        "create table a as select x from t; insert into a values (1); "
+        "create table b like a; quit;"
+    )
+
+    assert issues(program) == [
+        "PROC SQL option OUTOBS=10",
+        "SELECT statement in PROC SQL",
+        "INSERT statement in PROC SQL",
+        "CREATE TABLE without AS SELECT",
+    ]
+    assert len(program.steps[0].statements) == 1
+
+
+@pytest.mark.parametrize(
+    ("query", "message"),
+    [
+        ("select a from t right join u on a = b", "RIGHT join"),
+        ("select a from t, u", ", join"),
+        ("select a from t union select b from u", "UNION in a query"),
+        ("select a length=8 from t", "column modifier LENGTH="),
+        ("select calculated b from t", "CALCULATED"),
+        ("select a from t where a in (select b from u)", "subquery"),
+        ("select (select max(b) from u) as m from t", "subquery"),
+    ],
+)
+def test_unsupported_proc_sql_constructs(query: str, message: str) -> None:
+    program = parse_sas(f"proc sql; create table out as {query}; quit;")
+
+    assert issues(program) == [message]
+
+
+@pytest.mark.parametrize(
+    ("query", "message"),
+    [
+        ("from t", "Expected SELECT"),
+        ("select a", "Expected FROM, found 'end of statement'"),
+        ("select a b from t", "Expected FROM, found 'b'"),
+        ("select a from t join u", "Expected ON after the joined table"),
+        ("select a from t left u on a = b", "Expected JOIN"),
+        ("select a from t group a", "Expected BY"),
+        ("select a as from t", "Expected a column name after AS"),
+        ("select a from t as where a = 1", "Expected a table alias after AS"),
+        ("select a from t where a in (select b from u", "Expected \\) to end"),
+    ],
+)
+def test_invalid_proc_sql(query: str, message: str) -> None:
+    with pytest.raises(SASParseError, match=message):
+        parse_sas(f"proc sql; create table out as {query}; quit;")
+
+
+def test_a_qualified_name_needs_no_spaces() -> None:
+    assert where("a.b = 1")[0] == binary("=", ("Qualified", "a", "b"), number(1))

@@ -15,8 +15,9 @@ against SAS itself.
 
 All rules come from SAS's public documentation at documentation.sas.com:
 *SAS 9.4 Language Reference: Concepts*, *SAS 9.4 Functions and CALL Routines:
-Reference* for functions, *Base SAS 9.4 Procedures Guide* for procedures, and
-the FREQ procedure chapter of the *SAS/STAT User's Guide*.
+Reference* for functions, *Base SAS 9.4 Procedures Guide* for procedures, the
+FREQ procedure chapter of the *SAS/STAT User's Guide*, and the *SAS SQL
+Procedure User's Guide*.
 
 ## Supported so far
 
@@ -36,6 +37,7 @@ the FREQ procedure chapter of the *SAS/STAT User's Guide*.
 | Conditions | Comparisons (`=`, `^=`, `<`, `<=`, `>`, `>=` and `EQ`, `NE`, `LT`, `LE`, `GT`, `GE`); `AND`, `OR`, `NOT (...)`; `IN`, `NOT IN`; `BETWEEN ... AND`; `IS [NOT] MISSING` and `IS [NOT] NULL`; a number on its own. A comparison or condition used as a value is 1 or 0 |
 | Functions | `SUM`, `MEAN`, `MIN`, `MAX`, `N`, `NMISS`, `COALESCE`; `ROUND`, `INT`, `CEIL`, `FLOOR`, `ABS`, `MOD`; `UPCASE`, `LOWCASE`, `STRIP`, `TRIM`, `SUBSTR`, `LENGTH`; `CATS`, `CATX`, `COALESCEC`; `MISSING`. See [Functions](#functions) |
 | `PROC SORT` | `DATA=`, `OUT=` (with data set options), `NODUPKEY`, `BY` with `DESCENDING`, and `WHERE`. Options that do not change the result (`EQUALS`, `FORCE`, `TAGSORT`, `SORTSIZE=`, ...) are accepted. See [PROC SORT](#proc-sort) |
+| `PROC SQL` | `CREATE TABLE name AS SELECT` with `DISTINCT`, columns and `AS` names, `FROM` a data set (with data set options and an alias), `INNER JOIN` and `LEFT JOIN ... ON`, `WHERE`, `GROUP BY` columns, `HAVING`, `ORDER BY` names or positions with `DESC`, and the summary functions `COUNT(*)`, `COUNT`, `SUM`, `AVG`/`MEAN`, `MIN`, `MAX`, `NMISS`, `RANGE`, `STD`, `VAR` (`COUNT` and `SUM` also with `DISTINCT`). See [PROC SQL](#proc-sql) |
 | `PROC FREQ` | `DATA=`, `BY`, `WHERE`, and `TABLES a` or `TABLES a*b*...` with `/ OUT=`, `MISSING`, and `OUTPCT` (two-way tables). Options that only change printed output are accepted. See [PROC FREQ](#proc-freq) |
 | `PROC MEANS`, `PROC SUMMARY` | `DATA=`, `NWAY`, `MISSING`; `CLASS` (with `/ MISSING`), `VAR`, `BY`, `WHERE`; `OUTPUT OUT=` with `N`, `NMISS`, `SUM`, `MEAN`, `MIN`, `MAX`, `RANGE`, `STD`, and `VAR`, in the forms `mean=`, `mean=names`, and `mean(variables)=names`. Options that only change printed output are accepted. See [PROC MEANS and SUMMARY](#proc-means-and-summary) |
 | Comments | `/* ... */` anywhere, and `* ... ;` statements |
@@ -49,7 +51,11 @@ writing to a permanent library, PROC SORT's `DUPOUT=`, `NOUNIQUEKEY`, and
 collating sequences, PROC MEANS without `OUTPUT` (a printed report), quantiles
 such as `MEDIAN`, `AUTONAME`, `TYPES`, `WAYS`, `ID`, `FREQ`, and `WEIGHT`, PROC
 FREQ without `OUT=` (printed tables), its `OUTPUT` statement, `SPARSE`,
-`OUTCUM`, and grouped requests such as `(a b)*c`, and the other PROC steps.
+`OUTCUM`, and grouped requests such as `(a b)*c`, PROC SQL queries that are not
+in `CREATE TABLE ... AS` (they print a report), subqueries, `CALCULATED`,
+`UNION` and the other set operators, `RIGHT`, `FULL`, `CROSS`, and comma joins,
+`INSERT`, `UPDATE`, and the other PROC SQL statements, and the other PROC
+steps.
 
 ## The rules
 
@@ -411,6 +417,45 @@ percentages.
 first". The output is sorted by the BY variables, then by the table's
 variables.
 
+### PROC SQL
+
+*SAS SQL Procedure User's Guide*: "Retrieving Rows That Satisfy a Condition",
+"Sorting Data", "Summarizing Data", and "PROC SQL and the ANSI Standard". Why
+PROC SQL does not go through SparkShift's SQL conversion:
+[ADR 0006](adr/0006-proc-sql-follows-sas-rules.md).
+
+**Missing values follow SAS, not SQL.** "PROC SQL follows the SAS convention
+for handling missing values", and "PROC SQL treats missing values as smaller
+than nonmissing values": the guide's own example of `where Depth lt 500`
+returns features with a missing depth. So conditions in `WHERE`, `ON`, and
+`HAVING` follow the same rules as a DATA step's `WHERE` (see
+[Missing numbers](#missing-numbers) and [Text](#text)), not SQL's three-valued
+logic: in PROC SQL, `score < 3` keeps missing scores, which SparkShift's SQL
+conversion would drop.
+
+**Joins.** A comparison of two values is true when both are missing, so a join
+condition `a.id = b.id` matches missing values with each other, which
+`eqNullSafe` does. SparkShift cannot see whether the columns are numbers or
+text; for text, SAS would also ignore trailing blanks and treat empty text as
+missing. So an equality of two columns is translated with a warning; other
+comparisons of two columns are rejected, as in a DATA step.
+
+**Summary functions.** In a query's `SELECT` and `HAVING`, `COUNT(*)` counts
+rows, and a summary function with one argument, such as `SUM(amount)`,
+summarizes the rows of each group, skipping missing values. With two or more
+arguments, `SUM`, `MIN`, `MAX`, `MEAN`, `N`, and `NMISS` are the DATA step
+functions, computed for each row: `sum(amount, discount)` adds the two values
+of the row. Every selected column must be grouped or summarized; SAS would
+otherwise "remerge" the summary with each row, which SparkShift rejects. A
+`HAVING` condition becomes a helper column, `_having`, computed with the
+summaries and dropped after filtering. `GROUP BY` keeps missing values as a
+group, unlike PROC MEANS's `CLASS`.
+
+**Names and order.** A selected column keeps its name; a computed one needs
+`AS` (SAS would name it `_TEMA001`). "PROC SQL sorts nulls, or missing values,
+before character or numeric data": missing values come first in `ORDER BY`,
+and last with `DESC`, as Spark's `.asc()` and `.desc()` place NULLs.
+
 ## Limitations
 
 - **Column order of KEEP:** SAS keeps variables in the data set's order;
@@ -475,6 +520,8 @@ variables.
   frequency" without saying how combinations that are partly missing are
   grouped. SparkShift writes one row for each combination of values that has a
   missing value, as for a one-way table, each with missing percentages.
+- **Counting text in PROC SQL:** `COUNT(x)` and `NMISS(x)` count NULLs as
+  missing; for SAS, empty text is missing too.
 - **VAR is needed:** without a `VAR` statement, SAS analyzes every numeric
   variable, which SparkShift cannot see; name the variables in `VAR` or in
   `statistic(variables)=`.
