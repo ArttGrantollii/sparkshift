@@ -108,6 +108,29 @@ def test_convert_writes_the_output_file(
     assert capsys.readouterr() == ("", "")
 
 
+def test_convert_writes_a_notebook(
+    sql_file: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "query_notebook.py"
+
+    arguments = ["convert", str(sql_file), "--notebook", "-o", str(output)]
+    assert main(arguments) == EXIT_CONVERTED
+
+    expected = sparkshift.to_notebook(sparkshift.convert(SQL), source=str(sql_file))
+    assert output.read_text(encoding="utf-8") == expected
+
+
+def test_a_notebook_from_standard_input(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "stdin", io.StringIO("data a; set t; run;"))
+
+    assert main(["convert", "-", "-d", "sas", "--notebook"]) == EXIT_CONVERTED
+
+    result = sparkshift.convert("data a; set t; run;", dialect="sas")
+    assert capsys.readouterr().out == sparkshift.to_notebook(result, dialect="sas")
+
+
 def test_unsupported_sql_lists_every_issue_on_standard_error(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -428,6 +451,24 @@ def test_directory_converts_sql_and_sas_files(
         SAS, dialect="sas"
     ).code
     assert capsys.readouterr().err == "sparkshift: converted 2 of 2 files\n"
+
+
+def test_directory_of_notebooks(
+    mixed: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "notebooks"
+
+    arguments = ["convert", str(mixed), "-o", str(output), "-d", "tsql", "--notebook"]
+    assert main(arguments) == 0
+
+    sql = sparkshift.convert("SELECT TOP 2 name FROM customers", dialect="tsql")
+    assert (output / "a_query.py").read_text(encoding="utf-8") == (
+        sparkshift.to_notebook(sql, source="a_query.sql", dialect="tsql")
+    )
+    sas = sparkshift.convert(SAS, dialect="sas")
+    assert (output / "b_job.py").read_text(encoding="utf-8") == (
+        sparkshift.to_notebook(sas, source="b_job.sas", dialect="sas")
+    )
 
 
 def test_dialect_sas_selects_the_sas_programs(

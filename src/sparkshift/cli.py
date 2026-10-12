@@ -30,6 +30,7 @@ from sparkshift.api import convert
 from sparkshift.diagnostics import ConversionResult
 from sparkshift.dialects import DIALECT_CHOICES, SAS, is_sas
 from sparkshift.errors import SparkShiftError
+from sparkshift.notebook import to_notebook
 from sparkshift.report import Report, assess, to_json, to_markdown, to_text, unreadable
 
 EXIT_CONVERTED = 0
@@ -94,6 +95,11 @@ def _parser() -> argparse.ArgumentParser:
             "directory input, the directory to write .py files into (required)"
         ),
     )
+    convert_command.add_argument(
+        "--notebook",
+        action="store_true",
+        help="write Databricks notebooks (source format) instead of plain code",
+    )
 
     report_command = commands.add_parser(
         "report",
@@ -142,10 +148,12 @@ def _convert_one(parser: argparse.ArgumentParser, arguments: argparse.Namespace)
     result = _conversion(parser.prog, sql, name, dialect)
     if result is None:
         return EXIT_NOT_CONVERTED
+    source = None if arguments.input == _STDIN else arguments.input
+    code = _output(result, arguments.notebook, source, dialect)
     if arguments.output is None:
-        sys.stdout.write(result.code)
+        sys.stdout.write(code)
     else:
-        _write(parser, arguments.output, result.code)
+        _write(parser, arguments.output, code)
     return EXIT_CONVERTED
 
 
@@ -175,7 +183,7 @@ def _convert_directory(
             _write(
                 parser,
                 output / path.relative_to(source).with_suffix(".py"),
-                result.code,
+                _output(result, arguments.notebook, path.name, dialect),
             )
             converted += 1
 
@@ -247,6 +255,15 @@ def _source_files(
     if not files:
         parser.error(f"no {' or '.join(suffixes)} files in {source}")
     return files
+
+
+def _output(
+    result: ConversionResult, notebook: bool, source: str | None, dialect: str | None
+) -> str:
+    """The code to write: plain, or as a Databricks notebook."""
+    if not notebook:
+        return result.code
+    return to_notebook(result, source=source, dialect=dialect)
 
 
 def _dialect_of(path: Path, dialect: str | None) -> str | None:

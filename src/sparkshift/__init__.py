@@ -10,6 +10,7 @@ from sparkshift.errors import (
     UnsupportedDialectError,
     UnsupportedSQLError,
 )
+from sparkshift.notebook import to_notebook
 
 __version__ = "0.1.0.dev0"
 
@@ -24,4 +25,5 @@ __all__ = [
     "UnsupportedSQLError",
     "__version__",
     "convert",
+    "to_notebook",
 ]

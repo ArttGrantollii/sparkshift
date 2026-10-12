@@ -241,6 +241,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the report names the languages; the playground has SAS in its dialect
   list and SAS examples; the examples gallery has three SAS programs, checked
   on Spark against rows written by hand. Phase 4 (SAS) is complete.
+- Databricks notebooks (ADR 0007): `sparkshift convert --notebook` and
+  `sparkshift.to_notebook(...)` write the generated code as a source-format
+  notebook (`# Databricks notebook source`): a Markdown cell with the source,
+  its language, and the warnings to review, one cell per section of the code,
+  and `display(result)`. Every example, run as a notebook on Spark, displays
+  the same rows as its code.
 
 ### Changed
 

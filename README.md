@@ -213,6 +213,24 @@ written by hand. [docs/sas.md](docs/sas.md) lists what is supported, each rule
 with its source, and the limitations; the [examples](examples/README.md)
 include SAS programs.
 
+## Databricks notebooks
+
+`--notebook` writes a Databricks notebook instead of plain code, for SQL and
+SAS, one file or a whole directory:
+
+```bash
+sparkshift convert jobs/ --notebook -o notebooks/
+```
+
+Each notebook is a `.py` file in Databricks' source format: a Markdown cell
+that names the source file and lists the warnings to review, a cell for each
+part of the code (imports, each DataFrame, the result), and
+`display(result)`. Import it into a workspace (**Workspace → Import**) and run
+it; `spark` and `display` are defined there. Tables are read by name from the
+current catalog and schema. In Python, `sparkshift.to_notebook(result,
+source="job.sql")` does the same. See
+[ADR 0007](docs/adr/0007-databricks-notebooks.md).
+
 ## Playground
 
 The [playground](https://arttgrantollii.github.io/sparkshift/) runs SparkShift entirely in the browser, with
