@@ -167,6 +167,20 @@ def test_unsupported_sql_lists_the_same_issues_as_the_command_line(
     assert page.is_disabled("#copy")
 
 
+def test_modified_star_is_rejected_in_browser(session: dict) -> None:
+    page = session["page"]
+
+    convert_in_page(page, "SELECT * EXCEPT (secret) FROM audit_input", "")
+
+    assert page.is_visible("#errors")
+    assert "SELECT * with EXCEPT" in page.locator("#errors").inner_text()
+    assert (
+        "List the selected columns explicitly" in page.locator("#errors").inner_text()
+    )
+    assert page.is_hidden("#output")
+    assert page.is_disabled("#copy")
+
+
 def test_parse_error_shows_its_position(session: dict) -> None:
     page = session["page"]
 

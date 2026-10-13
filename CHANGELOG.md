@@ -270,6 +270,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- SQL wildcard modifiers (`EXCEPT`/`EXCLUDE`, `REPLACE`, `RENAME`, `ILIKE`)
+  are now rejected with rewrite guidance in projections and `COUNT(*)`,
+  including qualified and nested queries. Previously they were silently
+  discarded, retaining excluded columns, losing replacement calculations,
+  or producing incorrect row counts.
 - `ROW_NUMBER`, `RANK`, and `DENSE_RANK` without `ORDER BY` in the window are
   now rejected; they produced code that Spark refuses to run.
 - Long comparisons and arithmetic are now wrapped to fit 88 columns, one

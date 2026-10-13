@@ -1320,7 +1320,7 @@ class _Translator:
 
     def projection_item(self, node: exp.Expression) -> ir.Expression | None:
         if isinstance(node, exp.Star):
-            return ir.Star()
+            return self.star(node)
         if isinstance(node, exp.Column) and isinstance(node.this, exp.Star):
             # "c.*": every column of one input table.
             qualifier = tuple(
@@ -1328,7 +1328,7 @@ class _Translator:
                 for part in ("catalog", "db", "table")
                 if node.args.get(part)
             )
-            return ir.Star(qualifier)
+            return self.star(node.this, qualifier)
         if isinstance(node, exp.Alias):
             expression = self.expression(node.this)
             return None if expression is None else ir.Alias(expression, node.alias)
@@ -1377,6 +1377,37 @@ class _Translator:
             )
             return None
         return expression
+
+    def star(
+        self,
+        node: exp.Star,
+        qualifier: tuple[str, ...] = (),
+        *,
+        counting: bool = False,
+    ) -> ir.Star | None:
+        """Only an unmodified wildcard has the meaning our IR represents.
+
+        SQLGlot stores modifiers on the Star itself, even inside a qualified
+        column or COUNT. Check all populated fields so new parser modifiers
+        cannot silently turn into an unchanged projection or a row count.
+        """
+        supported = True
+        name = "COUNT(*)" if counting else "SELECT *"
+        hint = (
+            "Write an explicit aggregate that preserves which columns are "
+            "checked for NULL; a modified COUNT(*) is not a plain row count."
+            if counting
+            else "List the selected columns explicitly, and write replacements "
+            "or renames as expressions with AS aliases."
+        )
+        for part, value in node.args.items():
+            if value:
+                label = part.upper()
+                if part == "except_":
+                    label = "EXCLUDE" if self.dialect == "snowflake" else "EXCEPT"
+                self.unsupported(f"{name} with {label}", node, hint)
+                supported = False
+        return ir.Star(qualifier) if supported else None
 
     # --- Aggregation -----------------------------------------------------
 
@@ -1677,7 +1708,9 @@ class _Translator:
                 return None
             operands = list(argument.expressions)
         elif isinstance(argument, exp.Star) and function is ir.AggregateFunction.COUNT:
-            operands = []  # COUNT(*) counts rows
+            if self.star(argument, counting=True) is None:
+                return None
+            operands = []  # Only unmodified COUNT(*) counts every row
         else:
             operands = [argument]
         if function is not ir.AggregateFunction.COUNT and len(operands) != 1:

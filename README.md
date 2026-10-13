@@ -258,6 +258,7 @@ the same result as its SQL on Apache Spark.
 |---|---|
 | `SELECT ... FROM table` (including `schema.table`, quoted names, and table aliases) | Supported |
 | Columns, qualified columns (`t.column`), `*`, `t.*`, and `AS` aliases | Supported |
+| Wildcard modifiers: `* EXCEPT`/`EXCLUDE`, `REPLACE`, `RENAME`, and `ILIKE`, including modified `COUNT(*)` | Unsupported — rejected with rewrite guidance; never treated as an unchanged wildcard |
 | Joins: `[INNER] JOIN`, `LEFT`/`RIGHT`/`FULL [OUTER] JOIN`, `CROSS JOIN`, comma joins | Supported, with `ON` or `USING` |
 | Literals: integers, decimals, doubles (`1.5e0`), strings, `TRUE`/`FALSE`, `NULL` | Supported |
 | Arithmetic: `+ - * / %` and unary `-` | Supported, with dialect exceptions below |
