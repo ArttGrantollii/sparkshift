@@ -120,6 +120,32 @@ URL a database's tests skip, except where `SPARKSHIFT_DATABASE_REQUIRED` names
 that database (`postgres` or `mysql`), as in its CI job, where they fail
 instead, so a green job always means they ran.
 
+### Spark Connect
+
+Databricks serverless compute, including the Free Edition, runs PySpark code
+as a Spark Connect client: the DataFrame calls are sent to a remote Spark
+server instead of a JVM in the same process. The client builds some
+expressions itself, so generated code can behave differently there than in
+classic PySpark. The "Spark Connect" CI job runs every Spark test again
+through a local Spark Connect server:
+
+```bash
+uv sync --group connect
+SPARKSHIFT_SPARK_MODE=connect uv run pytest -m spark
+```
+
+(A plain `uv sync` removes the `connect` group again.)
+
+It found one difference. The Connect client sends a Python `Decimal` literal
+with a precision of at least 10, so `F.lit(Decimal("0.5"))` is
+`decimal(10,1)` there but `decimal(1,1)` in classic PySpark and in Spark SQL.
+The values are equal, but the wider type changes the types of arithmetic on
+it, and near the 38-digit limit, the result itself: a `decimal(30,10)` value
+times `F.lit(Decimal("1.11"))` is `decimal(38,9)` through Spark Connect, rounded
+to `…358.037037036`, where Spark SQL gives `decimal(34,12)`,
+`…358.037037035901`. SparkShift therefore emits a decimal literal as its text cast to its exact
+type, `F.lit("0.5").cast("decimal(1,1)")`, the same in both modes.
+
 ### Testing the comparator
 
 A comparator that always reports "equal" would make every equivalence test

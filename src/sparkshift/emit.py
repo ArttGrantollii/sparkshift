@@ -583,6 +583,14 @@ class _Emitter:
                 return f"{self.inline_relation(query)}.exists()", _ATOM
             case ir.ScalarSubquery(query=query):
                 return f"{self.inline_relation(query)}.scalar()", _ATOM
+            case ir.Literal(value=Decimal() as value):
+                # Text cast to the literal's exact type, the type Spark SQL
+                # gives it. F.lit(Decimal("0.5")) is decimal(1,1) in classic
+                # Spark but decimal(10,1) through Spark Connect, which sends a
+                # Python Decimal with a precision of at least 10.
+                self.uses_functions = True
+                text = python_string(str(value))
+                return f'F.lit({text}).cast("{decimal_type(value)}")', _ATOM
             case ir.Literal(value=value):
                 self.uses_functions = True
                 return f"F.lit({self.python_value(value)})", _ATOM
@@ -641,6 +649,18 @@ class _Emitter:
                 # a date, and a timestamp keeps its time of day.
                 self.uses_functions = True
                 return f"F.make_interval({unit}={self.expression(amount)})", _ATOM
+            case ir.Cast(
+                expression=ir.Literal(value=Decimal() as value),
+                data_type=data_type,
+                safe=safe,
+            ) if data_type.startswith("decimal"):
+                # Cast the text straight to the target type: the same value as
+                # going through the literal's own type, with one cast instead
+                # of two. (Text cast to an integer type would fail on "1.5".)
+                self.uses_functions = True
+                name = "try_cast" if safe else "cast"
+                text = python_string(str(value))
+                return f"F.lit({text}).{name}({python_string(data_type)})", _ATOM
             case ir.Cast(expression=inner, data_type=data_type, safe=safe):
                 name = "try_cast" if safe else "cast"
                 return self.method(inner, name, python_string(data_type)), _ATOM
@@ -670,6 +690,17 @@ class _Emitter:
             self.uses_decimal = True
             return f"Decimal({python_string(str(value))})"
         return python_string(value)
+
+
+def decimal_type(value: Decimal) -> str:
+    """Return the Spark type of a decimal literal, as Spark SQL derives it:
+    ``1.10`` is ``decimal(3,2)`` and ``0.05`` is ``decimal(2,2)``."""
+    parts = value.as_tuple()
+    exponent = parts.exponent
+    assert isinstance(exponent, int), "translation never produces NaN or infinity"
+    scale = max(-exponent, 0)
+    precision = max(len(parts.digits) + max(exponent, 0), scale)
+    return f"decimal({precision},{scale})"
 
 
 def spark_identifier(parts: tuple[str, ...]) -> str:

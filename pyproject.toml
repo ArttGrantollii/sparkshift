@@ -56,6 +56,14 @@ dev = [
     "pytest-cov>=7.1.0",
     "ruff>=0.16.10",
 ]
+# The Spark Connect client, to test the generated code the way Databricks
+# serverless compute runs it: uv sync --group connect, then run the tests with
+# SPARKSHIFT_SPARK_MODE=connect.
+connect = [
+    # PySpark 4.2 warns that it does not fully support pandas 3 yet.
+    "pandas>=2.2,<3",
+    "pyspark[connect]>=4.2.0",
+]
 
 [tool.ruff]
 target-version = "py311"

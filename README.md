@@ -37,15 +37,13 @@ print(result.code)
 <!-- Exact SparkShift output, checked by tests/test_readme.py. Not reformatted. -->
 <!-- fmt: off -->
 ```python
-from decimal import Decimal
-
 from pyspark.sql import functions as F
 
 result = (
     spark.table("sales.orders")
     .select(
         F.col("order_id"),
-        (F.col("amount") * F.lit(Decimal("1.10"))).alias("with_tax"),
+        (F.col("amount") * F.lit("1.10").cast("decimal(3,2)")).alias("with_tax"),
     )
 )
 ```
@@ -468,7 +466,10 @@ For dialects Spark cannot run, the reference is Spark SQL written to mean
 the same thing. PostgreSQL and MySQL queries are also run on real PostgreSQL
 and MySQL servers in CI and compared with the generated PySpark; T-SQL,
 Oracle, Snowflake, and BigQuery are not yet checked against their own
-databases. See [docs/testing.md](docs/testing.md).
+databases.
+
+The Spark tests also run through Spark Connect, the way Databricks serverless
+compute runs code, in a separate CI job. See [docs/testing.md](docs/testing.md).
 
 ## Development setup
 
@@ -499,6 +500,10 @@ uv run pytest --cov            # with coverage report
 uv run ruff check .            # lint
 uv run ruff format --check .   # formatting
 ```
+
+To run the Spark tests through Spark Connect, as Databricks serverless compute
+does: `uv sync --group connect`, then
+`SPARKSHIFT_SPARK_MODE=connect uv run pytest -m spark`.
 
 ## Design documents
 

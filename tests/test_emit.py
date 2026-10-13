@@ -6,6 +6,7 @@ import pytest
 
 from sparkshift import ir
 from sparkshift.emit import (
+    decimal_type,
     emit,
     emit_datasets,
     emit_expression,
@@ -92,19 +93,36 @@ def test_long_single_argument_moves_to_its_own_line() -> None:
     assert f'    .select(\n        F.col("{long_name}")\n    )' in emit(plan)
 
 
-def test_decimal_literals_import_decimal() -> None:
+def test_decimal_literals_are_text_cast_to_their_exact_type() -> None:
     plan = Project(TableScan(("t",)), (Alias(Literal(Decimal("1.10")), "rate"),))
 
+    # No Decimal import: the value is exact text, and the cast fixes the type
+    # in classic Spark and Spark Connect alike.
     assert emit(plan) == (
-        "from decimal import Decimal\n"
-        "\n"
         "from pyspark.sql import functions as F\n"
         "\n"
         "result = (\n"
         '    spark.table("t")\n'
-        '    .select(F.lit(Decimal("1.10")).alias("rate"))\n'
+        '    .select(F.lit("1.10").cast("decimal(3,2)").alias("rate"))\n'
         ")\n"
     )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (Decimal("1.10"), "decimal(3,2)"),  # trailing zeros keep the scale
+        (Decimal("0.5"), "decimal(1,1)"),
+        (Decimal("0.05"), "decimal(2,2)"),  # precision is at least the scale
+        (Decimal("0.00"), "decimal(2,2)"),
+        (Decimal("-2.5"), "decimal(2,1)"),  # the sign is not a digit
+        (Decimal("100.00"), "decimal(5,2)"),
+        (Decimal("9223372036854775808"), "decimal(19,0)"),
+        (Decimal("1E+2"), "decimal(3,0)"),  # a positive exponent adds digits
+    ],
+)
+def test_decimal_type_matches_spark_sql(value: Decimal, expected: str) -> None:
+    assert decimal_type(value) == expected
 
 
 def test_star_is_selected_by_name() -> None:
@@ -120,7 +138,7 @@ def test_star_is_selected_by_name() -> None:
         (True, "F.lit(True)"),
         (30, "F.lit(30)"),
         (-5, "F.lit(-5)"),
-        (Decimal("1.50"), 'F.lit(Decimal("1.50"))'),
+        (Decimal("1.50"), 'F.lit("1.50").cast("decimal(3,2)")'),
         (1.5, "F.lit(1.5)"),
         ('say "hi"', 'F.lit("say \\"hi\\"")'),
     ],
@@ -621,6 +639,20 @@ def test_aggregate_ir_needs_keys_or_aggregates() -> None:
         ),
         (ir.Cast(A, "decimal(10,2)"), 'F.col("a").cast("decimal(10,2)")'),
         (ir.Cast(A, "int", safe=True), 'F.col("a").try_cast("int")'),
+        # A decimal literal is cast once to a decimal type, from its text.
+        (
+            ir.Cast(Literal(Decimal("1.5")), "decimal(3,1)"),
+            'F.lit("1.5").cast("decimal(3,1)")',
+        ),
+        (
+            ir.Cast(Literal(Decimal("1.5")), "decimal(3,1)", safe=True),
+            'F.lit("1.5").try_cast("decimal(3,1)")',
+        ),
+        # Text "2.5" cast to int would fail, so it goes through its decimal type.
+        (
+            ir.Cast(Literal(Decimal("2.5")), "int"),
+            'F.lit("2.5").cast("decimal(2,1)").cast("int")',
+        ),
         (
             # A compound receiver is parenthesized before the method call.
             ir.Cast(BinaryOp(BinaryOperator.ADD, A, B), "int"),

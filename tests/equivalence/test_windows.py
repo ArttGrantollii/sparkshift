@@ -108,6 +108,12 @@ SCENARIOS = {
         "LEAD(amount, 2, 0) OVER (ORDER BY order_id) AS after_next FROM orders",
         None,
     ),
+    # The default is a plain Python value: F.lead(col, 1, Decimal("0.5")).
+    "LEAD with a decimal default": (
+        "SELECT order_id, LEAD(amount, 1, 0.5) OVER (ORDER BY order_id) AS next "
+        "FROM orders",
+        None,
+    ),
     # Customer 3's second order has a NULL amount; LAG returns it as a value.
     "LAG within partitions": (
         "SELECT order_id, customer_id, "

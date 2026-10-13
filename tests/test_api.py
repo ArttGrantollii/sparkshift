@@ -52,15 +52,14 @@ def test_convert_generates_a_projection() -> None:
     )
 
     assert sparkshift.convert(sql).code == (
-        "from decimal import Decimal\n"
-        "\n"
         "from pyspark.sql import functions as F\n"
         "\n"
         "result = (\n"
         '    spark.table("orders")\n'
         "    .select(\n"
         '        F.col("order_id"),\n'
-        '        (F.col("amount") * F.lit(Decimal("1.10"))).alias("with_tax"),\n'
+        '        (F.col("amount") * F.lit("1.10").cast("decimal(3,2)"))'
+        '.alias("with_tax"),\n'
         # Too long for one line: the condition moves into its own parentheses.
         "        (\n"
         '            (F.col("amount") > F.lit(100)) & '

@@ -94,6 +94,14 @@ SCENARIOS = {
     "TRY_CAST returns NULL for bad input": (
         "SELECT customer_id, TRY_CAST(name AS INT) AS name_number FROM customers"
     ),
+    # Decimal literals cast to a decimal type are cast once, straight from
+    # their text; to any other type, through their own decimal type.
+    "CAST of decimal literals": (
+        "SELECT customer_id, CAST(1.55 AS DECIMAL(2,1)) AS half_up, "
+        "CAST(-1.55 AS DECIMAL(2,1)) AS negative, "
+        "TRY_CAST(123.45 AS DECIMAL(3,1)) AS too_big, "
+        "CAST(2.5 AS INT) AS truncated, CAST(0.5 AS DOUBLE) AS d FROM customers"
+    ),
 }
 
 

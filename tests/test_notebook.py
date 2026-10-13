@@ -54,7 +54,8 @@ def test_a_notebook_in_databricks_source_format() -> None:
 def test_each_section_of_the_code_is_a_cell() -> None:
     result = sparkshift.convert(
         "WITH big AS (SELECT * FROM orders WHERE amount > 100) "
-        "SELECT o.order_id, c.name, CAST(1.5 AS DECIMAL(3, 1)) AS rate, "
+        "SELECT o.order_id, c.name, "
+        "LEAD(o.amount, 1, 0.5) OVER (ORDER BY o.order_id) AS next_amount, "
         "ROW_NUMBER() OVER (PARTITION BY c.name ORDER BY o.order_id) AS n "
         "FROM big o JOIN customers c ON o.customer_id = c.customer_id"
     )

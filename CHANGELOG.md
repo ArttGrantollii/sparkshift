@@ -247,8 +247,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its language, and the warnings to review, one cell per section of the code,
   and `display(result)`. Every example, run as a notebook on Spark, displays
   the same rows as its code.
+- Spark Connect testing: with `SPARKSHIFT_SPARK_MODE=connect` (and
+  `uv sync --group connect`), every Spark test runs through a local Spark
+  Connect server, as code runs on Databricks serverless compute. A new CI job,
+  "Spark Connect", runs them on every push.
 
 ### Changed
+
+- Decimal literals are generated as their text cast to their exact type,
+  `F.lit("1.10").cast("decimal(3,2)")`, instead of `F.lit(Decimal("1.10"))`,
+  which Spark Connect types as `decimal(10,2)`. A decimal literal cast to a
+  decimal type is cast once, straight from its text.
 
 - `IN (subquery)` where no subquery is allowed, such as in `QUALIFY` or a
   join condition, now reports where subqueries are supported instead of
