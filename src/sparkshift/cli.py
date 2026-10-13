@@ -170,9 +170,10 @@ def _convert_directory(
     if output.exists() and not output.is_dir():
         parser.error(f"--output {output} must be a directory, not a file")
     files = _source_files(parser, source, arguments.dialect)
+    destinations = _batch_outputs(parser, source, output, files)
 
     converted = 0
-    for path in files:
+    for path, destination in destinations:
         sql, reason = _read_text(path)
         if sql is None:
             print(f"{parser.prog}: cannot read {path}: {reason}", file=sys.stderr)
@@ -182,7 +183,7 @@ def _convert_directory(
         if result is not None:
             _write(
                 parser,
-                output / path.relative_to(source).with_suffix(".py"),
+                destination,
                 _output(result, arguments.notebook, path.name, dialect),
             )
             converted += 1
@@ -194,6 +195,43 @@ def _convert_directory(
         summary += f"; {failed} could not be converted"
     print(summary, file=sys.stderr)
     return EXIT_CONVERTED if failed == 0 else EXIT_NOT_CONVERTED
+
+
+def _batch_outputs(
+    parser: argparse.ArgumentParser, source: Path, output: Path, files: list[Path]
+) -> list[tuple[Path, Path]]:
+    """Plan every output before side effects; reject colliding portable names."""
+    planned = [
+        (path, output / path.relative_to(source).with_suffix(".py")) for path in files
+    ]
+    by_name: dict[tuple[str, ...], list[Path]] = {}
+    for path, destination in planned:
+        # Compare whole components, so a.py_extra is not a child of a.py.
+        # Case-fold even on Linux: batches should remain portable to Windows.
+        name = tuple(part.casefold() for part in destination.relative_to(output).parts)
+        by_name.setdefault(name, []).append(path)
+
+    conflicts: set[Path] = set()
+    for name, inputs in by_name.items():
+        if len(inputs) > 1:
+            conflicts.update(inputs)
+        for depth in range(1, len(name)):
+            if ancestor_inputs := by_name.get(name[:depth]):
+                conflicts.update(ancestor_inputs)
+                conflicts.update(inputs)
+
+    if conflicts:
+        mappings = "\n".join(
+            f"  {path} -> {destination}"
+            for path, destination in planned
+            if path in conflicts
+        )
+        parser.error(
+            f"batch output paths collide:\n{mappings}\n"
+            "No files were written. Rename the inputs or place them in separate "
+            "subdirectories so their output paths are distinct (ignoring case)."
+        )
+    return planned
 
 
 def _report(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int:

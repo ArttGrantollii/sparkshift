@@ -270,6 +270,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Directory conversion checks all selected output names before converting or
+  writing, rejecting same-stem SQL/SAS files, case-only variants, and output
+  file/directory conflicts with a usage error listing every conflicting mapping.
+  A colliding batch writes no files; separate subfolders and SAS-only selection
+  remain supported.
+
 - The playground now shows conversion warnings, including SAS NODUPKEY's
   retained-row warning, and clears output and Copy availability on input edits
   or conversion failures. Unexpected Python/JSON failures and excessive nesting

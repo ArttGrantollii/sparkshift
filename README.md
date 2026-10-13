@@ -71,7 +71,7 @@ sparkshift convert query.sql                    # print the PySpark code
 sparkshift convert query.sql --dialect tsql     # SQL in a specific dialect
 sparkshift convert query.sql -o query.py        # write the code to a file
 cat query.sql | sparkshift convert -            # read standard input
-sparkshift convert queries/ -o pyspark/         # every .sql file in a directory
+sparkshift convert queries/ -o pyspark/         # every .sql and .sas file in a directory
 ```
 
 For example:
@@ -95,11 +95,22 @@ result = (
 <!-- fmt: on -->
 
 The code goes to standard output and every message to standard error, so
-`> query.py` never captures an error. For a directory, each `.sql` file,
+`> query.py` never captures an error. For a directory, each `.sql` or `.sas` file,
 including those in subdirectories, becomes a `.py` file at the same relative
 path under the output directory; files that cannot be converted are listed
 with their issues, followed by a summary such as
 `converted 8 of 10 files; 2 could not be converted`.
+
+Before converting a directory, SparkShift checks the output paths of all selected
+inputs. If two inputs would share a `.py` path (for example, `job.sql` and
+`job.sas`), or one output file would also need to be another output's directory,
+the entire batch stops with exit status 2 before conversion or writing. The error
+lists every conflicting input and destination. Names are compared ignoring case,
+even on Linux, so batches remain portable to Windows. Rename the inputs or put
+them in separate subdirectories; `sql/job.sql` and `sas/job.sas` are allowed.
+`--dialect sas` checks only the selected `.sas` files. This preflight checks names
+within the batch; ordinary conversion or filesystem errors can still leave a
+partially completed batch.
 
 The exit status is 0 when every query is converted, 1 when any cannot be,
 and 2 for a usage error such as a missing file or an unknown dialect.
