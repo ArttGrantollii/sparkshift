@@ -59,14 +59,16 @@
       <div class="panes">
         <section aria-labelledby="sql-label">
           <h2 id="sql-label"><label for="sql" id="language">SQL</label></h2>
-          <textarea id="sql" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+          <p id="input-limit" class="input-help"></p>
+          <textarea id="sql" aria-describedby="input-limit" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
         </section>
         <section aria-labelledby="output-label">
           <div class="pane-heading">
             <h2 id="output-label">PySpark</h2>
             <button id="copy" class="secondary" type="button" disabled>Copy</button>
           </div>
-          <pre id="output" tabindex="0"><code id="code"></code></pre>
+          <div id="warnings" role="status" aria-live="polite" hidden></div>
+          <pre id="output" hidden tabindex="0"><code id="code"></code></pre>
           <div id="errors" role="alert" hidden></div>
         </section>
       </div>
@@ -75,8 +77,8 @@
     <footer>
       <p id="about">
         The generated code expects a SparkSession named <code>spark</code>, as in a
-        Databricks notebook. Constructs SparkShift cannot convert safely are rejected
-        with an explanation instead of guessed.
+        Databricks notebook. Review conversion warnings for documented semantic
+        differences. Unsupported constructs are rejected with an explanation.
       </p>
     </footer>
   </body>

@@ -10,6 +10,9 @@ import json
 import sparkshift
 from sparkshift.dialects import DIALECT_CHOICES
 
+# A playground policy, not a limit imposed by the library or CLI.
+MAX_SOURCE_BYTES = 50_000
+
 
 def convert_for_page(sql: str, dialect: str) -> str:
     """Convert ``sql`` (``dialect`` "" for generic SQL, "sas" for a SAS
@@ -19,8 +22,26 @@ def convert_for_page(sql: str, dialect: str) -> str:
     ``{"ok": false, "error": ..., "issues": [...]}`` when it cannot be
     converted; ``issues`` lists each unsupported construct separately.
     """
+    if len(sql.encode("utf-8")) > MAX_SOURCE_BYTES:
+        return json.dumps(
+            {
+                "ok": False,
+                "error": f"The browser demo accepts up to {MAX_SOURCE_BYTES:,} "
+                "UTF-8 bytes of source code. Use the CLI for larger files.",
+                "issues": [],
+            }
+        )
     try:
         result = sparkshift.convert(sql, dialect=dialect or None)
+    except RecursionError:
+        return json.dumps(
+            {
+                "ok": False,
+                "error": "This input is too deeply nested for the browser converter. "
+                "Simplify expressions or split it into smaller queries.",
+                "issues": [],
+            }
+        )
     except sparkshift.SparkShiftError as error:
         issues = getattr(error, "issues", ())
         return json.dumps(
@@ -43,7 +64,11 @@ def about() -> str:
     """JSON with the SparkShift version and the dialects the page can offer,
     SAS last."""
     return json.dumps(
-        {"version": sparkshift.__version__, "dialects": list(DIALECT_CHOICES)}
+        {
+            "version": sparkshift.__version__,
+            "dialects": list(DIALECT_CHOICES),
+            "max_source_bytes": MAX_SOURCE_BYTES,
+        }
     )
 
 

@@ -270,6 +270,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The playground now shows conversion warnings, including SAS NODUPKEY's
+  retained-row warning, and clears output and Copy availability on input edits
+  or conversion failures. Unexpected Python/JSON failures and excessive nesting
+  show readable errors; valid input can be converted again afterwards.
+- The browser demo enforces a documented 50,000-byte UTF-8 source limit in
+  JavaScript and the Python bridge. The CLI and Python API remain unrestricted
+  by this demo policy. This is not an execution timeout or cancellation system.
 - Correlated EXISTS queries omit output helper cleanup and DISTINCT, which
   cannot change row existence but can resolve outer references too early in
   Spark. Filters and limits are retained, including LIMIT 0.

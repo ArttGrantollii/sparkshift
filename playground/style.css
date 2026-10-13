@@ -9,6 +9,8 @@
   --accent-text: #ffffff;
   --error-background: #fdecec;
   --error-text: #8a1c1c;
+  --warning-background: #fff6dd;
+  --warning-text: #754c00;
   /* Code colors, each at least 4.5:1 against --surface (WCAG AA). */
   --code-string: #1d6b2a;
   --code-keyword: #7a2a99;
@@ -28,6 +30,8 @@
     --accent-text: #0b1020;
     --error-background: #3a1d1f;
     --error-text: #ffb4b4;
+    --warning-background: #332b18;
+    --warning-text: #f5d58a;
     --code-string: #8fd694;
     --code-keyword: #d7a6ff;
     --code-function: #8ab4ff;
@@ -217,19 +221,34 @@ pre {
   overflow: auto;
 }
 
-#errors {
+#errors,
+#warnings {
   padding: 0.75rem 1rem;
   border-radius: 6px;
   background: var(--error-background);
   color: var(--error-text);
+  overflow-wrap: anywhere;
 }
 
-#errors p {
+#warnings {
+  background: var(--warning-background);
+  color: var(--warning-text);
+}
+
+.input-help {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+#errors p,
+#warnings p {
   margin: 0;
   font-weight: 600;
 }
 
-#errors ul {
+#errors ul,
+#warnings ul {
   margin: 0.5rem 0 0;
   padding-left: 1.25rem;
 }

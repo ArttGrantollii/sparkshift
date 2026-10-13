@@ -244,6 +244,16 @@ uv run python tools/build_playground.py
 python3 -m http.server --directory _site 8000
 ```
 
+Conversion warnings appear alongside generated code and must be reviewed before
+running it. Editing the source or dialect clears the previous result and disables
+Copy until conversion succeeds. Unsupported inputs, excessive nesting and
+unexpected failures show an error instead of leaving old code available.
+
+The browser demo accepts up to **50,000 UTF-8 bytes** of source code; the
+Python library and CLI do not impose this demo limit. Use the CLI for larger
+files. Conversion still runs on the browser's main thread: the size limit and
+error handling are safeguards, not an execution timeout or cancellation system.
+
 ## Examples
 
 [examples/](examples/README.md) has a realistic query in each dialect next

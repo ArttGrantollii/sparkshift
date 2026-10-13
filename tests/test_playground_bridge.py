@@ -82,7 +82,7 @@ def test_other_errors_have_a_message_and_no_issues(
 def test_warnings_are_passed_on(
     bridge: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # No conversion produces warnings yet; the page must still show them.
+    # Warnings must retain the same diagnostic text as the Python API.
     warning = sparkshift.Diagnostic("fallback used", "x", "Review it.")
     monkeypatch.setattr(
         bridge.sparkshift,
@@ -99,4 +99,58 @@ def test_about(bridge: ModuleType) -> None:
     assert json.loads(bridge.about()) == {
         "version": sparkshift.__version__,
         "dialects": list(DIALECT_CHOICES),
+        "max_source_bytes": 50_000,
     }
+
+
+@pytest.mark.parametrize("extra_bytes", [-1, 0, 1])
+def test_source_limit_counts_utf8_bytes_before_conversion(
+    bridge: ModuleType, monkeypatch: pytest.MonkeyPatch, extra_bytes: int
+) -> None:
+    maximum = 50_000
+    prefix = "SELECT id FROM t --"
+    target = maximum + extra_bytes
+    sql = prefix + "é" * ((target - len(prefix)) // 2)
+    sql += " " * (target - len(sql.encode("utf-8")))
+    calls = []
+
+    def convert(source: str, *, dialect: str | None) -> sparkshift.ConversionResult:
+        calls.append(source)
+        return sparkshift.ConversionResult("result = x\n")
+
+    monkeypatch.setattr(bridge.sparkshift, "convert", convert)
+    result = json.loads(bridge.convert_for_page(sql, ""))
+    assert result["ok"] is (extra_bytes <= 0)
+    assert calls == ([sql] if extra_bytes <= 0 else [])
+    if extra_bytes > 0:
+        assert "50,000 UTF-8 bytes" in result["error"]
+        assert "CLI" in result["error"]
+        assert result["issues"] == []
+
+
+def test_deep_query_returns_a_readable_error(bridge: ModuleType) -> None:
+    sql = "SELECT id FROM orders WHERE " + " AND ".join(
+        f"id != {n}" for n in range(1000)
+    )
+    result = json.loads(bridge.convert_for_page(sql, ""))
+    assert result["ok"] is False
+    assert "deeply nested" in result["error"]
+    assert "Simplify" in result["error"]
+    assert result["issues"] == []
+
+
+def test_unexpected_converter_errors_remain_visible_to_the_browser_boundary(
+    bridge: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(sql: str, *, dialect: str | None) -> sparkshift.ConversionResult:
+        raise RuntimeError("internal failure sentinel")
+
+    monkeypatch.setattr(bridge.sparkshift, "convert", broken)
+    with pytest.raises(RuntimeError, match="internal failure sentinel"):
+        bridge.convert_for_page("SELECT id FROM t", "")
+
+
+def test_source_limit_is_not_imposed_on_the_python_library(bridge: ModuleType) -> None:
+    sql = "SELECT id FROM t --" + "x" * 50_000
+    assert sparkshift.convert(sql).code == sparkshift.convert("SELECT id FROM t").code
+    assert json.loads(bridge.convert_for_page(sql, ""))["ok"] is False

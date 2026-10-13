@@ -25,11 +25,14 @@ const elements = Object.fromEntries(
     "code",
     "copy",
     "errors",
+    "warnings",
+    "input-limit",
   ].map((id) => [id, document.getElementById(id)]),
 );
 
 let convertForPage = null;
 let examples = [];
+let maxSourceBytes = null;
 
 function setStatus(text) {
   elements.status.textContent = text;
@@ -56,6 +59,10 @@ async function start() {
   pyodide.runPython(await (await fetchOk("bridge.py")).text());
   convertForPage = pyodide.globals.get("convert_for_page");
   const about = JSON.parse(pyodide.globals.get("about")());
+  maxSourceBytes = about.max_source_bytes;
+  elements["input-limit"].textContent =
+    `Browser demo limit: ${maxSourceBytes.toLocaleString("en-US")} UTF-8 bytes of source. ` +
+    "Use the CLI for larger files.";
 
   for (const dialect of about.dialects) {
     elements.dialect.add(new Option(DIALECT_NAMES[dialect] ?? dialect, dialect));
@@ -69,9 +76,8 @@ async function start() {
   for (const control of [elements.dialect, elements.example, elements.convert, elements.share]) {
     control.disabled = false;
   }
-  setStatus(`Ready. SparkShift ${about.version}, running on Pyodide ${pyodide.version}.`);
-  if (!loadSharedQuery()) {
-    loadExample(0);
+  if (!loadSharedQuery() && loadExample(0)) {
+    setStatus(`Ready. SparkShift ${about.version}, running on Pyodide ${pyodide.version}.`);
   }
 }
 
@@ -110,7 +116,7 @@ function loadExample(index) {
   }
   elements.sql.value = example.sql;
   elements.dialect.value = example.dialect;
-  convert();
+  return convert();
 }
 
 // The input pane is named after its language: SQL, or a SAS program.
@@ -118,20 +124,88 @@ function showInputLanguage() {
   elements.language.textContent = elements.dialect.value === "sas" ? "SAS program" : "SQL";
 }
 
+// Reset first: a Python exception, invalid JSON or a rendering error must
+// never leave a previous query's output visible or available to Copy.
+function clearOutput() {
+  elements.copy.disabled = true;
+  elements.output.hidden = true;
+  elements.code.replaceChildren();
+  for (const panel of [elements.errors, elements.warnings]) {
+    panel.replaceChildren();
+    panel.hidden = true;
+  }
+}
+
+function inputChanged() {
+  showInputLanguage();
+  clearOutput();
+  if (convertForPage !== null) {
+    setStatus("Input changed. Convert to update the PySpark code.");
+  }
+}
+
+function conversionFailed(result) {
+  clearOutput();
+  elements.errors.hidden = false;
+  showErrors(result);
+  setStatus("Conversion failed.");
+}
+
 function convert() {
   showInputLanguage();
+  clearOutput();
   if (convertForPage === null) {
+    return false;
+  }
+  setStatus("Converting…");
+  try {
+    // Check UTF-8 bytes, matching the Python bridge (not UTF-16 string length).
+    if (new TextEncoder().encode(elements.sql.value).length > maxSourceBytes) {
+      conversionFailed({
+        error: `The browser demo accepts up to ${maxSourceBytes.toLocaleString("en-US")} ` +
+          "UTF-8 bytes of source code. Use the CLI for larger files.",
+        issues: [],
+      });
+      return false;
+    }
+    const result = JSON.parse(convertForPage(elements.sql.value, elements.dialect.value));
+    if (!result.ok) {
+      conversionFailed(result);
+      return false;
+    }
+    elements.code.replaceChildren(highlight(result.code));
+    showWarnings(result.warnings);
+    elements.output.hidden = false;
+    elements.copy.disabled = false;
+    setStatus(result.warnings.length
+      ? `Converted with ${result.warnings.length} warning${result.warnings.length === 1 ? "" : "s"}. Review before running.`
+      : "Converted successfully.");
+    return true;
+  } catch {
+    // Do not expose Python tracebacks or source text from an internal failure.
+    conversionFailed({
+      error: "Conversion failed unexpectedly. Try a smaller input, or report " +
+        "a reproducible example on GitHub.",
+      issues: [],
+    });
+    return false;
+  }
+}
+
+function showWarnings(warnings) {
+  if (warnings.length === 0) {
     return;
   }
-  const result = JSON.parse(convertForPage(elements.sql.value, elements.dialect.value));
-  elements.errors.replaceChildren();
-  elements.errors.hidden = result.ok;
-  elements.output.hidden = !result.ok;
-  elements.code.replaceChildren(result.ok ? highlight(result.code) : "");
-  elements.copy.disabled = !result.ok;
-  if (!result.ok) {
-    showErrors(result);
+  const heading = document.createElement("p");
+  heading.textContent = "Warnings — review before running";
+  const list = document.createElement("ul");
+  for (const warning of warnings) {
+    const item = document.createElement("li");
+    item.textContent = warning;
+    list.append(item);
   }
+  elements.warnings.append(heading, list);
+  elements.warnings.hidden = false;
 }
 
 function showErrors(result) {
@@ -186,7 +260,8 @@ function highlight(code) {
 // --- Events -----------------------------------------------------------------
 
 elements.convert.addEventListener("click", convert);
-elements.dialect.addEventListener("change", showInputLanguage);
+elements.dialect.addEventListener("change", inputChanged);
+elements.sql.addEventListener("input", inputChanged);
 elements.example.addEventListener("change", () => {
   loadExample(Number(elements.example.value));
   elements.example.value = "";
