@@ -270,6 +270,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Correlated EXISTS queries omit output helper cleanup and DISTINCT, which
+  cannot change row existence but can resolve outer references too early in
+  Spark. Filters and limits are retained, including LIMIT 0.
+
+- Generated helper columns now avoid user columns and aliases, including
+  unknown schemas, case-insensitive collisions and nested query scopes.
+  SAS IF helpers and wildcard QUALIFY helpers select unused names from the
+  actual input schema at execution; aggregate helpers also reserve unselected
+  grouping keys. Before, helpers could overwrite and drop data or make a
+  valid query ambiguous.
 - SQL wildcard modifiers (`EXCEPT`/`EXCLUDE`, `REPLACE`, `RENAME`, `ILIKE`)
   are now rejected with rewrite guidance in projections and `COUNT(*)`,
   including qualified and nested queries. Previously they were silently

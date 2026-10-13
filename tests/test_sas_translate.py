@@ -474,18 +474,20 @@ def test_a_block_assigns_each_variable_under_its_conditions() -> None:
 def test_a_condition_the_branch_changes_is_kept_in_a_helper_column() -> None:
     relation = step("if x > 1 then do; x = 0; y = 1; end;", "t(keep=x)")
 
-    helper = Column(("_if_1",))
+    name = ir.HelperName("_if_1")
+    helper = ir.HelperColumn(name)
+    checked_source = ir.AllocateHelpers(ir.Project(T, (X,)), (name,), ("x", "y"))
     assert relation == ir.DropColumns(
         ir.WithColumn(
             ir.WithColumn(
-                ir.WithColumn(ir.Project(T, (X,)), "_if_1", GREATER_1),
+                ir.WithColumn(checked_source, name, GREATER_1),
                 "x",
                 ir.Case(((helper, Literal(0)),), X),
             ),
             "y",
             ir.Case(((helper, Literal(1)),)),
         ),
-        ("_if_1",),
+        (name,),
     )
 
 

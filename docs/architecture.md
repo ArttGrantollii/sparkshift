@@ -1,8 +1,8 @@
 # Architecture
 
-> **Status:** the pipeline below exists end to end for the smallest query
-> (`SELECT * FROM table`). Interfaces other than the Python API are planned.
-> This document records the boundaries that keep them possible.
+> **Status:** SQL and the documented SAS subset use the shared pipeline.
+> The Python API, CLI, public playground and notebook generation exist;
+> Databricks upload and live workspace validation are in progress.
 
 ## The core idea
 
@@ -87,6 +87,16 @@ parentheses before `.alias` gets its own lines inside them. Wrapping only adds
 line breaks and grouping parentheses, so the code means exactly the same at any
 width. A single piece that cannot be split, such as a very long column name,
 can still exceed the limit.
+
+### Helper columns
+
+Temporary columns occupy a separate symbolic namespace when the source's
+columns are unknown. The emitted program reads the input DataFrame's column
+names and reserves names visible in the operation before selecting unused
+helper names; references and drops use those bindings. Known outputs use a
+static name allocator instead. Both conservatively ignore case to protect
+users on either Spark name-resolution setting. See
+[ADR 0008](adr/0008-protect-generated-helper-column-names.md).
 
 ## Rules for the core
 

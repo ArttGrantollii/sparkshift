@@ -9,7 +9,7 @@ are collected before failing, so users see them at once.
 
 from collections import Counter
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any, ClassVar
 
@@ -400,6 +400,7 @@ class _Translator:
         self.qualifier_scopes: list[tuple[frozenset[str], bool]] = []
         # Whether the SELECT about to be translated may do that.
         self.correlated = False
+        self.helper_scope = 0
 
     def statement(self, tree: exp.Expression) -> ir.Relation:
         if not isinstance(tree, exp.Select | exp.SetOperation):
@@ -748,6 +749,12 @@ class _Translator:
         # clauses are written in: FROM (and joins), WHERE, GROUP BY, HAVING,
         # SELECT (computing window functions), QUALIFY, DISTINCT, ORDER BY,
         # LIMIT.
+        # Bind from the FROM schema, before WHERE can contain unresolved
+        # references to an enclosing query. Filtering does not change names.
+        bound = tuple(h.name for h in helpers if isinstance(h.name, ir.HelperName))
+        if bound:
+            reserved = tuple(n for n in _output_names(items) if n is not None)
+            source = ir.AllocateHelpers(source, bound, reserved)
         relation: ir.Relation | None = source
         if condition is not None:
             relation = ir.Filter(source, condition)
@@ -1081,6 +1088,9 @@ class _Translator:
 
         # Every input column is an output column too.
         all_columns = ir.Star() in items
+        unknown_columns = any(isinstance(item, ir.Star) for item in items)
+        self.helper_scope += 1
+        scope = self.helper_scope
         helpers: list[ir.Alias] = []
 
         def output(expression: ir.Expression) -> ir.Expression | None:
@@ -1102,11 +1112,18 @@ class _Translator:
                 return None
             for helper in helpers:
                 if helper.expression == expression:
-                    return ir.Column((helper.name,))
-            helpers.append(
-                ir.Alias(expression, f"{_QUALIFY_PREFIX}_{len(helpers) + 1}")
+                    return ir.helper_reference(helper.name)
+            preferred = f"{_QUALIFY_PREFIX}_{len(helpers) + 1}"
+            name: str | ir.HelperName = (
+                ir.HelperName(preferred, scope)
+                if unknown_columns
+                else ir.unique_column_name(
+                    preferred,
+                    [n for n in names if n is not None] + [h.name for h in helpers],
+                )
             )
-            return ir.Column((helpers[-1].name,))
+            helpers.append(ir.Alias(expression, name))
+            return ir.helper_reference(name)
 
         return _rewrite(condition, output), tuple(helpers)
 
@@ -1666,7 +1683,11 @@ class _Translator:
                     assert isinstance(helper, ir.Alias)
                     if helper.expression == expression:
                         return ir.Column((helper.name,))
-                helpers.append(ir.Alias(expression, f"{prefix}_{len(helpers) + 1}"))
+                taken = [output_name(key) for key in keys]
+                taken += [n for n in _output_names(aggregates) if n is not None]
+                taken += [h.name for h in helpers if isinstance(h, ir.Alias)]
+                name = ir.unique_column_name(f"{prefix}_{len(helpers) + 1}", taken)
+                helpers.append(ir.Alias(expression, name))
                 return ir.Column((helpers[-1].name,))  # type: ignore[union-attr]
             if isinstance(expression, ir.Column):
                 key = _matching_key(expression, keys)
@@ -2135,7 +2156,7 @@ class _Translator:
         if not self.check_parts(node, {"this"}, "EXISTS"):
             return None
         relation = self.subquery_relation(node.this)
-        return None if relation is None else ir.Exists(relation)
+        return None if relation is None else ir.Exists(_exists_query(relation))
 
     def scalar_subquery(self, node: exp.Subquery) -> ir.Expression | None:
         """A subquery used as a value: one column, at most one row."""
@@ -3225,3 +3246,21 @@ def _rewrite(
     if replacement is not None:
         return replacement
     return ir.map_children(expression, lambda child: _rewrite(child, replace))
+
+
+def _exists_query(plan: ir.Relation) -> ir.Relation:
+    """Skip output cleanup and deduplication when only existence is observable.
+
+    Connect resolves DROP's child before a correlated EXISTS has an outer
+    scope. These temporary columns cannot affect whether the subquery has
+    rows, and neither can output DISTINCT. Keep filtering, sorting and limits,
+    and never descend into a join, input projection or a different subquery
+    whose columns can matter.
+    """
+    match plan:
+        case ir.DropColumns(source=source) | ir.Distinct(source=source):
+            return _exists_query(source)
+        case ir.Named() | ir.Sort() | ir.Limit():
+            return replace(plan, source=_exists_query(plan.source))
+        case _:
+            return plan

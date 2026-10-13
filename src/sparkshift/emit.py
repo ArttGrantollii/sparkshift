@@ -122,6 +122,8 @@ class _Emitter:
         self.table_uses: Counter[tuple[str, ...]] = Counter()
         self.window_variables: dict[_WindowKey, str] = {}
         self.named_variables: dict[ir.Named, str] = {}
+        self.helper_names: dict[ir.HelperName, str] = {}
+        self.helper_key_name: str | None = None
         # Variable declarations for named relations, in the order the code
         # needs them, so each comes after the ones it uses.
         self.declarations: list[str] = []
@@ -202,6 +204,50 @@ class _Emitter:
             self.declarations.append(f"{name} = {code}")
         return name
 
+    def column_name(self, name: str | ir.HelperName) -> str:
+        """A literal user name or a Python variable bound to a helper name."""
+        return (
+            self.helper_names[name]
+            if isinstance(name, ir.HelperName)
+            else python_string(name)
+        )
+
+    def allocate_helpers(self, plan: ir.AllocateHelpers) -> str:
+        source = self.named_variable(ir.Named("helper_input", plan.source))
+        occupied = _unique_name("helper_columns", self.taken_names)
+        self.taken_names.add(occupied)
+        key = self.helper_key_name
+        if key is None:
+            key = _unique_name("helper_column_key", self.taken_names)
+            self.taken_names.add(key)
+            self.helper_key_name = key
+            self.declarations.append(
+                f"def {key}(name):\n"
+                '    return name.upper().casefold().replace("\\u0307", "")'
+            )
+        lines = [f"{occupied} = {{{key}(name) for name in {source}.columns}}"]
+        if plan.reserved:
+            lines += [f"{occupied}.update(", "    ["]
+            lines += [
+                f"        {python_string(name)},"
+                for name in sorted({ir.column_key(n) for n in plan.reserved})
+            ]
+            lines += ["    ]", ")"]
+        for column in plan.columns:
+            name = _unique_name(
+                _python_name(column.preferred + "_name"), self.taken_names
+            )
+            self.taken_names.add(name)
+            self.helper_names[column] = name
+            lines += [
+                f"{name} = {python_string(column.preferred)}",
+                f"while {key}({name}) in {occupied}:",
+                f'    {name} += "_"',
+                f"{occupied}.add({key}({name}))",
+            ]
+        self.declarations.append("\n".join(lines))
+        return source
+
     def window_variable(self, name: str, key: "_WindowKey") -> str:
         """``name = Window.partitionBy(...).orderBy(...)``, on one line if it
         fits, otherwise one call per line."""
@@ -276,15 +322,26 @@ class _Emitter:
                     for old, new in renames
                 ]
                 return start, [*calls, *steps]
+            case ir.AllocateHelpers():
+                return self.allocate_helpers(plan), []
             case ir.WithColumn(source=source, name=name, expression=expression):
                 start, calls = self.chain(source)
                 step = self.call(
-                    "withColumn", [python_string(name), expression], short=True
+                    "withColumn", [self.column_name(name), expression], short=True
                 )
                 return start, [*calls, step]
             case ir.DropColumns(source=source, names=names):
                 start, calls = self.chain(source)
-                dropped = self.call("drop", [python_string(name) for name in names])
+                # Symbolic helpers use Column references: Spark's string-based
+                # drop inspects schema immediately, before a correlated query's
+                # outer columns can resolve. The Column form stays lazy.
+                arguments = [
+                    ir.HelperColumn(name)
+                    if isinstance(name, ir.HelperName)
+                    else python_string(name)
+                    for name in names
+                ]
+                dropped = self.call("drop", arguments)
                 return start, [*calls, dropped]
             case ir.RelationAlias(source=source, name=name):
                 if self.is_redundant_alias(source, name):
@@ -429,7 +486,7 @@ class _Emitter:
         """Multi-line code for an expression, or None if it has no good break."""
         match expression:
             case ir.Alias(expression=inner, name=name):
-                return self.suffixed(inner, f".alias({python_string(name)})", column)
+                return self.suffixed(inner, f".alias({self.column_name(name)})", column)
             case ir.BinaryOp():
                 return self.operator_chain(expression, column)
             case ir.UnaryOp(op=op, operand=operand):
@@ -570,6 +627,9 @@ class _Emitter:
                 self.uses_functions = True
                 name = f"{spark_identifier(qualifier)}.*"
                 return f"F.col({python_string(name)})", _ATOM
+            case ir.HelperColumn(name=name):
+                self.uses_functions = True
+                return f"F.col({self.column_name(name)})", _ATOM
             case ir.Column(name_parts=parts):
                 self.uses_functions = True
                 return f"F.col({python_string(spark_identifier(parts))})", _ATOM
@@ -596,7 +656,7 @@ class _Emitter:
                 return f"F.lit({self.python_value(value)})", _ATOM
             case ir.Alias(expression=inner, name=name):
                 return (
-                    f"{self.operand(inner, _ATOM)}.alias({python_string(name)})",
+                    f"{self.operand(inner, _ATOM)}.alias({self.column_name(name)})",
                     _ATOM,
                 )
             case ir.UnaryOp(op=op, operand=operand):
@@ -793,6 +853,7 @@ def _walk(plan: ir.Relation) -> Iterator[ir.Relation]:
             case (
                 ir.RenameColumns(source=source)
                 | ir.RenameByName(source=source)
+                | ir.AllocateHelpers(source=source)
                 | ir.WithColumn(source=source)
                 | ir.DropColumns(source=source)
                 | ir.RelationAlias(source=source)

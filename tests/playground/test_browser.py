@@ -211,6 +211,18 @@ def test_a_sas_program(session: dict) -> None:
     assert page.text_content("#language") == "SQL"
 
 
+def test_helper_names_are_bound_in_generated_code_in_browser(session: dict) -> None:
+    page = session["page"]
+    sql = "SELECT * FROM orders QUALIFY ROW_NUMBER() OVER (ORDER BY order_id)=1"
+
+    convert_in_page(page, sql, "")
+
+    assert page.is_hidden("#errors")
+    assert page.text_content("#code") == sparkshift.convert(sql).code
+    assert ".columns" in page.text_content("#code")
+    assert "while helper_column_key(_qualify_1_name)" in page.text_content("#code")
+
+
 def test_ctrl_enter_converts(session: dict) -> None:
     page = session["page"]
     page.select_option("#dialect", "")

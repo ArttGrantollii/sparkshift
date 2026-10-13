@@ -3287,12 +3287,15 @@ def test_select_star_with_qualify_keeps_plain_names() -> None:
     assert isinstance(plan, ir.DropColumns)
     assert isinstance(plan.source, ir.Filter)
     projection = plan.source.source
+    name = ir.HelperName("_qualify_1", scope=1)
     assert projection == Project(
-        TableScan(("t",)), (Star(), Alias(_window(), "_qualify_1"))
+        ir.AllocateHelpers(TableScan(("t",)), (name,)),
+        (Star(), Alias(_window(), name)),
     )
+    assert plan.names == (name,)
     assert plan.source.condition == BinaryOp(
         BinaryOperator.AND,
-        BinaryOp(BinaryOperator.EQUAL, _helper(1), Literal(1)),
+        BinaryOp(BinaryOperator.EQUAL, ir.HelperColumn(name), Literal(1)),
         BinaryOp(BinaryOperator.GREATER, C, Literal(0)),
     )
 

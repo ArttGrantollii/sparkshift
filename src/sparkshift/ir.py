@@ -10,7 +10,7 @@ the syntax of any source language.
 This module must not import SQLGlot or PySpark.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, fields, replace
 from decimal import Decimal
 from enum import Enum
@@ -42,6 +42,25 @@ class BinaryOperator(Enum):
 class UnaryOperator(Enum):
     NEGATE = "-"
     NOT = "~"
+
+
+@dataclass(frozen=True)
+class HelperName:
+    """A symbolic temporary name, distinct from every user column name.
+
+    The scope distinguishes independent allocations with the same preference.
+    The generated program binds it using the actual input's column names.
+    """
+
+    preferred: str
+    scope: int = 0
+
+
+@dataclass(frozen=True)
+class HelperColumn:
+    """A reference to a helper name bound by AllocateHelpers."""
+
+    name: HelperName
 
 
 @dataclass(frozen=True)
@@ -78,7 +97,7 @@ class Alias:
     """An expression with an output column name."""
 
     expression: "Expression"
-    name: str
+    name: str | HelperName
 
 
 class AggregateFunction(Enum):
@@ -309,6 +328,7 @@ class ScalarSubquery:
 
 Expression: TypeAlias = (
     Column
+    | HelperColumn
     | OuterColumn
     | InSubquery
     | Exists
@@ -419,12 +439,25 @@ class RenameByName:
 
 
 @dataclass(frozen=True)
+class AllocateHelpers:
+    """Bind collision-free helper names before transforming the source.
+
+    Reserve its actual columns and visible user names that later operations
+    create. Inspecting schema metadata does not collect the source's rows.
+    """
+
+    source: "Relation"
+    columns: tuple[HelperName, ...]
+    reserved: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class WithColumn:
     """Set a column to an expression of the source's columns: an existing
     column keeps its place, a new one is added at the end."""
 
     source: "Relation"
-    name: str
+    name: str | HelperName
     expression: Expression
 
 
@@ -433,7 +466,7 @@ class DropColumns:
     """Remove columns by name, such as helper columns a filter needed."""
 
     source: "Relation"
-    names: tuple[str, ...]
+    names: tuple[str | HelperName, ...]
 
     def __post_init__(self) -> None:
         if not self.names:
@@ -597,6 +630,7 @@ Relation: TypeAlias = (
     | Named
     | RenameColumns
     | RenameByName
+    | AllocateHelpers
     | WithColumn
     | DropColumns
     | RelationAlias
@@ -610,3 +644,27 @@ Relation: TypeAlias = (
     | Sort
     | Limit
 )
+
+
+def helper_reference(name: str | HelperName) -> Expression:
+    """A reference to a statically chosen or runtime-bound helper name."""
+    return HelperColumn(name) if isinstance(name, HelperName) else Column((name,))
+
+
+def unique_column_name(preferred: str, taken: Iterable[str]) -> str:
+    """Choose a name outside ``taken``, conservatively ignoring case."""
+    occupied = {column_key(name) for name in taken}
+    name, suffix = preferred, 1
+    while column_key(name) in occupied:
+        suffix += 1
+        name = f"{preferred}_{suffix}"
+    return name
+
+
+def column_key(name: str) -> str:
+    """Conservative Unicode key for Spark's case-insensitive resolver.
+
+    Uppercase first maps dotless i to I; dropping the combining dot also
+    protects against dotted I. Extra equivalences only reserve more names.
+    """
+    return name.upper().casefold().replace("\u0307", "")

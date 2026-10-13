@@ -848,7 +848,7 @@ class _SasTranslator:
             self.aggregating = False
         if not self.check_names(names, query):
             return None
-        helper = _unique_helper("_having", tuple(names))
+        helper = _unique_helper("_having", (*key_names, *names))
         if having is not None:
             aggregates.append(ir.Alias(having, helper))
         result: ir.Relation = ir.Aggregate(relation, tuple(keys), tuple(aggregates))
@@ -1172,9 +1172,10 @@ class _SasTranslator:
             # The branches change what the condition reads: keep its value
             # from before them.
             self.helpers += 1
-            helper = f"_if_{self.helpers}"
+            helper = ir.HelperName(f"_if_{self.helpers}")
+            relation = ir.AllocateHelpers(relation, (helper,), tuple(sorted(assigned)))
             relation = ir.WithColumn(relation, helper, condition)
-            condition = ir.Column((helper,))
+            condition = ir.HelperColumn(helper)
         relation = self.statement(statement.then, relation, _and(guard, condition))
         if statement.otherwise is not None:
             otherwise = _and(guard, _not(condition))
@@ -2155,13 +2156,7 @@ def _percentage(partition: tuple[str, ...], counted: str) -> ir.Expression:
 
 def _unique_helper(name: str, taken: tuple[str, ...]) -> str:
     """A helper column name that is not one of ``taken``."""
-    lowered = {other.lower() for other in taken}
-    suffix = 1
-    candidate = name
-    while candidate.lower() in lowered:
-        suffix += 1
-        candidate = f"{name}_{suffix}"
-    return candidate
+    return ir.unique_column_name(name, taken)
 
 
 def _is_summary(call: Call) -> bool:
