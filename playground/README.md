@@ -24,15 +24,29 @@ The demo accepts at most **50,000 UTF-8 bytes** of input, checked both before th
 JavaScript-to-Python call and in the bridge. The bridge publishes the limit in
 `about()` so the UI and Python use the same policy. The CLI and library do not
 inherit this demo restriction. This is a conservative input policy, not a
-measured performance guarantee: conversion still runs on the main thread and
-has no cancellation or execution timeout. Worker isolation remains future work.
+measured performance guarantee. Python and SQLGlot run in a module Web Worker;
+the page stays available while conversion runs. Each conversion has a
+**10-second deadline** and a **Cancel conversion** button. Editing source or
+dialect during conversion also cancels it and invalidates its result. A deadline,
+cancellation or worker crash terminates the worker and reloads Python; it does
+not automatically rerun the cancelled query. Loading Python has a **120-second
+deadline**; failed startup offers **Retry loading Python**. These are demo
+policies, not limits on the Python library or CLI.
+
+Restarting a worker reloads its Python runtime and packages, so recovery can take
+several seconds depending on the connection and browser cache. Conversion timing
+starts after Python is ready. Results are matched to their request and input
+revision so late replies cannot replace the current query's output. See
+[ADR 0009](../docs/adr/0009-isolate-browser-conversion-in-a-worker.md).
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `index.html`, `style.css` | The page |
-| `app.js` | Loads Pyodide and the wheels, and connects the page to the bridge |
+| `app.js` | Owns UI state, renders results and handles cancellation/recovery |
+| `worker-client.js` | Matches request IDs, bounds loading/conversion time, and terminates workers |
+| `worker.js` | Loads Pyodide and the wheels and invokes the Python bridge off the UI thread |
 | `bridge.py` | Runs inside Pyodide: converts SQL and returns JSON with the code or the issues |
 
 `tools/build_playground.py` assembles the site: these files, the SparkShift
@@ -64,6 +78,10 @@ Pages after CI passes on `main`, from the exact commit CI tested.
   must contact no other sites, fit a phone screen, and pass an axe-core
   accessibility audit (WCAG 2.1 AA) in light and dark mode, with and without
   warnings. Fault injection covers Python failures and malformed JSON; tests
-  also exercise Unicode byte limits and recovery. Run it
+  also exercise Unicode byte limits and recovery. Worker tests block real Python
+  with a CPU loop and check page timers, cancellation, input edits, deadlines,
+  successful recovery, stale reply rejection and crash handling. A virtual page
+  clock accelerates conversion deadlines; a stub worker checks a shorter injected
+  startup deadline. Production limits are unchanged by the tests. Run it
   with `uv run playwright install chromium` once, then
   `uv run pytest -m browser`.

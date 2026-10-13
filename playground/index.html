@@ -4,10 +4,11 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <!-- Scripts come only from this site and Pyodide's pinned CDN release.
-         'wasm-unsafe-eval' lets the browser compile Pyodide's WebAssembly. -->
+         Module worker imports use worker-src too, so the pinned Pyodide CDN
+         is allowed there. 'wasm-unsafe-eval' permits WebAssembly compilation. -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net 'wasm-unsafe-eval'; connect-src 'self' https://cdn.jsdelivr.net; style-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'"
+      content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net 'wasm-unsafe-eval'; worker-src 'self' https://cdn.jsdelivr.net; connect-src 'self' https://cdn.jsdelivr.net; style-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'"
     />
     <title>SparkShift playground: SQL and SAS to PySpark</title>
     <meta
@@ -15,7 +16,6 @@
       content="Convert SQL and SAS into readable PySpark in your browser. Your code never leaves this page."
     />
     <link rel="stylesheet" href="style.css" />
-    <script src="https://cdn.jsdelivr.net/pyodide/v314.0.7/full/pyodide.js"></script>
     <script type="module" src="app.js"></script>
   </head>
   <body>
@@ -45,6 +45,8 @@
         <button id="convert" type="button" disabled>
           Convert <kbd>Ctrl</kbd>+<kbd>Enter</kbd>
         </button>
+        <button id="cancel" class="secondary" type="button" hidden>Cancel conversion</button>
+        <button id="retry" class="secondary" type="button" hidden>Retry loading Python</button>
         <button id="share" class="secondary" type="button" disabled>Copy link</button>
       </div>
 

@@ -262,8 +262,13 @@ unexpected failures show an error instead of leaving old code available.
 
 The browser demo accepts up to **50,000 UTF-8 bytes** of source code; the
 Python library and CLI do not impose this demo limit. Use the CLI for larger
-files. Conversion still runs on the browser's main thread: the size limit and
-error handling are safeguards, not an execution timeout or cancellation system.
+files. Python conversion runs in a Web Worker, keeping the page available. A
+conversion has a 10-second deadline; **Cancel conversion** terminates its worker;
+editing source or dialect also cancels an active conversion. Cancelled, timed-out
+or crashed workers are terminated and Python reloads before the next attempt.
+Startup stops after 120 seconds and offers a retry. These are browser-demo limits,
+not limits on the Python library or CLI. See the
+[playground documentation](playground/README.md) for recovery behavior.
 
 ## Examples
 

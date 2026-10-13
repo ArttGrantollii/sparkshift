@@ -1,0 +1,40 @@
+// Python runs only here. Messages contain source and JSON results, never
+// executable Python supplied by the visitor.
+import { loadPyodide } from "https://cdn.jsdelivr.net/pyodide/v314.0.7/full/pyodide.mjs";
+
+let convertForPage = null;
+
+async function fetchOk(path) {
+  const response = await fetch(path);
+  if (!response.ok) throw new Error("Could not load the browser runtime.");
+  return response;
+}
+
+self.onmessage = async ({ data: { id, type, sql, dialect } }) => {
+  try {
+    if (type === "init") {
+      const [pyodide, manifest] = await Promise.all([
+        loadPyodide(),
+        fetchOk("manifest.json").then((response) => response.json()),
+      ]);
+      for (const wheel of manifest.wheels) {
+        const buffer = await (await fetchOk(wheel)).arrayBuffer();
+        pyodide.unpackArchive(buffer, "wheel");
+      }
+      pyodide.runPython(await (await fetchOk("bridge.py")).text());
+      convertForPage = pyodide.globals.get("convert_for_page");
+      const aboutFunction = pyodide.globals.get("about");
+      const about = JSON.parse(aboutFunction());
+      aboutFunction.destroy();
+      self.postMessage({ id, result: { about, manifest, pyodideVersion: pyodide.version } });
+    } else if (type === "convert" && convertForPage !== null) {
+      const result = JSON.parse(convertForPage(sql, dialect));
+      self.postMessage({ id, result });
+    } else {
+      throw new Error("Unexpected worker request.");
+    }
+  } catch {
+    // Tracebacks and pasted source never cross an unexpected-error boundary.
+    self.postMessage({ id, error: true });
+  }
+};

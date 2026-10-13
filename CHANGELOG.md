@@ -270,6 +270,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Browser conversion runs in a module Web Worker, with cancellation on request
+  or input changes, a 10-second conversion deadline and worker reload after
+  interruption or crashes. Loading has a 120-second deadline and a retry action.
+  Request IDs and input revisions prevent stale responses from restoring output.
+
 - Directory conversion checks all selected output names before converting or
   writing, rejecting same-stem SQL/SAS files, case-only variants, and output
   file/directory conflicts with a usage error listing every conflicting mapping.

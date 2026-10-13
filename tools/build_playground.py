@@ -18,7 +18,14 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PLAYGROUND_FILES = ["index.html", "style.css", "app.js", "bridge.py"]
+PLAYGROUND_FILES = [
+    "index.html",
+    "style.css",
+    "app.js",
+    "worker-client.js",
+    "worker.js",
+    "bridge.py",
+]
 
 
 def build(output: Path) -> None:

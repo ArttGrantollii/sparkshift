@@ -167,3 +167,19 @@ orders with no or unknown customers, and a customer with no orders.
 
 `tests/equivalence/test_datasets.py` fails if any of these edge cases is
 removed, because weakening the data silently weakens every test that uses it.
+
+
+## Browser worker recovery
+
+The playground's worker tests exercise real CPU-bound Python: an injected bridge
+loops indefinitely on one specific input. The page must still run a JavaScript
+timer, clear previous output, allow cancellation or input editing, terminate the
+blocked worker, reload Python and successfully convert new input. Other tests
+inject an unmatched request ID and a runtime crash, check retry after a CDN
+failure, and verify that successful requests clear their deadlines.
+
+Conversion deadline tests use Playwright's virtual page clock to advance the
+10-second timer; the Python worker still executes on its own thread. A startup
+test injects a shorter timer and a worker that never replies. These fixtures do
+not add production test hooks or relax production deadlines. Existing tests now
+wait for asynchronous conversions to settle before comparing exact output.

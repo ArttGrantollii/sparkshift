@@ -72,7 +72,7 @@ def session(browser: Any, site_url: str) -> Iterator[dict]:
     page = context.new_page()
     origins: set[str] = set()
     errors: list[str] = []
-    page.on("request", lambda request: origins.add(urlsplit(request.url).hostname))
+    context.on("request", lambda request: origins.add(urlsplit(request.url).hostname))
     page.on("pageerror", lambda error: errors.append(str(error)))
     page.on(
         "console",
@@ -90,6 +90,7 @@ def convert_in_page(page: Any, sql: str, dialect: str) -> None:
     page.select_option("#dialect", dialect)
     page.fill("#sql", sql)
     page.click("#convert")
+    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
 
 
 # --- Converting ---------------------------------------------------------------
@@ -129,6 +130,7 @@ def test_every_example_matches_the_command_line(session: dict) -> None:
 
     for index in range(len(examples)):
         page.select_option("#example", str(index))
+        page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
         dialect = page.input_value("#dialect")
         sql = page.input_value("#sql")
 
@@ -229,6 +231,7 @@ def test_ctrl_enter_converts(session: dict) -> None:
     page.fill("#sql", "SELECT name FROM customers")
 
     page.press("#sql", "Control+Enter")
+    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
 
     assert (
         page.text_content("#code")
@@ -519,5 +522,318 @@ def test_initial_conversion_failure_is_not_reported_as_ready(
         assert page.text_content("#code") == sparkshift.convert("SELECT id FROM t").code
         assert page.is_hidden("#errors")
         assert page.is_enabled("#copy")
+    finally:
+        context.close()
+
+
+def test_python_runtime_is_isolated_from_the_page(session: dict) -> None:
+    page = session["page"]
+    assert page.evaluate("typeof loadPyodide") == "undefined"
+    assert page.locator("#cancel").count() == 1
+    assert page.is_hidden("#cancel")
+
+
+@pytest.fixture
+def blocked_worker_page(browser: Any, site_url: str) -> Iterator[Any]:
+    """Real Pyodide, with a CPU-bound Python fault on one specific input."""
+    context = browser.new_context()
+
+    def bridge_fault(route: Any) -> None:
+        response = route.fetch()
+        injected = response.text() + "\n_original = convert_for_page\n"
+        injected += (
+            "def convert_for_page(sql, dialect):\n"
+            "    if sql == 'SELECT worker_busy FROM t':\n"
+            "        from js import console\n"
+            "        console.log('worker CPU fault entered')\n"
+            "        while True:\n"
+            "            pass\n"
+            "    return _original(sql, dialect)\n"
+        )
+        route.fulfill(response=response, body=injected)
+
+    context.route("**/bridge.py", bridge_fault)
+    page = context.new_page()
+    try:
+        page.goto(site_url)
+        page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+        # Do not run the blocking fault if worker isolation regresses.
+        assert page.evaluate("typeof loadPyodide") == "undefined"
+        yield page
+    finally:
+        context.close()
+
+
+def block_python(page: Any) -> None:
+    convert_in_page(page, WARNING_PROGRAM, "sas")
+    page.select_option("#dialect", "")
+    page.fill("#sql", "SELECT worker_busy FROM t")
+    with page.expect_console_message(
+        predicate=lambda message: message.text == "worker CPU fault entered"
+    ):
+        page.click("#convert")
+    assert page.is_visible("#cancel")
+    assert page.is_disabled("#convert")
+    assert page.is_hidden("#output")
+    assert page.is_hidden("#warnings")
+    assert page.is_disabled("#copy")
+    # A timer still runs on the UI thread while Python is burning CPU.
+    assert (
+        page.evaluate(
+            "() => new Promise(resolve => setTimeout(() => resolve('responsive'), 20))"
+        )
+        == "responsive"
+    )
+
+
+@pytest.mark.parametrize("action", ["cancel", "source", "dialect"])
+def test_a_blocked_python_worker_can_be_cancelled_and_recovered(
+    blocked_worker_page: Any, action: str
+) -> None:
+    page = blocked_worker_page
+    block_python(page)
+
+    def delay_reload(route: Any) -> None:
+        response = route.fetch()
+        injected = response.text().replace(
+            '    if (type === "init") {',
+            '    if (type === "init") {\n'
+            "      await new Promise(resolve => setTimeout(resolve, 500));",
+        )
+        route.fulfill(response=response, body=injected)
+
+    page.context.route("**/worker.js", delay_reload)
+    if action == "cancel":
+        page.click("#cancel")
+    elif action == "source":
+        page.fill("#sql", "SELECT name FROM customers")
+    else:
+        page.select_option("#dialect", "postgres")
+    # Readiness must not be claimed while the replacement runtime is loading.
+    assert page.is_disabled("#convert")
+    assert "Reloading Python" in page.text_content("#status")
+    assert "Ready" not in page.text_content("#status")
+    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    assert page.is_hidden("#cancel")
+    assert page.is_hidden("#output")
+    assert page.is_disabled("#copy")
+    assert "cancelled" in page.text_content(
+        "#status"
+    ) or "Input changed" in page.text_content("#status")
+    convert_in_page(page, "SELECT name FROM customers", "")
+    assert (
+        page.text_content("#code")
+        == sparkshift.convert("SELECT name FROM customers").code
+    )
+    assert page.is_hidden("#errors")
+    assert page.is_enabled("#copy")
+
+
+def test_blocked_python_is_terminated_at_the_conversion_deadline(
+    blocked_worker_page: Any,
+) -> None:
+    page = blocked_worker_page
+    # Accelerate the real production deadline, rather than waiting ten seconds.
+    page.clock.install()
+    block_python(page)
+    page.clock.fast_forward(10_001)
+    page.wait_for_selector("#errors:has-text('10-second limit')")
+    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    assert page.is_hidden("#output")
+    assert page.is_disabled("#copy")
+    assert "CLI" in page.text_content("#errors")
+    assert "Conversion failed" in page.text_content("#status")
+    convert_in_page(page, "SELECT id FROM orders", "")
+    assert (
+        page.text_content("#code") == sparkshift.convert("SELECT id FROM orders").code
+    )
+    assert page.is_hidden("#errors")
+
+
+def test_successful_requests_disarm_their_deadlines(blocked_worker_page: Any) -> None:
+    page = blocked_worker_page
+    page.clock.install()
+    convert_in_page(page, "SELECT id FROM orders", "")
+    page.clock.fast_forward(10_001)
+    assert page.is_hidden("#errors")
+    assert page.is_enabled("#convert")
+    assert page.is_enabled("#copy")
+    assert (
+        page.text_content("#code") == sparkshift.convert("SELECT id FROM orders").code
+    )
+    convert_in_page(page, "SELECT name FROM customers", "")
+    assert (
+        page.text_content("#code")
+        == sparkshift.convert("SELECT name FROM customers").code
+    )
+
+
+def test_stale_worker_messages_cannot_replace_current_output(
+    browser: Any, site_url: str
+) -> None:
+    context = browser.new_context()
+
+    def stale_reply(route: Any) -> None:
+        response = route.fetch()
+        injected = response.text().replace(
+            "self.postMessage({ id, result });",
+            """if (sql === "SELECT id FROM orders") {
+              self.postMessage({ id: id - 1, result: {
+                ok: true, code: "stale result", warnings: []
+              } });
+              await new Promise(resolve => setTimeout(resolve, 200));
+            }
+            self.postMessage({ id, result });""",
+        )
+        route.fulfill(response=response, body=injected)
+
+    context.route("**/worker.js", stale_reply)
+    page = context.new_page()
+    try:
+        page.goto(site_url)
+        page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+        convert_in_page(page, "SELECT id FROM orders", "")
+        assert (
+            page.text_content("#code")
+            == sparkshift.convert("SELECT id FROM orders").code
+        )
+        assert page.is_hidden("#errors")
+    finally:
+        context.close()
+
+
+def test_worker_crash_clears_output_and_reloads_python(
+    browser: Any, site_url: str
+) -> None:
+    context = browser.new_context()
+
+    def crash(route: Any) -> None:
+        response = route.fetch()
+        injected = response.text().replace(
+            "  try {",
+            """  if (type === "convert" && sql === "SELECT forced_crash FROM t") {
+              setTimeout(() => { throw new Error("private crash sentinel"); }, 0);
+              return;
+            }
+            try {""",
+            1,
+        )
+        route.fulfill(response=response, body=injected)
+
+    context.route("**/worker.js", crash)
+    page = context.new_page()
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    try:
+        page.goto(site_url)
+        page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+        convert_in_page(page, WARNING_PROGRAM, "sas")
+        convert_in_page(page, "SELECT forced_crash FROM t", "")
+        assert page.is_hidden("#output")
+        assert page.is_hidden("#warnings")
+        assert page.is_disabled("#copy")
+        assert "unexpectedly" in page.text_content("#errors")
+        assert "private crash sentinel" not in page.text_content("#errors")
+        convert_in_page(page, "SELECT id FROM orders", "")
+        assert (
+            page.text_content("#code")
+            == sparkshift.convert("SELECT id FROM orders").code
+        )
+        assert errors == []
+    finally:
+        context.close()
+
+
+def test_startup_failure_offers_a_working_retry(browser: Any, site_url: str) -> None:
+    context = browser.new_context()
+
+    def blocked(route: Any) -> None:
+        route.abort()
+
+    context.route("https://cdn.jsdelivr.net/**", blocked)
+    page = context.new_page()
+    try:
+        page.goto(site_url)
+        page.wait_for_selector("#status:has-text('could not start')")
+        assert page.is_visible("#retry")
+        assert page.is_disabled("#convert")
+        assert page.is_disabled("#copy")
+        context.unroute("https://cdn.jsdelivr.net/**", blocked)
+        page.click("#retry")
+        page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+        assert page.is_hidden("#retry")
+        convert_in_page(page, "SELECT id FROM orders", "")
+        assert (
+            page.text_content("#code")
+            == sparkshift.convert("SELECT id FROM orders").code
+        )
+    finally:
+        context.close()
+
+
+def test_unresponsive_startup_is_bounded(browser: Any, site_url: str) -> None:
+    context = browser.new_context()
+    context.route(
+        "**/worker.js",
+        lambda route: route.fulfill(
+            content_type="text/javascript", body="self.onmessage = () => {};"
+        ),
+    )
+
+    def shorter_deadline(route: Any) -> None:
+        response = route.fetch()
+        route.fulfill(
+            response=response,
+            body=response.text().replace(
+                "STARTUP_TIMEOUT_MS = 120_000", "STARTUP_TIMEOUT_MS = 500"
+            ),
+        )
+
+    context.route("**/worker-client.js", shorter_deadline)
+    page = context.new_page()
+    try:
+        page.goto(site_url)
+        page.wait_for_selector("#status:has-text('could not start')")
+        assert page.is_visible("#retry")
+        assert page.is_disabled("#convert")
+        assert page.is_disabled("#copy")
+        assert page.is_hidden("#cancel")
+    finally:
+        context.close()
+
+
+def test_worker_crash_while_idle_invalidates_output_and_recovers(
+    browser: Any, site_url: str
+) -> None:
+    context = browser.new_context()
+
+    def crash_after_reply(route: Any) -> None:
+        response = route.fetch()
+        injected = response.text().replace(
+            "self.postMessage({ id, result });",
+            """self.postMessage({ id, result });
+            if (sql === "SELECT idle_crash FROM t") {
+              setTimeout(() => { throw new Error("idle crash sentinel"); }, 200);
+            }""",
+        )
+        route.fulfill(response=response, body=injected)
+
+    context.route("**/worker.js", crash_after_reply)
+    page = context.new_page()
+    try:
+        page.goto(site_url)
+        page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+        convert_in_page(page, "SELECT idle_crash FROM t", "")
+        page.wait_for_selector("#errors:has-text('stopped unexpectedly')")
+        page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+        assert page.is_hidden("#output")
+        assert page.is_disabled("#copy")
+        assert "idle crash sentinel" not in page.text_content("#errors")
+        convert_in_page(page, "SELECT id FROM orders", "")
+        assert (
+            page.text_content("#code")
+            == sparkshift.convert("SELECT id FROM orders").code
+        )
+        assert page.is_hidden("#errors")
     finally:
         context.close()
