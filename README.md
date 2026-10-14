@@ -468,6 +468,13 @@ rejects it rather than guess:
   SQL Server often compare and sort strings, including in `LIKE`, `REPLACE`,
   and `ORDER BY`, case-insensitively; Spark compares and sorts them
   case-sensitively, so `'Z'` sorts before `'a'`.
+- SQL Server ignores trailing spaces when it compares strings with `=`, `<`,
+  or `>` (ANSI padding; `LIKE` is the exception), so `'abc ' = 'abc'` is true
+  there and false in Spark. Only the column types would tell where this
+  applies; use `RTRIM` on both sides to compare the same way in both.
+- MySQL's `AVG` of integers or `DECIMAL` values returns a `DECIMAL`, with a
+  fixed number of decimal places; Spark returns a double. The averages differ
+  only by MySQL's rounding of its last decimal place.
 - Oracle treats an empty string as NULL; SparkShift does not emulate this.
 - Casting an exact half of a floating-point value to an integer: PostgreSQL
   and MySQL round it to even (`2.5` → `2`, checked on both servers), while the
