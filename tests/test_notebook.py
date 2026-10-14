@@ -141,3 +141,40 @@ def test_without_a_source() -> None:
         "catalog and schema: run `USE CATALOG` and `USE SCHEMA` first if they are "
         "elsewhere.",
     ]
+
+
+def test_multiline_sas_warning_remains_notebook_metadata() -> None:
+    result = sparkshift.convert(
+        "proc sort data=customers out=unique_customers nodupkey;\n"
+        "by customer_id;\nrun;",
+        dialect="sas",
+    )
+    assert result.warnings
+    notebook = to_notebook(result, source="deduplicate.sas", dialect="sas")
+    assert ast.dump(ast.parse(notebook)) == ast.dump(
+        ast.parse(result.code + "\ndisplay(result)\n")
+    )
+    assert all(line.startswith("# MAGIC") for line in cells(notebook)[0].splitlines())
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r", "\r\n"])
+@pytest.mark.parametrize("field", ["source", "dialect", "message", "sql", "hint"])
+def test_metadata_cannot_create_executable_code_or_notebook_cells(
+    newline: str, field: str
+) -> None:
+    payload = newline.join(
+        ["metadata", "# COMMAND ----------", "raise RuntimeError('injected')"]
+    )
+    values = {"message": "warning", "sql": "fragment", "hint": "guidance"}
+    options = {"source": "query.sql", "dialect": "sas"}
+    if field in values:
+        values[field] = payload
+    else:
+        options[field] = payload
+    result = ConversionResult("result = spark.table('t')\n", (Diagnostic(**values),))
+    notebook = to_notebook(result, **options)
+    assert ast.dump(ast.parse(notebook)) == ast.dump(
+        ast.parse(result.code + "\ndisplay(result)\n")
+    )
+    assert notebook.splitlines().count(CELL_SEPARATOR) == 2
+    assert all(line.startswith("# MAGIC") for line in cells(notebook)[0].splitlines())

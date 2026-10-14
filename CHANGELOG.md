@@ -270,6 +270,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep every line of notebook metadata inside Markdown comments, including
+  multiline source names and diagnostics containing notebook cell markers.
+  Metadata can no longer add executable Python or extra notebook cells.
+
+
 - Browser conversion runs in a module Web Worker, with cancellation on request
   or input changes, a 10-second conversion deadline and worker reload after
   interruption or crashes. Loading has a 120-second deadline and a retry action.

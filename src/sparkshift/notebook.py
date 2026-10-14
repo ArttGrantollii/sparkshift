@@ -90,7 +90,10 @@ def _code_span(text: str) -> str:
 
 
 def _markdown(lines: list[str]) -> str:
-    magic = [f"{_MAGIC} %md"] + [f"{_MAGIC} {line}".rstrip() for line in lines]
+    # Metadata can contain newlines, including notebook cell markers. Prefix
+    # every physical line so it cannot become Python or a new notebook cell.
+    physical_lines = "\n".join(lines).splitlines()
+    magic = [f"{_MAGIC} %md"] + [f"{_MAGIC} {line}".rstrip() for line in physical_lines]
     return "\n".join(magic)
 
 
