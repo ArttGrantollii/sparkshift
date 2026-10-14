@@ -82,6 +82,34 @@ def test_helper_cannot_overwrite_a_variable_assigned_in_its_branches(
     assert not differences(expected, actual), (expected, actual, code)
 
 
+@pytest.mark.parametrize("nested", [False, True])
+def test_sas_if_with_known_columns_names_its_helper_statically(
+    helper_tables: "SparkSession", nested: bool
+) -> None:
+    # KEEP= lists every input column, so the helper's name is chosen during
+    # conversion: no schema lookup in the generated code, and _if_1 survives.
+    inner = "if id > 1 then do; id=id+10; amount=amount+1; end; " if nested else ""
+    program = (
+        "data output; set helper_inputs(keep=id amount _if_1 _IF_1__); "
+        f"if amount > 0 then do; amount=0; {inner}id=id+1; end; "
+        "else do; amount=1; id=id+2; end; run;"
+    )
+    code = sparkshift.convert(program, dialect="sas").code
+    assert ".columns" not in code
+    assert "while" not in code
+    actual = snapshot(run_generated(helper_tables, code))
+    nested_id = "CASE WHEN id > 1 THEN id + 11 ELSE id + 1 END" if nested else "id+1"
+    nested_amount = "CASE WHEN id > 1 THEN 1 ELSE 0 END" if nested else "0"
+    expected = snapshot(
+        helper_tables.sql(
+            f"SELECT CASE WHEN amount > 0 THEN {nested_id} ELSE id+2 END AS id, "
+            f"CAST(CASE WHEN amount > 0 THEN {nested_amount} ELSE 1 END AS DOUBLE) "
+            "AS amount, _if_1, `_IF_1__` FROM helper_inputs"
+        )
+    )
+    assert not differences(expected, actual), (expected, actual, code)
+
+
 @pytest.mark.parametrize(
     "sql",
     [

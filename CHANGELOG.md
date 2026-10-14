@@ -311,6 +311,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   actual input schema at execution; aggregate helpers also reserve unselected
   grouping keys. Before, helpers could overwrite and drop data or make a
   valid query ambiguous.
+- A SAS IF helper in a DATA step whose `SET` lists its columns with `KEEP=`
+  now gets its name during conversion (`_if_1`, or `_if_1_2` when that name
+  is taken), instead of generated code that looks up the input's column names
+  when it runs. The lookup remains where the input's columns are unknown.
 - SQL wildcard modifiers (`EXCEPT`/`EXCLUDE`, `REPLACE`, `RENAME`, `ILIKE`)
   are now rejected with rewrite guidance in projections and `COUNT(*)`,
   including qualified and nested queries. Previously they were silently

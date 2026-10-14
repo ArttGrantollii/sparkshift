@@ -472,23 +472,74 @@ def test_a_block_assigns_each_variable_under_its_conditions() -> None:
 
 
 def test_a_condition_the_branch_changes_is_kept_in_a_helper_column() -> None:
+    # KEEP= lists the input's columns, so the helper's name is chosen now.
     relation = step("if x > 1 then do; x = 0; y = 1; end;", "t(keep=x)")
 
-    name = ir.HelperName("_if_1")
-    helper = ir.HelperColumn(name)
-    checked_source = ir.AllocateHelpers(ir.Project(T, (X,)), (name,), ("x", "y"))
+    helper = Column(("_if_1",))
     assert relation == ir.DropColumns(
         ir.WithColumn(
             ir.WithColumn(
-                ir.WithColumn(checked_source, name, GREATER_1),
+                ir.WithColumn(ir.Project(T, (X,)), "_if_1", GREATER_1),
                 "x",
                 ir.Case(((helper, Literal(0)),), X),
             ),
             "y",
             ir.Case(((helper, Literal(1)),)),
         ),
-        (name,),
+        ("_if_1",),
     )
+
+
+@pytest.mark.parametrize(
+    ("program", "dataset", "expected"),
+    [
+        # An input column or a variable of the step has the preferred name.
+        ("if x > 1 then do; x = 0; y = 1; end;", "t(keep=x _IF_1)", "_if_1_2"),
+        ("if x > 1 then do; x = 0; _if_1 = 1; end;", "t(keep=x)", "_if_1_2"),
+        ("_if_1 = 5; if x > 1 then x = 0; else y = 1;", "t(keep=x)", "_if_1_2"),
+        ("if x > 1 then do; x = 0; y = 1; end;", "t(keep=x _if_1 _if_1_2)", "_if_1_3"),
+        # A RENAME= target is a column too.
+        (
+            "if x > 1 then do; x = 0; y = 1; end;",
+            "t(keep=x a rename=(a=_if_1))",
+            "_if_1_2",
+        ),
+    ],
+)
+def test_a_known_helper_name_avoids_every_known_column(
+    program: str, dataset: str, expected: str
+) -> None:
+    relation = step(program, dataset)
+
+    assert isinstance(relation, ir.DropColumns)
+    assert relation.names == (expected,)
+
+
+def test_nested_helpers_with_known_columns_have_distinct_names() -> None:
+    relation = step(
+        "if x > 1 then do; x = 0; if y > 1 then do; y = 0; x = 2; end; end;",
+        "t(keep=x y)",
+    )
+
+    assert isinstance(relation, ir.DropColumns)
+    assert relation.names == ("_if_1",)
+    inner = relation.source
+    while not isinstance(inner, ir.DropColumns):
+        assert isinstance(inner, ir.WithColumn)
+        inner = inner.source
+    assert inner.names == ("_if_2",)
+
+
+def test_a_helper_for_unknown_input_columns_is_bound_when_the_code_runs() -> None:
+    # Without KEEP=, any input column could be named _if_1.
+    relation = step("if x > 1 then do; x = 0; y = y + 1; end;", "t")
+
+    name = ir.HelperName("_if_1")
+    assert relation == ir.DropColumns(relation.source, (name,))  # type: ignore[union-attr]
+    first = relation
+    while isinstance(first, ir.DropColumns | ir.WithColumn):
+        first = first.source
+    assert first == ir.AllocateHelpers(T, (name,), ("x", "y"))
 
 
 def test_nested_conditions_combine() -> None:

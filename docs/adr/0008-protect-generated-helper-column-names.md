@@ -18,6 +18,12 @@ including unselected grouping keys, conservatively comparing names without
 case sensitivity, also protecting Unicode variants such as dotted and dotless
 I that Spark resolves as an ASCII I. SAS FREQ uses this policy for its percentage helper too.
 
+A SAS DATA step whose SET data set lists its columns with KEEP= has known
+columns too: its IF helpers get a static name outside the kept, renamed and
+assigned variables, with no schema inspection (amended 2026-10-14; at first
+every SAS IF helper was bound at execution, which added about ten lines of
+lookup code where the converter already knew every column).
+
 For unknown input columns, represent a temporary name with HelperName and
 references with HelperColumn. AllocateHelpers marks where names must be
 bound. The emitter assigns the source to a DataFrame variable and writes code
@@ -49,8 +55,8 @@ schema from its server.
 
 ## Consequences
 
-Helper-bearing SAS IF blocks and wildcard QUALIFY queries gain a short schema
-inspection section in their output. Generated source remains deterministic,
+Helper-bearing SAS IF blocks whose input columns are unknown, and wildcard
+QUALIFY queries, gain a short schema inspection section in their output. Generated source remains deterministic,
 while actual helper names depend on the input schema. This can add a metadata
 request on Spark Connect, but no row collection or additional dependency.
 

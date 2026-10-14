@@ -496,8 +496,9 @@ rejects it rather than guess:
   unselected columns it uses, because Spark does not allow window functions
   in a filter. Helpers are dropped after filtering. With wildcard projections,
   the generated code inspects column names at execution to choose unused
-  helper names; SAS IF blocks use the same protection. Known outputs reserve
-  selected aliases and grouping keys during conversion. See
+  helper names; SAS IF blocks use the same protection unless `KEEP=` on `SET`
+  lists the input's columns. Known outputs reserve selected aliases and
+  grouping keys during conversion. See
   [ADR 0008](docs/adr/0008-protect-generated-helper-column-names.md).
 
 ## How correctness is verified

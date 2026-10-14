@@ -274,6 +274,8 @@ class _SasTranslator:
         # and the input's columns when the program shows them.
         self.variables: dict[str, _Variable] = {}
         self.input_columns: set[str] | None = None
+        # Every variable the DATA step assigns, lower case.
+        self.step_assigned: set[str] = set()
         self.helpers = 0
         # In PROC SQL: columns may be qualified, and an equality of two
         # columns is translated with a warning. While ``aggregating``, a
@@ -341,6 +343,7 @@ class _SasTranslator:
         source = sets[0].datasets[0]
         relation, filtered = self.input_dataset(source)
         self.input_columns = _input_columns(source)
+        self.step_assigned = set().union(*(_assigned(s) for s in step.statements))
         if wheres and filtered:
             self.warn(
                 "WHERE statement ignored",
@@ -1178,16 +1181,27 @@ class _SasTranslator:
         if chain is not None:
             return self.chain(chain, relation, guard)
         condition = self.condition(statement.condition) or ir.Literal(True)
-        helper = None
+        helper: str | ir.HelperName | None = None
         assigned = _assigned(statement.then) | _assigned(statement.otherwise)
         if _variables(statement.condition) & assigned:
             # The branches change what the condition reads: keep its value
-            # from before them.
+            # from before them, in a helper column whose name no column has.
             self.helpers += 1
-            helper = ir.HelperName(f"_if_{self.helpers}")
-            relation = ir.AllocateHelpers(relation, (helper,), tuple(sorted(assigned)))
+            preferred = f"_if_{self.helpers}"
+            if self.input_columns is None:
+                # The input's columns are unknown: the generated code picks
+                # the name from them when it runs.
+                helper = ir.HelperName(preferred)
+                relation = ir.AllocateHelpers(
+                    relation, (helper,), tuple(sorted(assigned))
+                )
+            else:
+                # Every column is known: the input's, and the variables the
+                # step assigns. The counter keeps nested IFs' helpers apart.
+                taken = self.input_columns | self.step_assigned
+                helper = ir.unique_column_name(preferred, taken)
             relation = ir.WithColumn(relation, helper, condition)
-            condition = ir.HelperColumn(helper)
+            condition = ir.helper_reference(helper)
         relation = self.statement(statement.then, relation, _and(guard, condition))
         if statement.otherwise is not None:
             otherwise = _and(guard, _not(condition))

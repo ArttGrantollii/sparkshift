@@ -184,7 +184,11 @@ An `IF ... ELSE IF ... ELSE` chain that assigns one variable becomes a single
 `F.when(...).when(...).otherwise(...)`. Other blocks assign each variable under
 its condition. When a block changes a variable its condition reads, the
 condition is first saved in a helper column (`_if_1`), dropped afterwards, so
-it keeps its value from before the block.
+it keeps its value from before the block. When `KEEP=` on `SET` lists the
+input's columns, the helper's name is chosen during conversion to differ from
+every column and variable (`_if_1_2` if `_if_1` is taken). Otherwise the
+generated code reads the input's column names when it runs and picks an
+unused name then.
 
 ### Text length
 
