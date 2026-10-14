@@ -356,6 +356,7 @@ behavior:
 | `DATE_TRUNC('month', x)` | PostgreSQL | Returns a timestamp | `F.date_trunc("month", x)` |
 | `DATE_TRUNC(x, MONTH)` | BigQuery | Returns a date | `F.trunc(x, "month")` |
 | `FIRST_VALUE`, `LAST_VALUE` without a frame | Snowflake | Cover the whole window | `.rowsBetween(Window.unboundedPreceding, Window.unboundedFollowing)` |
+| `CAST(x AS INT)` and other integer types | PostgreSQL, MySQL, Snowflake, BigQuery | Round a fraction to the nearest integer (`2.7` → `3`); Spark's cast drops it | `F.round(x).cast("int")` |
 
 ### Timestamps and time zones
 
@@ -467,6 +468,11 @@ rejects it rather than guess:
   and `ORDER BY`, case-insensitively; Spark compares and sorts them
   case-sensitively, so `'Z'` sorts before `'a'`.
 - Oracle treats an empty string as NULL; SparkShift does not emulate this.
+- Casting an exact half of a floating-point value to an integer: PostgreSQL
+  and MySQL round it to even (`2.5` → `2`, checked on both servers), while the
+  generated `F.round(x)` rounds it away from zero (`3`), as both databases do
+  for exact numbers such as `DECIMAL`. Only the column type would tell them
+  apart. Snowflake does not document how it rounds halves.
 - In PostgreSQL, subtracting two dates gives a number of days; in Spark it
   gives an interval. SparkShift cannot tell that two columns are dates.
 - Date formatting and parsing with format strings (`TO_DATE(s, fmt)`,

@@ -322,6 +322,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   variable named in `KEEP=` truncated its later values; SAS ignores it. With
   `KEEP=` on `SET`, the output now matches; without it, a never-assigned
   `LENGTH` variable is rejected and a different order is warned about.
+- `CAST(x AS INT)` and other integer casts in PostgreSQL, MySQL, Snowflake,
+  and BigQuery dropped the fraction, as Spark's cast does (`2.7` → `2`); these
+  databases round (`3`). The generated code now rounds first,
+  `F.round(x).cast("int")`, checked on real PostgreSQL and MySQL. Their
+  floating-point halves round to even, which is documented as a limitation.
 - SQL wildcard modifiers (`EXCEPT`/`EXCLUDE`, `REPLACE`, `RENAME`, `ILIKE`)
   are now rejected with rewrite guidance in projections and `COUNT(*)`,
   including qualified and nested queries. Previously they were silently
