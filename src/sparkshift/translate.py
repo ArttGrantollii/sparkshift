@@ -150,6 +150,12 @@ _SIMPLE_CAST_TYPES = {
     exp.DataType.Type.DATE: "date",
     exp.DataType.Type.BOOLEAN: "boolean",
 }
+# Casting a number with a fraction to an integer type rounds it to the
+# nearest integer in these dialects; Spark drops the fraction.
+_ROUNDING_INTEGER_CAST_DIALECTS = frozenset(
+    {"postgres", "mysql", "snowflake", "bigquery"}
+)
+_INTEGER_SPARK_TYPES = frozenset({"tinyint", "smallint", "int", "bigint"})
 _STRING_CAST_TYPES = frozenset(
     {exp.DataType.Type.VARCHAR, exp.DataType.Type.NVARCHAR, exp.DataType.Type.TEXT}
 )
@@ -2343,6 +2349,14 @@ class _Translator:
         operand = self.expression(node.this)
         if data_type is None or operand is None:
             return None
+        if (
+            data_type in _INTEGER_SPARK_TYPES
+            and self.dialect in _ROUNDING_INTEGER_CAST_DIALECTS
+            and not _is_integer_or_text_literal(operand)
+        ):
+            # The value may have a fraction, which this dialect rounds away
+            # and Spark's cast truncates: round it first.
+            operand = ir.FunctionCall("round", (operand,))
         return ir.Cast(operand, data_type, safe)
 
     def spark_type(
@@ -3113,6 +3127,14 @@ def _without_implicit_time_cast(node: exp.Expression) -> exp.Expression:
 
 def _is_max_length(parameters: list[exp.Expression]) -> bool:
     return len(parameters) == 1 and parameters[0].name.upper() == "MAX"
+
+
+def _is_integer_or_text_literal(expression: ir.Expression) -> bool:
+    """A literal that is not a number with a fraction: an integer, or text,
+    which databases parse by their own text rules rather than round."""
+    return isinstance(expression, ir.Literal) and isinstance(
+        expression.value, int | str
+    )
 
 
 def _without_implicit_string_cast(node: exp.Expression) -> exp.Expression:
