@@ -257,6 +257,34 @@ current catalog and schema. In Python, `sparkshift.to_notebook(result,
 source="job.sql")` does the same. See
 [ADR 0007](docs/adr/0007-databricks-notebooks.md).
 
+### Uploading to a workspace
+
+`sparkshift upload` converts files into notebooks and imports them into a
+workspace folder, keeping their relative paths (`jobs/daily/orders.sql`
+becomes `FOLDER/daily/orders`). It needs the optional Databricks SDK:
+
+```bash
+pip install 'sparkshift[databricks]'
+export DATABRICKS_HOST=https://<your-workspace>.cloud.databricks.com
+export DATABRICKS_TOKEN=...   # a personal access token, set in your own shell
+sparkshift upload jobs/ --to /Workspace/Users/you@example.com/migrated --dry-run
+sparkshift upload jobs/ --to /Workspace/Users/you@example.com/migrated
+```
+
+- Credentials come only from the Databricks SDK's usual sources: the
+  environment variables above, or a profile in `~/.databrickscfg`
+  (`--profile NAME`). There is no option to pass a token, and SparkShift
+  replaces any secret it knows of with `***` in its messages.
+  [`.env.example`](.env.example) lists the variables.
+- `--dry-run` converts and lists the notebook paths without connecting (and
+  works without the extra).
+- An existing notebook is never replaced unless you pass `--overwrite`; it is
+  reported, and the other files are still uploaded. `--strict` skips any
+  file whose conversion has warnings. The exit status is 1 if any file
+  could not be converted or uploaded.
+
+See [ADR 0010](docs/adr/0010-upload-notebooks-with-the-databricks-sdk.md).
+
 ## Playground
 
 The [playground](https://arttgrantollii.github.io/sparkshift/) runs SparkShift entirely in the browser, with

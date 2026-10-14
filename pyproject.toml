@@ -29,6 +29,10 @@ dependencies = [
     "sqlglot>=30.21,<31",
 ]
 
+[project.optional-dependencies]
+# sparkshift upload: import generated notebooks into a Databricks workspace.
+databricks = ["databricks-sdk>=0.144,<1"]
+
 [project.scripts]
 sparkshift = "sparkshift.cli:main"
 
@@ -47,6 +51,9 @@ packages = ["src/sparkshift"]
 [dependency-groups]
 dev = [
     "axe-playwright-python>=0.1.8",
+    # The newest release at least two weeks old when it was added (the SDK
+    # releases almost daily); the tests use its real types. Raise deliberately.
+    "databricks-sdk>=0.144,<0.145",
     "playwright>=1.50",
     "pre-commit>=4.6.2",
     "psycopg[binary]>=3.3.6",

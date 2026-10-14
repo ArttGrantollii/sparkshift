@@ -200,3 +200,18 @@ jobs:
           /tmp/clean/bin/sparkshift --version
           echo "SELECT name FROM customers WHERE country = 'US'" \
             | /tmp/clean/bin/sparkshift convert -
+
+      # Without the databricks extra, a dry run still works and an upload
+      # explains how to install the extra (exit 2) instead of failing oddly.
+      - name: Use upload without and with the databricks extra
+        run: |
+          folder=/Workspace/Shared/sparkshift
+          /tmp/clean/bin/sparkshift upload examples/sql/generic --to $folder --dry-run
+          status=0
+          /tmp/clean/bin/sparkshift upload examples/sql/generic --to $folder \
+            2> missing.txt || status=$?
+          test "$status" -eq 2
+          grep -F "pip install 'sparkshift[databricks]'" missing.txt
+          uv venv /tmp/extra
+          uv pip install --python /tmp/extra "$(ls dist/*.whl)[databricks]"
+          /tmp/extra/bin/python -c "import databricks.sdk"

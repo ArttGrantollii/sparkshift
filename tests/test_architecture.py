@@ -64,8 +64,19 @@ def test_ir_and_emitter_never_depend_on_sqlglot() -> None:
 
 # Modules the core must never import. SparkShift generates PySpark code; it
 # never runs Spark. Keeping these out of the core keeps the runtime small and
-# lets the package run in a browser (Pyodide), where no JVM exists.
-FORBIDDEN_RUNTIME_MODULES = ("pyspark", "py4j")
+# lets the package run in a browser (Pyodide), where no JVM exists. The
+# Databricks SDK is an optional extra, imported only when `upload` runs.
+FORBIDDEN_RUNTIME_MODULES = ("pyspark", "py4j", "databricks")
+
+
+def test_only_the_upload_module_uses_the_databricks_sdk() -> None:
+    importers = {
+        module
+        for module in all_modules()
+        if any(name.split(".")[0] == "databricks" for name in imported_modules(module))
+    }
+
+    assert importers == {"databricks"}
 
 
 def test_core_does_not_import_spark() -> None:

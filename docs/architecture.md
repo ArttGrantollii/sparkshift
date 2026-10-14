@@ -1,8 +1,8 @@
 # Architecture
 
 > **Status:** SQL and the documented SAS subset use the shared pipeline.
-> The Python API, CLI, public playground and notebook generation exist;
-> Databricks upload and live workspace validation are in progress.
+> The Python API, CLI, public playground, notebook generation, and notebook
+> upload exist; live workspace validation is in progress.
 
 ## The core idea
 
@@ -41,11 +41,13 @@ flowchart LR
 | Entry point | `api.py` | `convert(sql, dialect)` runs the stages in order; with `dialect="sas"`, the SAS frontend's |
 | Notebooks | `notebook.py` | Generated code as a Databricks source-format notebook: a Markdown description, one cell per section, and `display(result)` ([ADR 0007](adr/0007-databricks-notebooks.md)) |
 | Analysis | `report.py` | Calls `convert` for many files and summarizes the outcomes: pure functions and data, with text, Markdown, and JSON formats; it reads no files |
-| Command line | `cli.py` | Reads and writes files, and calls `convert` or `report` |
+| Databricks | `databricks.py` | Imports notebooks into a workspace through the optional Databricks SDK, imported only when uploading; credentials come from the SDK's own sources and are redacted from every message ([ADR 0010](adr/0010-upload-notebooks-with-the-databricks-sdk.md)) |
+| Command line | `cli.py` | Reads and writes files, and calls `convert`, `report`, or the upload |
 
 Only `parsing.py` and `translate.py` may import SQLGlot; the IR, the emitter,
-and the SAS frontend never depend on it. Both rules are enforced by
-`tests/test_architecture.py`.
+and the SAS frontend never depend on it; and only `databricks.py` imports the
+Databricks SDK, never when the package is imported. These rules are enforced
+by `tests/test_architecture.py`.
 
 ### Errors and warnings
 

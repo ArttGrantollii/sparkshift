@@ -3,8 +3,9 @@
 Usage: python tools/check_wheel.py dist/sparkshift-*.whl
 
 Checks what a development checkout cannot show: that the wheel's only runtime
-dependency is SQLGlot (PySpark is never required, see ADR 0002), that it
-contains the package, its type information, its license, and the
+dependency is SQLGlot (PySpark is never required, see ADR 0002) and its only
+optional one the Databricks SDK, in the ``databricks`` extra (ADR 0010), that
+it contains the package, its type information, its license, and the
 ``sparkshift`` command, and nothing from the repository besides the package.
 Prints each problem and exits with 1 if there are any.
 """
@@ -15,8 +16,15 @@ import zipfile
 from email.parser import Parser
 
 ALLOWED_DEPENDENCIES = ["sqlglot"]
-REQUIRED_FILES = ["sparkshift/__init__.py", "sparkshift/cli.py", "sparkshift/py.typed"]
+ALLOWED_EXTRAS = {"databricks": ["databricks-sdk"]}
+REQUIRED_FILES = [
+    "sparkshift/__init__.py",
+    "sparkshift/cli.py",
+    "sparkshift/databricks.py",
+    "sparkshift/py.typed",
+]
 COMMAND = "sparkshift = sparkshift.cli:main"
+_EXTRA = re.compile(r"""extra\s*==\s*["']([^"']+)["']""")
 
 
 def problems(wheel_path: str) -> list[str]:
@@ -28,11 +36,21 @@ def problems(wheel_path: str) -> list[str]:
 
     found = []
     requirements = metadata.get_all("Requires-Dist") or []
-    dependencies = [re.match(r"[A-Za-z0-9._-]+", item)[0] for item in requirements]
+    dependencies: list[str] = []
+    extras: dict[str, list[str]] = {}
+    for item in requirements:
+        name = re.match(r"[A-Za-z0-9._-]+", item)[0]
+        extra = _EXTRA.search(item)
+        if extra is None:
+            dependencies.append(name)
+        else:
+            extras.setdefault(extra[1], []).append(name)
     if dependencies != ALLOWED_DEPENDENCIES:
         found.append(
             f"runtime dependencies should be {ALLOWED_DEPENDENCIES}: {requirements}"
         )
+    if extras != ALLOWED_EXTRAS:
+        found.append(f"optional dependencies should be {ALLOWED_EXTRAS}: {extras}")
     found += [f"missing {name}" for name in REQUIRED_FILES if name not in names]
     if not any(name.endswith(".dist-info/licenses/LICENSE") for name in names):
         found.append("missing the LICENSE file")

@@ -255,6 +255,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `uv sync --group connect`), every Spark test runs through a local Spark
   Connect server, as code runs on Databricks serverless compute. A new CI job,
   "Spark Connect", runs them on every push.
+- `sparkshift upload PATH --to FOLDER` (ADR 0010): converts a `.sql`/`.sas`
+  file or directory into notebooks and imports them into a Databricks
+  workspace folder, keeping relative paths, with `--profile`, `--overwrite`,
+  `--strict`, and `--dry-run`. Needs the new optional extra
+  `sparkshift[databricks]` (the Databricks SDK); credentials come only from
+  the SDK's environment variables or `~/.databrickscfg` profiles and are
+  redacted from every message. `.env.example` documents the variables.
 
 ### Changed
 

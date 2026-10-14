@@ -1,5 +1,5 @@
-"""The command line: ``sparkshift convert query.sql`` and
-``sparkshift report queries/``.
+"""The command line: ``sparkshift convert query.sql``,
+``sparkshift report queries/``, and ``sparkshift upload queries/ --to FOLDER``.
 
 ``convert`` converts one SQL file or SAS program, standard input, or every
 ``.sql`` and ``.sas`` file in a directory. Generated code goes to standard
@@ -9,24 +9,31 @@ to standard error, so redirecting the output never captures an error message.
 ``report`` assesses a file or every ``.sql`` and ``.sas`` file in a directory
 and reports how many convert and what blocks the rest, without writing code.
 
+``upload`` converts a file or every ``.sql`` and ``.sas`` file in a directory
+into Databricks notebooks and imports them into a workspace folder (see
+:mod:`sparkshift.databricks`).
+
 A ``.sas`` file is always a SAS program; ``--dialect`` gives the dialect of
 the SQL files, and ``--dialect sas`` selects only the SAS programs.
 
 Exit codes:
-    0  every query was converted (convert), or the report was produced
+    0  every query was converted (convert) or uploaded (upload), or the
+       report was produced
     1  some input cannot be converted or --strict rejects its warnings
-       (convert; standard error lists every
-       issue), or fewer files converted than --fail-under requires (report)
-    2  usage error: a bad option, or an input or output that cannot be read
-       or written
+       (convert, upload; standard error lists every issue), some notebook
+       cannot be imported (upload), or fewer files converted than
+       --fail-under requires (report)
+    2  usage error: a bad option, an input or output that cannot be read or
+       written, or no connection to Databricks (upload)
 """
 
 import argparse
 import sys
 from collections.abc import Sequence
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath
+from typing import TypeVar
 
-from sparkshift import __version__
+from sparkshift import __version__, databricks
 from sparkshift.api import convert
 from sparkshift.diagnostics import ConversionResult
 from sparkshift.dialects import DIALECT_CHOICES, SAS, is_sas
@@ -43,6 +50,8 @@ _STDIN = "-"
 
 _REPORT_FORMATS = {"text": to_text, "markdown": to_markdown, "json": to_json}
 
+PathT = TypeVar("PathT", bound=PurePath)
+
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the command line with ``argv`` (default: ``sys.argv[1:]``) and
@@ -51,6 +60,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     if arguments.command == "report":
         return _report(parser, arguments)
+    if arguments.command == "upload":
+        return _upload(parser, arguments)
     if arguments.input != _STDIN and Path(arguments.input).is_dir():
         return _convert_directory(parser, arguments)
     return _convert_one(parser, arguments)
@@ -145,6 +156,55 @@ def _parser() -> argparse.ArgumentParser:
         metavar="PERCENT",
         help="exit with status 1 if fewer than PERCENT of the files convert",
     )
+
+    upload_command = commands.add_parser(
+        "upload",
+        help="convert files into notebooks and import them into Databricks",
+        description=(
+            "Convert a .sql or .sas file, or every one in a directory, into "
+            "Databricks notebooks and import them into a workspace folder, "
+            "keeping their relative paths. Credentials come from the "
+            "DATABRICKS_HOST and DATABRICKS_TOKEN environment variables or a "
+            "~/.databrickscfg profile, never from the command line. Needs "
+            f"{databricks.INSTALL_HINT}, except with --dry-run."
+        ),
+    )
+    upload_command.add_argument("input", help="file or directory to upload")
+    upload_command.add_argument(
+        "--to",
+        required=True,
+        metavar="FOLDER",
+        help="workspace folder to import into, such as "
+        "/Workspace/Users/you@example.com/migrated",
+    )
+    upload_command.add_argument(
+        "-d",
+        "--dialect",
+        type=str.lower,
+        choices=DIALECT_CHOICES,
+        help="SQL dialect of the input, or sas for SAS programs only; omit it "
+        "for generic SQL. A .sas file is always a SAS program",
+    )
+    upload_command.add_argument(
+        "--profile",
+        help="the ~/.databrickscfg profile to authenticate with",
+    )
+    upload_command.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="replace notebooks that already exist (by default they are kept "
+        "and reported)",
+    )
+    upload_command.add_argument(
+        "--strict",
+        action="store_true",
+        help="reject conversions with any warnings; do not upload them",
+    )
+    upload_command.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="convert and list the notebook paths without connecting to Databricks",
+    )
     return parser
 
 
@@ -207,11 +267,20 @@ def _convert_directory(
 
 
 def _batch_outputs(
-    parser: argparse.ArgumentParser, source: Path, output: Path, files: list[Path]
-) -> list[tuple[Path, Path]]:
-    """Plan every output before side effects; reject colliding portable names."""
+    parser: argparse.ArgumentParser,
+    source: Path,
+    output: PathT,
+    files: list[Path],
+    suffix: str = ".py",
+) -> list[tuple[Path, PathT]]:
+    """Plan every output before side effects; reject colliding portable names.
+
+    ``output`` is a local directory, or a workspace folder as a
+    ``PurePosixPath``; each input keeps its relative path, with ``suffix``.
+    """
     planned = [
-        (path, output / path.relative_to(source).with_suffix(".py")) for path in files
+        (path, output.joinpath(*path.relative_to(source).with_suffix(suffix).parts))
+        for path in files
     ]
     by_name: dict[tuple[str, ...], list[Path]] = {}
     for path, destination in planned:
@@ -285,6 +354,87 @@ def _report(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> i
         )
         return EXIT_NOT_CONVERTED
     return EXIT_CONVERTED
+
+
+def _upload(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int:
+    """Convert a file, or every .sql and .sas file under a directory, into
+    notebooks and import them into a workspace folder. Every file is converted
+    before connecting; a notebook that cannot be imported is reported, and the
+    others are still imported."""
+    folder = PurePosixPath(arguments.to)
+    if not folder.is_absolute() or ".." in folder.parts:
+        parser.error(
+            f"--to {arguments.to} must be an absolute workspace folder, such as "
+            "/Workspace/Users/you@example.com/migrated"
+        )
+    source = Path(arguments.input)
+    if source.is_dir():
+        files = _source_files(parser, source, arguments.dialect)
+    elif source.is_file():
+        files, source = [source], source.parent
+    else:
+        parser.error(f"cannot read {arguments.input}: no such file or directory")
+    planned = _batch_outputs(parser, source, folder, files, suffix="")
+
+    notebooks: list[tuple[Path, PurePosixPath, str]] = []
+    for path, notebook_path in planned:
+        sql, reason = _read_text(path)
+        if sql is None:
+            print(f"{parser.prog}: cannot read {path}: {reason}", file=sys.stderr)
+            continue
+        dialect = _dialect_of(path, arguments.dialect)
+        result = _conversion(
+            parser.prog, sql, str(path), dialect, strict=arguments.strict
+        )
+        if result is not None:
+            notebook = to_notebook(result, source=path.name, dialect=dialect)
+            notebooks.append((path, notebook_path, notebook))
+
+    if arguments.dry_run:
+        for path, notebook_path, _ in notebooks:
+            print(f"{path} -> {notebook_path}")
+        return _upload_summary(
+            parser.prog, "would upload", "converted", len(notebooks), files
+        )
+
+    try:
+        workspace = databricks.connect(arguments.profile)
+    except databricks.UploadError as error:
+        print(f"{parser.prog}: {error}", file=sys.stderr)
+        return EXIT_USAGE
+    uploaded = 0
+    created: set[PurePosixPath] = set()
+    for path, notebook_path, notebook in notebooks:
+        try:
+            if notebook_path.parent not in created:
+                workspace.mkdirs(str(notebook_path.parent))
+                created.add(notebook_path.parent)
+            workspace.import_notebook(
+                str(notebook_path), notebook, overwrite=arguments.overwrite
+            )
+        except databricks.UploadError as error:
+            print(
+                f"{parser.prog}: cannot upload {path} to {notebook_path}: {error}",
+                file=sys.stderr,
+            )
+            continue
+        print(f"{parser.prog}: uploaded {path} to {notebook_path}", file=sys.stderr)
+        uploaded += 1
+    return _upload_summary(
+        parser.prog, "uploaded", "converted or uploaded", uploaded, files
+    )
+
+
+def _upload_summary(
+    prog: str, done: str, failure: str, count: int, files: list[Path]
+) -> int:
+    noun = "file" if len(files) == 1 else "files"
+    summary = f"{prog}: {done} {count} of {len(files)} {noun}"
+    failed = len(files) - count
+    if failed:
+        summary += f"; {failed} could not be {failure}"
+    print(summary, file=sys.stderr)
+    return EXIT_CONVERTED if failed == 0 else EXIT_NOT_CONVERTED
 
 
 def _source_files(
