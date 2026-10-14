@@ -315,6 +315,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now gets its name during conversion (`_if_1`, or `_if_1_2` when that name
   is taken), instead of generated code that looks up the input's column names
   when it runs. The lookup remains where the input's columns are unknown.
+- SAS `LENGTH` statements now follow the program data vector. A variable
+  declared but never assigned was missing from the output; SAS writes it as
+  a missing column. A new variable declared before another one that is
+  assigned first came out in the wrong column order. A `LENGTH` for an input
+  variable named in `KEEP=` truncated its later values; SAS ignores it. With
+  `KEEP=` on `SET`, the output now matches; without it, a never-assigned
+  `LENGTH` variable is rejected and a different order is warned about.
 - SQL wildcard modifiers (`EXCEPT`/`EXCLUDE`, `REPLACE`, `RENAME`, `ILIKE`)
   are now rejected with rewrite guidance in projections and `COUNT(*)`,
   including qualified and nested queries. Previously they were silently

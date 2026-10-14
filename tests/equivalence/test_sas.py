@@ -261,6 +261,32 @@ SAS_SCENARIOS = {
             (109, "mediu"),
         ),
     ),
+    # SAS writes every variable of the step, missing if never assigned, in
+    # the order the variables first appear.
+    "LENGTH writes variables the step never assigns": (
+        "data noted; set customers(keep=customer_id); length note $ 8 extra 8; run;",
+        _result(
+            "customer_id int, note string, extra double",
+            *[(n, None, None) for n in (1, 2, 3, 4, 5, 6, 7, 7)],
+        ),
+    ),
+    "LENGTH places variables where they first appear": (
+        "data ordered; set customers(keep=customer_id); length second $ 3 first $ 3; "
+        "first = 'a'; second = 'b'; run;",
+        _result(
+            "customer_id int, second string, first string",
+            *[(n, "b", "a") for n in (1, 2, 3, 4, 5, 6, 7, 7)],
+        ),
+    ),
+    # name comes from SET, which sets its length; SAS ignores LENGTH for it.
+    "LENGTH of an input variable is ignored": (
+        "data renamed; set customers(keep=customer_id name); length name $ 2; "
+        "name = 'Robert'; run;",
+        _result(
+            "customer_id int, name string",
+            *[(n, "Robert") for n in (1, 2, 3, 4, 5, 6, 7, 7)],
+        ),
+    ),
     "LENGTH keeps longer values": (
         "data sized; set orders(keep=order_id amount); length size $ 6; "
         "if amount > 100 then size = 'large'; "

@@ -712,13 +712,66 @@ def test_a_length_statement_sets_the_length() -> None:
 
 
 def test_a_length_after_the_first_use_is_ignored() -> None:
-    assert (
-        warnings("s = 'a'; length s $ 5; length x 8;")
-        == [
-            "LENGTH of s ignored",
-            "LENGTH of x ignored",
-        ][:1]
+    # x comes from the input (KEEP=), s from its first assignment: SAS keeps
+    # both lengths.
+    assert warnings("s = 'a'; length s $ 5; length x 8;", "t(keep=x)") == [
+        "LENGTH of s ignored",
+        "LENGTH of x ignored",
+    ]
+
+
+def test_a_length_for_a_known_input_variable_does_not_truncate_it() -> None:
+    # SAS ignores the LENGTH, so 'abcdef' is stored whole, not as 'abc'.
+    relation = step("length name $ 3; name = 'abcdef';", "t(keep=name)")
+
+    assert relation == ir.WithColumn(
+        ir.Project(T, (Column(("name",)),)), "name", Literal("abcdef")
     )
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        # Never assigned: SAS writes it, missing.
+        ("length note $ 8;", [("note", ir.Cast(Literal(None), "string"))]),
+        ("length score 8;", [("score", ir.Cast(Literal(None), "double"))]),
+        # Declared before a, but a is assigned first: b keeps its place.
+        (
+            "length b $ 8 a $ 8; a = 'x'; b = 'y';",
+            [
+                ("b", ir.Cast(Literal(None), "string")),
+                ("a", Literal("x")),
+                ("b", Literal("y")),
+            ],
+        ),
+        # In the order of first assignment: no extra column.
+        (
+            "length a $ 8 b $ 8; a = 'x'; b = 'y';",
+            [("a", Literal("x")), ("b", Literal("y"))],
+        ),
+        ("length b $ 8; b = 'y'; a = 'x';", [("b", Literal("y")), ("a", Literal("x"))]),
+        # x is an input column, already in place: b needs no extra column.
+        ("length b $ 8; x = 1; b = 'y';", [("x", Literal(1)), ("b", Literal("y"))]),
+    ],
+)
+def test_a_new_variable_is_placed_where_length_declares_it(
+    body: str, expected: list[tuple[str, ir.Expression]]
+) -> None:
+    relation = step(body, "t(keep=x)")
+
+    columns = []
+    while isinstance(relation, ir.WithColumn):
+        columns.insert(0, (relation.name, relation.expression))
+        relation = relation.source
+    assert columns == expected
+    assert relation == ir.Project(T, (X,))
+
+
+def test_length_order_with_unknown_input_columns_is_warned() -> None:
+    assert warnings("length b $ 8 a $ 8; a = 'x'; b = 'y';") == [
+        "LENGTH may change the order of new variables"
+    ]
+    assert warnings("length a $ 8 b $ 8; a = 'x'; b = 'y';") == []
 
 
 def test_a_numeric_length_declares_a_number() -> None:
@@ -742,6 +795,8 @@ def test_a_numeric_length_declares_a_number() -> None:
         ("s = 'a'; s = 1;", "assignment of a number to the text variable s"),
         ("n = 1; n = 'a';", "assignment of text to the number variable n"),
         ("length n 4;", "numeric LENGTH 4"),
+        # n could be an input variable (kept) or new (written, missing).
+        ("length n 8;", "LENGTH of n, which the step never assigns"),
         ("y = x ** 2;", "the ** operator"),
         ("y = x || 'a';", "concatenation with ||"),
         ("y = scan(x);", "function SCAN"),
@@ -763,7 +818,9 @@ def test_unsupported_program_statements(body: str, message: str) -> None:
 
 def test_a_length_statement_before_set_is_reported() -> None:
     assert issues("data a; length s $ 5; set t; run;") == [
-        "LENGTH statement before SET"
+        "LENGTH statement before SET",
+        # Moving it after SET still leaves s unknown: every issue at once.
+        "LENGTH of s, which the step never assigns",
     ]
 
 

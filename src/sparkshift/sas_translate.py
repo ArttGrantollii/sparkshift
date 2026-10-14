@@ -251,7 +251,8 @@ class _Variable:
     kind: str = "unknown"
     # A text variable's length, when known.
     length: int | None = None
-    # Whether it is a column at this point: read from the input, or assigned.
+    # Whether it is a column at this point: read from the input, assigned, or
+    # a new variable a LENGTH statement declared.
     exists: bool = False
     assigned: bool = False
     # The first text constant's length, when it is unknown whether the
@@ -274,8 +275,10 @@ class _SasTranslator:
         # and the input's columns when the program shows them.
         self.variables: dict[str, _Variable] = {}
         self.input_columns: set[str] | None = None
-        # Every variable the DATA step assigns, lower case.
+        # Every variable the DATA step assigns, and the variables its LENGTH
+        # statements must add as columns, lower case.
         self.step_assigned: set[str] = set()
+        self.declared_early: set[str] = set()
         self.helpers = 0
         # In PROC SQL: columns may be qualified, and an equality of two
         # columns is translated with a warning. While ``aggregating``, a
@@ -306,6 +309,8 @@ class _SasTranslator:
         issues_before = len(self.issues)
         output = self.output_dataset(step)
         statements = list(_all_statements(step.statements))
+        self.step_assigned = set().union(*(_assigned(s) for s in step.statements))
+        self.declared_early = set()
         sets = [s for s in statements if isinstance(s, SetStatement)]
         wheres = [s for s in statements if isinstance(s, WhereStatement)]
         if not sets:
@@ -343,7 +348,17 @@ class _SasTranslator:
         source = sets[0].datasets[0]
         relation, filtered = self.input_dataset(source)
         self.input_columns = _input_columns(source)
-        self.step_assigned = set().union(*(_assigned(s) for s in step.statements))
+        self.declared_early = _declared_early(statements, self.input_columns or set())
+        if self.input_columns is None and self.declared_early & self.step_assigned:
+            lengths = [s for s in statements if isinstance(s, LengthStatement)]
+            self.warn(
+                "LENGTH may change the order of new variables",
+                lengths[0].span,
+                "SAS places a new variable where it first appears, here in a "
+                "LENGTH statement; this code adds it where it is first assigned. "
+                "Declare variables in the order they are first assigned, or list "
+                "the input's columns with KEEP= on SET.",
+            )
         if wheres and filtered:
             self.warn(
                 "WHERE statement ignored",
@@ -1157,7 +1172,7 @@ class _SasTranslator:
             case IfThen():
                 return self.if_then(statement, relation, guard)
             case LengthStatement():
-                self.length(statement)
+                return self.length(statement, relation)
         # SET, WHERE, KEEP, DROP, and RENAME apply to the whole step.
         return relation
 
@@ -1370,15 +1385,28 @@ class _SasTranslator:
             return None
         return name.lower() not in self.input_columns
 
-    def length(self, statement: LengthStatement) -> None:
+    def length(self, statement: LengthStatement, relation: ir.Relation) -> ir.Relation:
+        """Record each variable's type and length. SAS places a new variable
+        where it first appears, missing until assigned, and writes it even if
+        the step never assigns it; the column is added here when its first
+        assignment would not give the same result (see _declared_early)."""
         for name, is_text, size in statement.entries:
             variable = self.variables.get(name.lower())
+            new = self.is_new(name)
             if variable is not None and (variable.exists or variable.assigned):
                 self.warn(
                     f"LENGTH of {name} ignored",
                     statement.span,
                     "SAS sets a variable's length where it first appears; put "
                     "LENGTH before the variable's first use.",
+                )
+                continue
+            if new is False:
+                self.warn(
+                    f"LENGTH of {name} ignored",
+                    statement.span,
+                    f"{name} comes from the SET data set, which sets its length; "
+                    "SAS ignores a later LENGTH statement for it.",
                 )
                 continue
             if not is_text and size != 8:
@@ -1389,10 +1417,24 @@ class _SasTranslator:
                     "keeps full precision, so only LENGTH 8 is supported.",
                 )
                 continue
+            if new is None and name.lower() not in self.step_assigned:
+                self.unsupported(
+                    f"LENGTH of {name}, which the step never assigns",
+                    statement.span,
+                    f"If {name} is new, SAS writes it as a missing column; if it "
+                    "is an input variable, SAS keeps it. List the input's columns "
+                    "with KEEP= on SET, or remove it from the LENGTH statement.",
+                )
+                continue
             self.variables[name.lower()] = _Variable(
                 kind="text" if is_text else "number",
                 length=size if is_text else None,
+                exists=bool(new),
             )
+            if new and name.lower() in self.declared_early:
+                missing = ir.Cast(ir.Literal(None), "string" if is_text else "double")
+                relation = ir.WithColumn(relation, name, missing)
+        return relation
 
     # --- Values --------------------------------------------------------------
 
@@ -2036,6 +2078,37 @@ def _single(statement: Statement | None) -> Statement | None:
     if isinstance(statement, Block) and len(statement.statements) == 1:
         return statement.statements[0]
     return statement
+
+
+def _declared_early(statements: list[Statement], inputs: set[str]) -> set[str]:
+    """The variables, lower case, that a LENGTH statement must add as columns.
+
+    SAS places a new variable in the output where it first appears, in a
+    LENGTH statement or an assignment; the generated code adds a column where
+    it is first assigned. Those differ for a variable that is never assigned
+    (SAS writes it, missing) and for one declared before another new variable
+    that is assigned first (SAS's column order differs).
+    """
+    mentioned: list[str] = []
+    assigned: list[str] = []
+    for statement in statements:
+        if isinstance(statement, LengthStatement):
+            names = [name.lower() for name, _, _ in statement.entries]
+        elif isinstance(statement, Assignment):
+            names = [statement.name.lower()]
+            if names[0] not in assigned:
+                assigned.append(names[0])
+        else:
+            continue
+        mentioned += [n for n in names if n not in inputs and n not in mentioned]
+    early = set()
+    for position, name in enumerate(mentioned):
+        if name not in assigned or any(
+            other in assigned and assigned.index(other) < assigned.index(name)
+            for other in mentioned[position + 1 :]
+        ):
+            early.add(name)
+    return early
 
 
 def _input_columns(dataset: Dataset) -> set[str] | None:

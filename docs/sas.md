@@ -39,7 +39,7 @@ Procedure User's Guide*.
 | Arithmetic | `+`, `-`, `*`, `/`, and a leading minus |
 | `IF ... THEN ...; ELSE ...;` | With `ELSE IF` chains and `DO; ... END;` blocks of the statements listed here |
 | Subsetting `IF condition;` and `DELETE` | |
-| `LENGTH name $ n;` | Before a variable's first use; numbers only with length 8 |
+| `LENGTH name $ n;` | Before a variable's first use; numbers only with length 8. A variable never assigned needs `KEEP=` on `SET`. See [Where new variables go](#where-new-variables-go) |
 | Conditions | Comparisons (`=`, `^=`, `<`, `<=`, `>`, `>=` and `EQ`, `NE`, `LT`, `LE`, `GT`, `GE`); `AND`, `OR`, `NOT (...)`; `IN`, `NOT IN`; `BETWEEN ... AND`; `IS [NOT] MISSING` and `IS [NOT] NULL`; a number on its own. A comparison or condition used as a value is 1 or 0 |
 | Functions | `SUM`, `MEAN`, `MIN`, `MAX`, `N`, `NMISS`, `COALESCE`; `ROUND`, `INT`, `CEIL`, `FLOOR`, `ABS`, `MOD`; `UPCASE`, `LOWCASE`, `STRIP`, `TRIM`, `SUBSTR`, `LENGTH`; `CATS`, `CATX`, `COALESCEC`; `MISSING`. See [Functions](#functions) |
 | `PROC SORT` | `DATA=`, `OUT=` (with data set options), `NODUPKEY`, `BY` with `DESCENDING`, and `WHERE`. Options that do not change the result (`EQUALS`, `FORCE`, `TAGSORT`, `SORTSIZE=`, ...) are accepted. See [PROC SORT](#proc-sort) |
@@ -205,6 +205,28 @@ before the first assignment sets the length instead. When SparkShift cannot
 tell whether a variable is new (and so whether its first value sets its
 length), and a later value could be truncated, it rejects the assignment and
 suggests a `LENGTH` statement.
+
+A variable read from the `SET` data set already has its length there, so a
+later `LENGTH` statement for it is ignored, with a warning, as SAS ignores it.
+
+### Where new variables go
+
+*SAS Global Forum 2013, paper 125-2013, "Essentials of the Program Data Vector
+(PDV)":* SAS builds the PDV, the row it works on, while compiling the step.
+New variables "will be set to missing in the PDV at the beginning of every
+iteration", and the kept variables of the PDV are written to the output. So a
+variable that a `LENGTH` statement declares but no statement assigns is still
+an output column, missing on every row, and a new variable's column goes where
+the variable first appears, which can be a `LENGTH` statement.
+
+The generated code adds a new variable where it is first assigned. When that
+would give a different result (the variable is never assigned, or another new
+variable is assigned before it), and `KEEP=` on `SET` lists the input's
+columns, the `LENGTH` statement adds the column itself, missing until assigned:
+`F.lit(None).cast("string")` for text, `"double"` for numbers. Without `KEEP=`,
+SparkShift cannot tell a new variable from an input one: a `LENGTH` variable
+the step never assigns is rejected, and a `LENGTH` order that differs from the
+order of first assignment is warned about.
 
 ### Functions
 
