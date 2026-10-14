@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `convert --strict` rejects warned conversions with exit status 1 before writing
+  their output, including notebooks and batch conversions. Warning-free batch
+  inputs still convert; existing outputs of rejected inputs stay untouched.
+
 - Project skeleton: `src/` layout, `pyproject.toml` packaging, Apache-2.0 license.
 - Test and quality tooling: pytest, coverage, Ruff, and pre-commit hooks.
 - Architecture test ensuring the core package never imports PySpark.

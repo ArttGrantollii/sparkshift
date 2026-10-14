@@ -112,7 +112,24 @@ them in separate subdirectories; `sql/job.sql` and `sas/job.sas` are allowed.
 within the batch; ordinary conversion or filesystem errors can still leave a
 partially completed batch.
 
-The exit status is 0 when every query is converted, 1 when any cannot be,
+Use `sparkshift convert job.sas --strict -o job.py` to reject **any** warning,
+including warnings about possible result differences. Warnings still go to
+standard error, but the rejected input produces no code or notebook and exits
+with status 1. This works with files, standard input, directories, and
+`--notebook`. Without `--strict`, conversion keeps its existing behavior: code
+is emitted with warnings for review.
+
+In a strict batch, warning-free files are written and rejected files count as
+failures in the summary. Existing outputs for rejected files are left untouched;
+use a fresh output directory and check the exit status before using batch output.
+Use `-o` to preserve existing files on rejection: shell redirection (`> job.py`)
+can truncate a file before SparkShift starts. Strict mode rejects all warnings,
+including informational ones; a warning-free conversion is not a proof of
+correctness for arbitrary data. The Python API and `report` retain their existing
+warning data and reporting behavior.
+
+The exit status is 0 when every query is converted, 1 when any cannot be or
+strict mode rejects warnings,
 and 2 for a usage error such as a missing file or an unknown dialect.
 `python -m sparkshift` works the same way. In a development checkout, run it
 as `uv run sparkshift`.

@@ -14,7 +14,8 @@ the SQL files, and ``--dialect sas`` selects only the SAS programs.
 
 Exit codes:
     0  every query was converted (convert), or the report was produced
-    1  some SQL cannot be converted (convert; standard error lists every
+    1  some input cannot be converted or --strict rejects its warnings
+       (convert; standard error lists every
        issue), or fewer files converted than --fail-under requires (report)
     2  usage error: a bad option, or an input or output that cannot be read
        or written
@@ -101,6 +102,12 @@ def _parser() -> argparse.ArgumentParser:
         help="write Databricks notebooks (source format) instead of plain code",
     )
 
+    convert_command.add_argument(
+        "--strict",
+        action="store_true",
+        help="reject conversions with any warnings; do not write their output",
+    )
+
     report_command = commands.add_parser(
         "report",
         help="report how much of a set of files converts, and what blocks the rest",
@@ -145,7 +152,7 @@ def _convert_one(parser: argparse.ArgumentParser, arguments: argparse.Namespace)
     name = "standard input" if arguments.input == _STDIN else arguments.input
     sql = _read(parser, arguments.input)
     dialect = _dialect_of(Path(arguments.input), arguments.dialect)
-    result = _conversion(parser.prog, sql, name, dialect)
+    result = _conversion(parser.prog, sql, name, dialect, strict=arguments.strict)
     if result is None:
         return EXIT_NOT_CONVERTED
     source = None if arguments.input == _STDIN else arguments.input
@@ -179,7 +186,9 @@ def _convert_directory(
             print(f"{parser.prog}: cannot read {path}: {reason}", file=sys.stderr)
             continue
         dialect = _dialect_of(path, arguments.dialect)
-        result = _conversion(parser.prog, sql, str(path), dialect)
+        result = _conversion(
+            parser.prog, sql, str(path), dialect, strict=arguments.strict
+        )
         if result is not None:
             _write(
                 parser,
@@ -320,10 +329,10 @@ def _read_text(path: Path) -> tuple[str | None, str | None]:
 
 
 def _conversion(
-    prog: str, sql: str, name: str, dialect: str | None
+    prog: str, sql: str, name: str, dialect: str | None, *, strict: bool
 ) -> ConversionResult | None:
     """Convert one query, reporting errors and warnings on standard error;
-    None if it cannot be converted."""
+    None if it cannot be converted or strict mode rejects its warnings."""
     try:
         result = convert(sql, dialect=dialect)
     except SparkShiftError as error:
@@ -331,6 +340,13 @@ def _conversion(
         return None
     for warning in result.warnings:
         print(f"{prog}: warning in {name}: {warning}", file=sys.stderr)
+    if strict and result.warnings:
+        print(
+            f"{prog}: --strict rejected {name} because conversion has warnings; "
+            "no output written for this input",
+            file=sys.stderr,
+        )
+        return None
     return result
 
 
