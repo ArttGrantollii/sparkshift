@@ -44,6 +44,21 @@ class Sorted:
 
 
 SAS_SCENARIOS = {
+    # SAS GROUP BY without a summary is a sort, not deduplication. Its explicit
+    # ORDER BY rewrite preserves both copies of customer 7.
+    "PROC SQL: ORDER BY rewrite preserves duplicate rows": (
+        "proc sql; create table sorted_customers as select customer_id "
+        "from customers order by customer_id; quit;",
+        Sorted(
+            "customer_id",
+            _result("customer_id int", (1,), (2,), (3,), (4,), (5,), (6,), (7,), (7,)),
+        ),
+    ),
+    "PROC SQL: summary only in HAVING still groups rows": (
+        "proc sql; create table repeated_customers as select customer_id "
+        "from customers group by customer_id having count(*) > 1; quit;",
+        _result("customer_id int", (7,)),
+    ),
     # A missing numeric value is smaller than any other numeric value.
     "a missing number is smaller than every number": (
         "data low; set customers(keep=customer_id score); where score < 3; run;",

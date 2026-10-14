@@ -457,6 +457,14 @@ otherwise "remerge" the summary with each row, which SparkShift rejects. A
 summaries and dropped after filtering. `GROUP BY` keeps missing values as a
 group, unlike PROC MEANS's `CLASS`.
 
+**GROUP BY needs a summary function.** SAS treats `GROUP BY` without a summary
+function in either SELECT or HAVING as sorting, preserving duplicate rows.
+SparkShift rejects this form rather than generating aggregation that removes
+rows. Write `ORDER BY` explicitly to retain rows, or `SELECT DISTINCT` when
+removing duplicates is your intent. A multi-argument SAS function such as
+`SUM(x, 1)` is a row function and does not make the query an aggregation.
+See the [SAS GROUP BY reference](https://support.sas.com/documentation/cdl/en/sqlproc/63043/HTML/default/n16ee3ciphxlean1wug0v9i913jw.htm).
+
 **Names and order.** A selected column keeps its name; a computed one needs
 `AS` (SAS would name it `_TEMA001`). "PROC SQL sorts nulls, or missing values,
 before character or numeric data": missing values come first in `ORDER BY`,

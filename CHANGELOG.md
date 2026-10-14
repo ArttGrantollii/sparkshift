@@ -274,6 +274,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reject SAS PROC SQL `GROUP BY` without a summary function in SELECT or HAVING.
+  SAS treats it as sorting; previously generated aggregation silently removed
+  duplicate rows. The error gives explicit ORDER BY / DISTINCT rewrite guidance.
+
 - Keep every line of notebook metadata inside Markdown comments, including
   multiline source names and diagnostics containing notebook cell markers.
   Metadata can no longer add executable Python or extra notebook cells.

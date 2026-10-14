@@ -1718,7 +1718,10 @@ def test_several_tables_in_one_step_and_a_later_data_step() -> None:
     ("query", "message"),
     [
         ("select x + 1 from t", "computed column without a name"),
-        ("select a, x from t group by a", "column x neither grouped nor summarized"),
+        (
+            "select a, x, count(*) as n from t group by a",
+            "column x neither grouped nor summarized",
+        ),
         ("select a, sum(x) as s from t", "column a neither grouped nor summarized"),
         ("select x from t where sum(x) > 1", "summary function in WHERE"),
         (
@@ -1739,7 +1742,10 @@ def test_several_tables_in_one_step_and_a_later_data_step() -> None:
         ),
         ("select a, x as a from t", "two columns named a"),
         ("select *, x from t", "* with other columns"),
-        ("select * from t group by a", "* with GROUP BY or a summary function"),
+        (
+            "select * from t group by a having count(*) > 1",
+            "* with GROUP BY or a summary function",
+        ),
         ("select sum(x) as s from t group by x + 1", "GROUP BY of an expression"),
         ("select avg(distinct x) as m from t", "AVG(DISTINCT ...)"),
         ("select sum(*) as s from t", "SUM(*)"),

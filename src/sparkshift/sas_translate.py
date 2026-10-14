@@ -701,10 +701,22 @@ class _SasTranslator:
             condition = self.condition(query.where)
             if condition is not None:
                 relation = ir.Filter(relation, condition)
-        summarized = bool(query.group_by) or any(
+        selected_summary = any(
             item.expression is not None and _has_summary(item.expression)
             for item in query.items
         )
+        having_summary = query.having is not None and _has_summary(query.having)
+        if query.group_by and not (selected_summary or having_summary):
+            self.unsupported(
+                "GROUP BY without a summary function",
+                query.span,
+                "SAS treats this GROUP BY as sorting and keeps duplicate rows. "
+                "Use ORDER BY to keep the rows, or SELECT DISTINCT if you intend "
+                "to remove duplicates. SparkShift does not translate this "
+                "implicit sort yet.",
+            )
+            return None
+        summarized = bool(query.group_by) or selected_summary
         if query.having is not None and not summarized:
             self.unsupported(
                 "HAVING without GROUP BY or a summary function",
