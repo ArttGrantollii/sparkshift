@@ -332,6 +332,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including qualified and nested queries. Previously they were silently
   discarded, retaining excluded columns, losing replacement calculations,
   or producing incorrect row counts.
+- T-SQL `AVG(x)` is now rejected unless `x` is visibly a decimal or
+  floating-point value, such as `AVG(CAST(x AS DECIMAL(10, 2)))`. T-SQL
+  averages integers as an integer (the average of 1 and 2 is 1); the
+  generated `F.avg` returned 1.5.
 - `ROW_NUMBER`, `RANK`, and `DENSE_RANK` without `ORDER BY` in the window are
   now rejected; they produced code that Spark refuses to run.
 - Long comparisons and arithmetic are now wrapped to fit 88 columns, one

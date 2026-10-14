@@ -3,6 +3,7 @@ from decimal import Decimal
 import pytest
 from sqlglot import exp
 
+import sparkshift
 from sparkshift import ir
 from sparkshift.errors import SQLParseError, UnsupportedSQLError
 from sparkshift.ir import (
@@ -3533,3 +3534,49 @@ def test_interval_on_a_column_keeps_its_type_elsewhere(dialect: str | None) -> N
     item = only_item("SELECT d + INTERVAL '3' DAY AS x FROM t", dialect)
 
     assert item == Alias(plus(D, "days", 3), "x")
+
+
+# --- T-SQL AVG -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sql_expression",
+    [
+        "AVG(a)",
+        "AVG(a) OVER (PARTITION BY b)",
+        "AVG(a - 1)",
+        "AVG(-a)",
+        "AVG(CAST(a AS INT))",
+    ],
+)
+def test_tsql_avg_of_a_possible_integer_is_rejected(sql_expression: str) -> None:
+    issues = unsupported_issues(f"SELECT {sql_expression} AS x FROM t", "tsql")
+
+    messages = [message for message, _ in issues]
+    assert "AVG of a value that may be an integer" in messages
+
+
+@pytest.mark.parametrize(
+    "sql_expression",
+    [
+        "AVG(CAST(a AS DECIMAL(10, 2)))",
+        "AVG(CAST(a AS DOUBLE PRECISION))",
+        "AVG(a * 1.0)",
+        "AVG(1.5 - a)",
+        "AVG(-CAST(a AS DECIMAL(10, 2)))",
+        "AVG(2.5)",
+    ],
+)
+def test_tsql_avg_of_a_visibly_fractional_value_is_converted(
+    sql_expression: str,
+) -> None:
+    code = sparkshift.convert(f"SELECT {sql_expression} AS x FROM t", "tsql").code
+
+    assert "F.avg(" in code
+
+
+@pytest.mark.parametrize("dialect", [None, "postgres", "mysql", "snowflake", "oracle"])
+def test_avg_elsewhere_is_a_fractional_average(dialect: str | None) -> None:
+    code = sparkshift.convert("SELECT AVG(a) AS x FROM t", dialect).code
+
+    assert 'F.avg(F.col("a"))' in code

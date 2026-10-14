@@ -136,6 +136,17 @@ DIALECT_SCENARIOS = {
         "SELECT order_id, IIF(amount > 100, 'big', 'small') AS size FROM orders",
         "SELECT order_id, IF(amount > 100, 'big', 'small') AS size FROM orders",
     ),
+    # T-SQL's AVG of an integer is an integer; its rewrites mean the same in
+    # T-SQL and Spark. CAST to INT truncates in both.
+    "T-SQL AVG of a decimal, and its integer part": (
+        "tsql",
+        "SELECT customer_id, AVG(CAST(order_id AS DECIMAL(10, 2))) AS mean, "
+        "CAST(AVG(CAST(order_id AS DECIMAL(10, 2))) AS INT) AS whole, "
+        "AVG(amount * 1.0) AS mean_amount FROM orders GROUP BY customer_id",
+        "SELECT customer_id, AVG(CAST(order_id AS DECIMAL(10, 2))) AS mean, "
+        "CAST(AVG(CAST(order_id AS DECIMAL(10, 2))) AS INT) AS whole, "
+        "AVG(amount * 1.0) AS mean_amount FROM orders GROUP BY customer_id",
+    ),
     "PostgreSQL :: cast": (
         "postgres",
         "SELECT order_id, amount::numeric(10,1) AS rounded FROM orders",

@@ -436,6 +436,7 @@ rejects it rather than guess:
 | A `SELECT` alias inside an `ORDER BY` expression (`ORDER BY total * 2`) | All | Some databases, such as PostgreSQL, read the name as a table column instead. |
 | Selecting a column that is neither grouped nor aggregated | MySQL (relaxed mode) | MySQL returns an arbitrary value; Spark raises an error. |
 | `ISNULL(a, b)` | T-SQL | Returns the first argument's type (`ISNULL(int_col, 1.5)` is 1); `COALESCE` returns 1.5. |
+| `AVG(x)` unless `x` is visibly a decimal | T-SQL | The average of integers is an integer (`AVG` of 1 and 2 is 1); Spark returns 1.5. Write `AVG(CAST(x AS DECIMAL(p, s)))`. |
 | `CAST(x AS VARCHAR)` without a length | T-SQL | Means `VARCHAR(30)` and truncates longer values. |
 | `CAST(x AS FLOAT)` / `REAL` | All except PostgreSQL `FLOAT` | Sizes differ: T-SQL `FLOAT` is 8 bytes, Spark `FLOAT` is 4. (PostgreSQL's `FLOAT` means `DOUBLE PRECISION` and is converted to `double`.) |
 | `LIKE '[a-c]%'` | T-SQL | `[ ]` is a character class in T-SQL; Spark matches it literally. |

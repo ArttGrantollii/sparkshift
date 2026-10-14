@@ -358,6 +358,12 @@ _INTEGER_DIVISION_HINT = (
     "Dividing two integers discards the remainder in this dialect but not in "
     "Spark, and SparkShift cannot see column types."
 )
+_TSQL_AVG_HINT = (
+    "T-SQL averages integers as an integer (the average of 1 and 2 is 1), Spark "
+    "as a fraction (1.5), and SparkShift cannot see column types. Write "
+    "AVG(CAST(x AS DECIMAL(p, s))) for a fractional average, or "
+    "CAST(AVG(CAST(x AS DECIMAL(p, s))) AS INT) for T-SQL's integer result."
+)
 _SAFE_DIVISION_HINT = (
     "Division by zero returns NULL in this dialect but raises an error in Spark."
 )
@@ -1752,6 +1758,15 @@ class _Translator:
         self.no_subqueries = outside_subqueries
         if any(argument is None for argument in arguments):
             return None
+        if (
+            function is ir.AggregateFunction.AVG
+            and self.dialect == "tsql"
+            and not _visibly_fractional(arguments[0])  # type: ignore[arg-type]
+        ):
+            self.unsupported(
+                "AVG of a value that may be an integer", node, _TSQL_AVG_HINT
+            )
+            return None
         return ir.AggregateCall(function, tuple(arguments), distinct)  # type: ignore[arg-type]
 
     # --- Expressions -----------------------------------------------------
@@ -3135,6 +3150,26 @@ def _is_integer_or_text_literal(expression: ir.Expression) -> bool:
     return isinstance(expression, ir.Literal) and isinstance(
         expression.value, int | str
     )
+
+
+def _visibly_fractional(expression: ir.Expression) -> bool:
+    """Whether a T-SQL value is visibly a decimal or floating-point number: a
+    cast to one, a literal with a decimal point, or arithmetic involving one
+    (T-SQL gives the result the type that ranks higher, not the integer)."""
+    match expression:
+        case ir.Cast(data_type=data_type):
+            return data_type == "double" or data_type.startswith("decimal")
+        case ir.Literal(value=value):
+            return isinstance(value, Decimal | float)
+        case ir.UnaryOp(operand=operand):
+            return _visibly_fractional(operand)
+        case ir.BinaryOp(op=op, left=left, right=right) if op in (
+            ir.BinaryOperator.ADD,
+            ir.BinaryOperator.SUBTRACT,
+            ir.BinaryOperator.MULTIPLY,
+        ):
+            return _visibly_fractional(left) or _visibly_fractional(right)
+    return False
 
 
 def _without_implicit_string_cast(node: exp.Expression) -> exp.Expression:
