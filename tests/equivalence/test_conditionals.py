@@ -141,6 +141,34 @@ DIALECT_SCENARIOS = {
         "SELECT order_id, amount::numeric(10,1) AS rounded FROM orders",
         "SELECT order_id, CAST(amount AS DECIMAL(10,1)) AS rounded FROM orders",
     ),
+    # Casting a fraction to an integer rounds it in these dialects, halves
+    # away from zero for exact numbers (2.500 -> 3, -2.500 -> -3); Spark's
+    # cast truncates, so the generated code rounds first.
+    **{
+        f"{label} integer cast rounds exact numbers": (
+            dialect,
+            "SELECT product_id, CAST(price AS INT) AS whole, "
+            f"CAST(price * 10 AS {target}) AS tenths FROM products",
+            "SELECT product_id, CAST(ROUND(price) AS INT) AS whole, "
+            f"CAST(ROUND(price * 10) AS {spark_target}) AS tenths FROM products",
+        )
+        for label, dialect, target, spark_target in [
+            ("PostgreSQL", "postgres", "BIGINT", "BIGINT"),
+            ("MySQL", "mysql", "SIGNED", "BIGINT"),
+            ("Snowflake", "snowflake", "INTEGER", "INT"),
+            ("BigQuery", "bigquery", "INT64", "BIGINT"),
+        ]
+    },
+    "PostgreSQL integer cast rounds floating-point values": (
+        "postgres",
+        "SELECT product_id, weight::int AS whole FROM products",
+        "SELECT product_id, CAST(ROUND(weight) AS INT) AS whole FROM products",
+    ),
+    "MySQL integer cast rounds floating-point values": (
+        "mysql",
+        "SELECT product_id, CAST(weight AS SIGNED) AS whole FROM products",
+        "SELECT product_id, CAST(ROUND(weight) AS BIGINT) AS whole FROM products",
+    ),
     # Spark SQL rejects VARCHAR without a length; PostgreSQL means unbounded.
     "PostgreSQL VARCHAR without a length": (
         "postgres",

@@ -1107,7 +1107,11 @@ def test_if_and_iif_become_case(sql: str, dialect: str) -> None:
             "snowflake",
             ir.Cast(A, "decimal(38,0)"),
         ),
-        ("SELECT CAST(a AS SIGNED) AS x FROM t", "mysql", ir.Cast(A, "bigint")),
+        (
+            "SELECT CAST(a AS SIGNED) AS x FROM t",
+            "mysql",
+            ir.Cast(ir.FunctionCall("round", (A,)), "bigint"),
+        ),
         ("SELECT CAST(a AS VARCHAR) AS x FROM t", "postgres", ir.Cast(A, "string")),
     ],
 )
@@ -1248,6 +1252,60 @@ def test_issues_inside_predicates_are_reported(
     issues = unsupported_issues(f"SELECT {sql_expression} AS x FROM t", dialect)
 
     assert issues == [("function F", "F(a)")]
+
+
+A_COLUMN = Column(("a",))
+
+
+@pytest.mark.parametrize(
+    ("sql_expression", "dialect", "expected"),
+    [
+        # These dialects round a fraction; Spark truncates, so round first.
+        (
+            "CAST(a AS INT)",
+            "postgres",
+            ir.Cast(ir.FunctionCall("round", (A_COLUMN,)), "int"),
+        ),
+        (
+            "a::smallint",
+            "postgres",
+            ir.Cast(ir.FunctionCall("round", (A_COLUMN,)), "smallint"),
+        ),
+        (
+            "CAST(a AS SIGNED)",
+            "mysql",
+            ir.Cast(ir.FunctionCall("round", (A_COLUMN,)), "bigint"),
+        ),
+        (
+            "a::INTEGER",
+            "snowflake",
+            ir.Cast(ir.FunctionCall("round", (A_COLUMN,)), "int"),
+        ),
+        (
+            "SAFE_CAST(a AS INT64)",
+            "bigquery",
+            ir.Cast(ir.FunctionCall("round", (A_COLUMN,)), "bigint", safe=True),
+        ),
+        (
+            "CAST(2.7 AS INT)",
+            "postgres",
+            ir.Cast(ir.FunctionCall("round", (Literal(Decimal("2.7")),)), "int"),
+        ),
+        # Nothing to round: an integer, or text, which is parsed, not rounded.
+        ("CAST(3 AS BIGINT)", "postgres", ir.Cast(Literal(3), "bigint")),
+        ("CAST('12' AS INT)", "postgres", ir.Cast(Literal("12"), "int")),
+        # Other target types, and dialects whose casts truncate as Spark's do.
+        ("CAST(a AS DOUBLE)", "postgres", ir.Cast(A_COLUMN, "double")),
+        ("CAST(a AS INT)", "tsql", ir.Cast(A_COLUMN, "int")),
+        ("CAST(a AS INT)", None, ir.Cast(A_COLUMN, "int")),
+    ],
+)
+def test_integer_casts_round_where_the_dialect_does(
+    sql_expression: str, dialect: str | None, expected: ir.Expression
+) -> None:
+    item = only_item(f"SELECT {sql_expression} AS x FROM t", dialect)
+
+    assert item == Alias(expected, "x")
 
 
 @pytest.mark.parametrize("precision", ["DECIMAL(40, 2)", "DECIMAL(5, 6)"])
