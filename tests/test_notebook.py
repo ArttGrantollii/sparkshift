@@ -32,6 +32,9 @@ def test_a_notebook_in_databricks_source_format() -> None:
         f"{sparkshift.__version__}. Tables are read by name from the current "
         "catalog and schema: run `USE CATALOG` and `USE SCHEMA` first if they are "
         "elsewhere.\n"
+        "# MAGIC\n"
+        "# MAGIC Needs a PySpark 4 client: on serverless compute, use environment "
+        "version 4 or later.\n"
         "\n"
         "# COMMAND ----------\n"
         "\n"
@@ -97,6 +100,9 @@ def test_warnings_are_listed_for_review() -> None:
         f"{sparkshift.__version__}. Tables are read by name from the current "
         "catalog and schema: run `USE CATALOG` and `USE SCHEMA` first if they are "
         "elsewhere.",
+        "# MAGIC",
+        "# MAGIC Needs a PySpark 4 client: on serverless compute, use environment "
+        "version 4 or later.",
         "# MAGIC",
         "# MAGIC **Review before running:**",
         "# MAGIC",

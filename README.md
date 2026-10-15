@@ -249,7 +249,9 @@ sparkshift convert jobs/ --notebook -o notebooks/
 ```
 
 Each notebook is a `.py` file in Databricks' source format: a Markdown cell
-that names the source file and lists the warnings to review, a cell for each
+that names the source file, says that the code needs a PySpark 4 client
+(serverless environment version 4 or later), and lists the warnings to
+review, a cell for each
 part of the code (imports, each DataFrame, the result), and
 `display(result)`. Import it into a workspace (**Workspace → Import**) and run
 it; `spark` and `display` are defined there. Tables are read by name from the

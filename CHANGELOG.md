@@ -271,6 +271,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Generated notebooks say in their first cell that the code needs a PySpark
+  4 client: serverless environment version 4 or later. Phase 5 (Databricks)
+  is complete.
+
 - Decimal literals are generated as their text cast to their exact type,
   `F.lit("1.10").cast("decimal(3,2)")`, instead of `F.lit(Decimal("1.10"))`,
   which Spark Connect types as `decimal(10,2)`. A decimal literal cast to a

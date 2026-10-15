@@ -31,7 +31,10 @@ compute on Spark 4.2.0, the version SparkShift is tested with, and
   plain code.
 - **A Markdown cell first**, naming the source file, its language, and the
   SparkShift version, with the warnings to review. A notebook travels without
-  the command line that printed those warnings.
+  the command line that printed those warnings. (Amended 2026-10-15: it also
+  says the code needs a PySpark 4 client, serverless environment version 4 or
+  later, after validation showed that older environments lack APIs the code
+  uses; see [databricks-validation.md](../databricks-validation.md).)
 - **`display(result)` last**, to show the result as Databricks notebooks do.
 - **Tables keep the names in the source.** The notebook says that they are
   read from the current catalog and schema. Rewriting names for Unity

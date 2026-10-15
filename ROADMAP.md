@@ -15,7 +15,7 @@ Status legend: **Done** · **In progress** · **Planned**
 | 6 | Public browser-based playground (live demo) | Done |
 | 3 | Advanced SQL: QUALIFY, multi-dialect testing, coverage reporting | Done |
 | 4 | SAS → PySpark for a documented subset (DATA step, PROC SQL/SORT/MEANS/FREQ) | Done |
-| 5 | Databricks notebook generation and deployment | In progress |
+| 5 | Databricks notebooks, Spark Connect testing, upload to a workspace, and validation on Databricks | Done |
 | 7 | Documentation polish and 1.0 release on PyPI | Planned |
 
 ## Guiding principle

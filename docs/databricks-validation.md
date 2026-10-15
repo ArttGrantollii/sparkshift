@@ -73,4 +73,5 @@ clients:
 | 5 | 4.1.0 | present |
 
 So on Databricks serverless compute, run generated code in environment
-version 4 or later; the validation tool sets it with `--environment`.
+version 4 or later; the validation tool sets it with `--environment`, and
+every generated notebook says so in its first cell.

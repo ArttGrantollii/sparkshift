@@ -6,8 +6,9 @@ cells, and a cell whose lines start with ``# MAGIC %md`` is Markdown. Databricks
 imports such a file as a notebook, and it stays a readable, diffable Python
 file (see docs/adr/0007-databricks-notebooks.md).
 
-The notebook has a Markdown cell that says where the code comes from and
-lists the warnings to review, then the generated code, one cell per section
+The notebook has a Markdown cell that says where the code comes from, that
+it needs a PySpark 4 client, and lists the warnings to review, then the
+generated code, one cell per section
 (the imports, the table and window variables, each DataFrame, and the
 result), and finally ``display(result)``. ``spark`` and ``display`` are
 predefined in Databricks notebooks.
@@ -68,6 +69,11 @@ def _description(
         f"Converted from {origin} ({language}) by SparkShift {__version__}. "
         "Tables are read by name from the current catalog and schema: run "
         "`USE CATALOG` and `USE SCHEMA` first if they are elsewhere.",
+        "",
+        # Measured: serverless environments 2 and 3 have a PySpark 3.5 client,
+        # without Column.outer() (docs/databricks-validation.md).
+        "Needs a PySpark 4 client: on serverless compute, use environment "
+        "version 4 or later.",
     ]
     if result.warnings:
         lines += ["", "**Review before running:**", ""]
