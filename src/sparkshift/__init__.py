@@ -12,7 +12,7 @@ from sparkshift.errors import (
 )
 from sparkshift.notebook import to_notebook
 
-__version__ = "0.1.0rc1"
+__version__ = "0.1.0"
 
 __all__ = [
     "ConversionResult",

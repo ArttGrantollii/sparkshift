@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-15
+
+The first public release. SparkShift converts SQL `SELECT` queries, from
+generic SQL and six dialects (T-SQL, PostgreSQL, MySQL, Snowflake, BigQuery,
+and Oracle), and a documented subset of SAS (DATA steps and `PROC SORT`,
+`MEANS`, `SUMMARY`, `FREQ`, and `SQL`) into readable PySpark DataFrame code,
+and rejects what it cannot translate exactly with an explanation. It comes
+with a command line (`convert`, `report`, `upload`), Databricks notebooks and
+upload (`pip install "sparkshift[databricks]"`), and an
+[in-browser playground](https://arttgrantollii.github.io/sparkshift/).
+Supported constructs are tested by running the original and the generated
+code on Apache Spark, including through Spark Connect; PostgreSQL and MySQL
+queries also on real servers; and the examples on Databricks.
+
 ### Added
 
 - `convert --strict` rejects warned conversions with exit status 1 before writing

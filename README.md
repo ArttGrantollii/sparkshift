@@ -1,6 +1,8 @@
 # SparkShift
 
 [![CI](https://github.com/ArttGrantollii/sparkshift/actions/workflows/ci.yml/badge.svg)](https://github.com/ArttGrantollii/sparkshift/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/sparkshift.svg)](https://pypi.org/project/sparkshift/)
+[![Python](https://img.shields.io/pypi/pyversions/sparkshift.svg)](https://pypi.org/project/sparkshift/)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 Convert SQL and SAS programs into readable, idiomatic, tested PySpark DataFrame
@@ -9,7 +11,7 @@ code.
 **[Try it in your browser](https://arttgrantollii.github.io/sparkshift/)**: nothing to install, and your code
 never leaves your browser.
 
-> **Status: pre-release.** SparkShift converts `SELECT` queries, including
+> **Status: first release (0.1).** SparkShift converts `SELECT` queries, including
 > joins, aggregation, ordering, window functions and `QUALIFY`, CTEs, set
 > operations, and subqueries, from generic SQL and six dialects (T-SQL,
 > PostgreSQL, MySQL, Snowflake, BigQuery, and Oracle), and a documented
@@ -34,11 +36,10 @@ never leaves your browser.
 
 ## Install
 
-SparkShift needs Python 3.11 or later. It is not on PyPI yet; install it from
-GitHub:
+SparkShift needs Python 3.11 or later:
 
 ```bash
-pip install "git+https://github.com/ArttGrantollii/sparkshift.git"
+pip install sparkshift
 ```
 
 It depends only on [SQLGlot](https://github.com/tobymao/sqlglot): converting
@@ -161,7 +162,7 @@ and the limitations.
 
 ```bash
 sparkshift convert jobs/ --notebook -o notebooks/ --catalog main --schema sales
-pip install "sparkshift[databricks] @ git+https://github.com/ArttGrantollii/sparkshift.git"
+pip install "sparkshift[databricks]"
 sparkshift upload jobs/ --to /Workspace/Users/you@example.com/migrated --catalog main --schema sales
 ```
 
