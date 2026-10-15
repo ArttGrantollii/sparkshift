@@ -1,7 +1,8 @@
 # Roadmap
 
 SparkShift is in pre-release development. This roadmap describes intended
-scope, not current capabilities; see the README for what works today.
+scope, not current capabilities; see the README and
+[docs/supported-sql.md](docs/supported-sql.md) for what works today.
 Phases are listed in the order they are planned; their numbers are kept
 from the original plan.
 
@@ -16,7 +17,7 @@ Status legend: **Done** · **In progress** · **Planned**
 | 3 | Advanced SQL: QUALIFY, multi-dialect testing, coverage reporting | Done |
 | 4 | SAS → PySpark for a documented subset (DATA step, PROC SQL/SORT/MEANS/FREQ) | Done |
 | 5 | Databricks notebooks, Spark Connect testing, upload to a workspace, and validation on Databricks | Done |
-| 7 | Documentation polish and 1.0 release on PyPI | Planned |
+| 7 | Documentation polish and the first release on PyPI (0.1.0) | In progress |
 
 ## Guiding principle
 

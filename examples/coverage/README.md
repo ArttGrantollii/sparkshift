@@ -9,5 +9,5 @@ sparkshift report examples/coverage
 Two queries convert (one uses `QUALIFY`). Four are blocked: by a
 user-defined function, by `OFFSET`, or by holding two statements in one file.
 One is invalid SQL. Unlike [the gallery](../README.md), these queries are not
-all meant to convert; the main README shows the report they produce, and a
-test keeps it up to date.
+all meant to convert; the [command-line guide](../../docs/cli.md#report)
+shows the report they produce, and a test keeps it up to date.

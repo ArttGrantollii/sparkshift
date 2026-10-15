@@ -274,6 +274,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Generated notebooks say in their first cell that the code needs a PySpark
   4 client: serverless environment version 4 or later. Phase 5 (Databricks)
   is complete.
+- Documentation: the README is now a front page (about 200 lines, down from
+  630); the details moved, unchanged, into guides: `docs/supported-sql.md`,
+  `docs/cli.md`, `docs/databricks.md`, and a new `docs/api.md` for the
+  Python API. New `CONTRIBUTING.md` and `SECURITY.md`. A test checks that
+  every relative link and anchor in the documentation resolves.
 - Generated notebooks have `catalog` and `schema` widgets, text boxes at the
   top of the notebook that select where tables are read from, with the
   catalog API (names are never put into SQL text). `convert --notebook` and

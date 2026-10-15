@@ -102,7 +102,7 @@ way:
 The MySQL test database compares strings exactly, by code point
 (`utf8mb4_0900_bin`), as Spark does. MySQL's default collation ignores case,
 accents, and trailing spaces; SparkShift does not emulate that (see the
-README's known limitations), so the tests check what SparkShift claims to
+[known limitations](supported-sql.md#known-limitations)), so the tests check what SparkShift claims to
 convert exactly.
 
 Preparing these tests caught a wrong reference: PostgreSQL's documentation

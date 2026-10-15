@@ -1,4 +1,5 @@
-"""Keep the README's examples identical to what SparkShift actually produces."""
+"""Keep the examples in the README and the guides identical to what SparkShift
+actually produces."""
 
 import io
 import sys
@@ -9,7 +10,9 @@ import pytest
 import sparkshift
 from sparkshift.cli import main
 
-README = (Path(__file__).parents[1] / "README.md").read_text()
+ROOT = Path(__file__).parents[1]
+README = (ROOT / "README.md").read_text()
+CLI_GUIDE = (ROOT / "docs" / "cli.md").read_text()
 
 
 def test_usage_example_output_matches_real_output() -> None:
@@ -28,8 +31,10 @@ def test_command_line_example_matches_real_output(
     assert main(["convert", "-", "--dialect", "tsql"]) == 0
 
     command = f'echo "{sql}" | sparkshift convert - --dialect tsql'
-    assert command in README
-    assert f"```python\n{capsys.readouterr().out}```" in README
+    output = f"```python\n{capsys.readouterr().out}```"
+    for document in (README, CLI_GUIDE):
+        assert command in document
+        assert output in document
 
 
 def test_coverage_report_example_matches_real_output(
@@ -39,8 +44,8 @@ def test_coverage_report_example_matches_real_output(
 
     assert main(["report", "examples/coverage"]) == 0
 
-    assert "sparkshift report examples/coverage\n" in README
-    assert f"```text\n{capsys.readouterr().out}```" in README
+    assert "sparkshift report examples/coverage\n" in CLI_GUIDE
+    assert f"```text\n{capsys.readouterr().out}```" in CLI_GUIDE
 
 
 def test_sas_example_matches_real_output() -> None:
