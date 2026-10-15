@@ -120,6 +120,31 @@ def test_convert_writes_a_notebook(
     assert output.read_text(encoding="utf-8") == expected
 
 
+def test_a_notebook_starts_its_widgets_at_the_given_catalog_and_schema(
+    sql_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    arguments = ["convert", str(sql_file), "--notebook"]
+    arguments += ["--catalog", "workspace", "--schema", "sparkshift"]
+
+    assert main(arguments) == EXIT_CONVERTED
+
+    expected = sparkshift.to_notebook(
+        sparkshift.convert(SQL),
+        source=str(sql_file),
+        catalog="workspace",
+        schema="sparkshift",
+    )
+    assert capsys.readouterr().out == expected
+
+
+@pytest.mark.parametrize("option", ["--catalog", "--schema"])
+def test_catalog_and_schema_need_a_notebook(sql_file: Path, option: str) -> None:
+    with pytest.raises(SystemExit) as caught:
+        main(["convert", str(sql_file), option, "x"])
+
+    assert caught.value.code == EXIT_USAGE
+
+
 def test_a_notebook_from_standard_input(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

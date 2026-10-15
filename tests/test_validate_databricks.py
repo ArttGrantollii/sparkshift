@@ -70,7 +70,8 @@ def test_the_driver_runs_and_checks_every_example(tool: ModuleType) -> None:
     for name in expected:
         assert f"_validation_check({name!r}, result)" in source
     assert 'saveAsTable("workspace.sparkshift." + _name)' in source
-    assert 'spark.sql("USE SCHEMA sparkshift")' in source
+    # The examples' own widgets select the schema, not the driver.
+    assert "USE " not in source
 
 
 def test_the_driver_check_reports_differences(tool: ModuleType) -> None:

@@ -7,17 +7,19 @@ imports such a file as a notebook, and it stays a readable, diffable Python
 file (see docs/adr/0007-databricks-notebooks.md).
 
 The notebook has a Markdown cell that says where the code comes from, that
-it needs a PySpark 4 client, and lists the warnings to review, then the
-generated code, one cell per section
-(the imports, the table and window variables, each DataFrame, and the
-result), and finally ``display(result)``. ``spark`` and ``display`` are
-predefined in Databricks notebooks.
+it needs a PySpark 4 client, and lists the warnings to review; a cell with
+``catalog`` and ``schema`` widgets that choose where tables are read from;
+then the generated code, one cell per section (the imports, the table and
+window variables, each DataFrame, and the result), and finally
+``display(result)``. ``spark``, ``dbutils``, and ``display`` are predefined
+in Databricks notebooks.
 """
 
 from pathlib import PurePath
 
 from sparkshift.diagnostics import ConversionResult, Diagnostic
 from sparkshift.dialects import is_sas
+from sparkshift.emit import python_string
 
 HEADER = "# Databricks notebook source"
 CELL_SEPARATOR = "# COMMAND ----------"
@@ -40,14 +42,19 @@ def to_notebook(
     *,
     source: str | None = None,
     dialect: str | None = None,
+    catalog: str = "",
+    schema: str = "",
 ) -> str:
     """A Databricks source-format notebook that runs ``result.code``.
 
     ``source`` names the file the code was converted from, for the title,
     and ``dialect`` is the language it was converted from, as given to
-    ``convert`` ("sas" for SAS).
+    ``convert`` ("sas" for SAS). ``catalog`` and ``schema`` are the initial
+    values of the notebook's ``catalog`` and ``schema`` widgets, which select
+    where tables are read from; empty means the current catalog or schema.
     """
     cells = [_markdown(_description(result, source, dialect))]
+    cells.append(_location_cell(catalog, schema))
     cells += _code_cells(result.code)
     cells.append("display(result)")
     body = f"\n\n{CELL_SEPARATOR}\n\n".join(cells)
@@ -67,8 +74,9 @@ def _description(
         f"# {title}",
         "",
         f"Converted from {origin} ({language}) by SparkShift {__version__}. "
-        "Tables are read by name from the current catalog and schema: run "
-        "`USE CATALOG` and `USE SCHEMA` first if they are elsewhere.",
+        "Tables are read by name from the catalog and schema in the `catalog` "
+        "and `schema` widgets at the top of the notebook; leave a widget empty "
+        "to use the current one.",
         "",
         # Measured: serverless environments 2 and 3 have a PySpark 3.5 client,
         # without Column.outer() (docs/databricks-validation.md).
@@ -79,6 +87,25 @@ def _description(
         lines += ["", "**Review before running:**", ""]
         lines += [_warning(warning) for warning in result.warnings]
     return lines
+
+
+def _location_cell(catalog: str, schema: str) -> str:
+    """Widgets that choose the catalog and schema tables are read from.
+
+    The names go to the catalog API as values, never into SQL text, so any
+    name works and none can change the statement. An empty widget keeps the
+    current catalog or schema.
+    """
+    return "\n".join(
+        [
+            f'dbutils.widgets.text("catalog", {python_string(catalog)})',
+            f'dbutils.widgets.text("schema", {python_string(schema)})',
+            'if dbutils.widgets.get("catalog"):',
+            '    spark.catalog.setCurrentCatalog(dbutils.widgets.get("catalog"))',
+            'if dbutils.widgets.get("schema"):',
+            '    spark.catalog.setCurrentDatabase(dbutils.widgets.get("schema"))',
+        ]
+    )
 
 
 def _warning(warning: Diagnostic) -> str:

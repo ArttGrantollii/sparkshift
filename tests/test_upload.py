@@ -96,6 +96,23 @@ def test_unreadable_files_are_skipped_and_folders_created_once(
     assert "it is not UTF-8 text" in capsys.readouterr().err
 
 
+def test_uploaded_notebooks_start_at_the_given_catalog_and_schema(
+    workspace: FakeWorkspace, jobs: Path
+) -> None:
+    path = jobs / "daily" / "orders.sql"
+    arguments = [str(path), "--to", FOLDER, "--catalog", "main", "--schema", "sales"]
+
+    assert upload(*arguments) == EXIT_CONVERTED
+
+    source, _ = workspace.notebooks[f"{FOLDER}/orders"]
+    assert source == to_notebook(
+        sparkshift.convert(path.read_text()),
+        source="orders.sql",
+        catalog="main",
+        schema="sales",
+    )
+
+
 def test_a_single_file_goes_into_the_folder(
     workspace: FakeWorkspace, jobs: Path
 ) -> None:

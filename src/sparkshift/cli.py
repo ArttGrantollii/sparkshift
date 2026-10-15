@@ -62,6 +62,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _report(parser, arguments)
     if arguments.command == "upload":
         return _upload(parser, arguments)
+    if (arguments.catalog or arguments.schema) and not arguments.notebook:
+        parser.error("--catalog and --schema need --notebook")
     if arguments.input != _STDIN and Path(arguments.input).is_dir():
         return _convert_directory(parser, arguments)
     return _convert_one(parser, arguments)
@@ -112,6 +114,7 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="write Databricks notebooks (source format) instead of plain code",
     )
+    _add_location_arguments(convert_command, "with --notebook, ")
 
     convert_command.add_argument(
         "--strict",
@@ -185,6 +188,7 @@ def _parser() -> argparse.ArgumentParser:
         help="SQL dialect of the input, or sas for SAS programs only; omit it "
         "for generic SQL. A .sas file is always a SAS program",
     )
+    _add_location_arguments(upload_command, "")
     upload_command.add_argument(
         "--profile",
         help="the ~/.databrickscfg profile to authenticate with",
@@ -208,6 +212,17 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _add_location_arguments(command: argparse.ArgumentParser, condition: str) -> None:
+    """--catalog and --schema: the notebooks' widget values."""
+    for name in ("catalog", "schema"):
+        command.add_argument(
+            f"--{name}",
+            default="",
+            help=f"{condition}the {name} the notebooks read tables from, as the "
+            f"initial value of their {name} widget (default: the current one)",
+        )
+
+
 def _convert_one(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int:
     name = "standard input" if arguments.input == _STDIN else arguments.input
     sql = _read(parser, arguments.input)
@@ -216,7 +231,7 @@ def _convert_one(parser: argparse.ArgumentParser, arguments: argparse.Namespace)
     if result is None:
         return EXIT_NOT_CONVERTED
     source = None if arguments.input == _STDIN else arguments.input
-    code = _output(result, arguments.notebook, source, dialect)
+    code = _output(result, arguments, source, dialect)
     if arguments.output is None:
         sys.stdout.write(code)
     else:
@@ -253,7 +268,7 @@ def _convert_directory(
             _write(
                 parser,
                 destination,
-                _output(result, arguments.notebook, path.name, dialect),
+                _output(result, arguments, path.name, dialect),
             )
             converted += 1
 
@@ -387,7 +402,13 @@ def _upload(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> i
             parser.prog, sql, str(path), dialect, strict=arguments.strict
         )
         if result is not None:
-            notebook = to_notebook(result, source=path.name, dialect=dialect)
+            notebook = to_notebook(
+                result,
+                source=path.name,
+                dialect=dialect,
+                catalog=arguments.catalog,
+                schema=arguments.schema,
+            )
             notebooks.append((path, notebook_path, notebook))
 
     if arguments.dry_run:
@@ -455,12 +476,21 @@ def _source_files(
 
 
 def _output(
-    result: ConversionResult, notebook: bool, source: str | None, dialect: str | None
+    result: ConversionResult,
+    arguments: argparse.Namespace,
+    source: str | None,
+    dialect: str | None,
 ) -> str:
     """The code to write: plain, or as a Databricks notebook."""
-    if not notebook:
+    if not arguments.notebook:
         return result.code
-    return to_notebook(result, source=source, dialect=dialect)
+    return to_notebook(
+        result,
+        source=source,
+        dialect=dialect,
+        catalog=arguments.catalog,
+        schema=arguments.schema,
+    )
 
 
 def _dialect_of(path: Path, dialect: str | None) -> str | None:

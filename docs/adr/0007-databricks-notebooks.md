@@ -39,6 +39,14 @@ compute on Spark 4.2.0, the version SparkShift is tested with, and
 - **Tables keep the names in the source.** The notebook says that they are
   read from the current catalog and schema. Rewriting names for Unity
   Catalog's three-level names would be a guess about the user's catalog.
+  (Amended 2026-10-15: a user running an uploaded notebook got
+  `TABLE_OR_VIEW_NOT_FOUND`, because the tables were in another schema and
+  the note was easy to miss. A cell now creates `catalog` and `schema`
+  widgets, text boxes at the top of the notebook, and selects them with
+  `spark.catalog.setCurrentCatalog` and `setCurrentDatabase`: the names are
+  passed as values, never put into SQL text. `--catalog` and `--schema` give
+  their initial values; empty keeps the current catalog or schema, so names
+  are still never guessed. Widgets are also job parameters.)
 - `sparkshift convert --notebook` and `sparkshift.to_notebook(...)` write it,
   for SQL and SAS alike.
 

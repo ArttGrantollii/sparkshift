@@ -245,18 +245,24 @@ include SAS programs.
 SAS, one file or a whole directory:
 
 ```bash
-sparkshift convert jobs/ --notebook -o notebooks/
+sparkshift convert jobs/ --notebook -o notebooks/ --catalog main --schema sales
 ```
 
 Each notebook is a `.py` file in Databricks' source format: a Markdown cell
 that names the source file, says that the code needs a PySpark 4 client
 (serverless environment version 4 or later), and lists the warnings to
-review, a cell for each
-part of the code (imports, each DataFrame, the result), and
-`display(result)`. Import it into a workspace (**Workspace → Import**) and run
-it; `spark` and `display` are defined there. Tables are read by name from the
-current catalog and schema. In Python, `sparkshift.to_notebook(result,
-source="job.sql")` does the same. See
+review; a cell with `catalog` and `schema` widgets; a cell for each part of
+the code (imports, each DataFrame, the result); and `display(result)`.
+Import it into a workspace (**Workspace → Import**) and run it; `spark`,
+`dbutils`, and `display` are defined there.
+
+Tables are read by name from the catalog and schema in the widgets, which
+appear as text boxes at the top of the notebook. `--catalog` and `--schema`
+give their initial values; an empty box keeps the current catalog or schema
+(by default, both start empty). To read other tables, type another schema
+and run the notebook again, or pass `catalog` and `schema` as parameters of
+a job. In Python, `sparkshift.to_notebook(result, source="job.sql",
+catalog="main", schema="sales")` does the same. See
 [ADR 0007](docs/adr/0007-databricks-notebooks.md).
 
 ### Uploading to a workspace
@@ -280,6 +286,8 @@ sparkshift upload jobs/ --to /Workspace/Users/you@example.com/migrated
   [`.env.example`](.env.example) lists the variables.
 - `--dry-run` converts and lists the notebook paths without connecting (and
   works without the extra).
+- `--catalog` and `--schema` set the notebooks' widgets, as for
+  `convert --notebook`, so the notebooks read the right tables as uploaded.
 - An existing notebook is never replaced unless you pass `--overwrite`; it is
   reported, and the other files are still uploaded. `--strict` skips any
   file whose conversion has warnings. The exit status is 1 if any file

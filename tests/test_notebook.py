@@ -18,6 +18,23 @@ def cells(notebook: str) -> list[str]:
     return notebook[len(HEADER) + 1 : -1].split(SEPARATOR)
 
 
+def location_cell(catalog: str = "", schema: str = "") -> str:
+    """The cell whose widgets choose where tables are read from."""
+    return (
+        f'dbutils.widgets.text("catalog", "{catalog}")\n'
+        f'dbutils.widgets.text("schema", "{schema}")\n'
+        'if dbutils.widgets.get("catalog"):\n'
+        '    spark.catalog.setCurrentCatalog(dbutils.widgets.get("catalog"))\n'
+        'if dbutils.widgets.get("schema"):\n'
+        '    spark.catalog.setCurrentDatabase(dbutils.widgets.get("schema"))'
+    )
+
+
+def program(code: str) -> str:
+    """What a notebook runs: the widget cell, the code, and display(result)."""
+    return f"{location_cell()}\n{code}\ndisplay(result)\n"
+
+
 def test_a_notebook_in_databricks_source_format() -> None:
     result = sparkshift.convert("SELECT name FROM customers WHERE score > 3")
 
@@ -29,12 +46,16 @@ def test_a_notebook_in_databricks_source_format() -> None:
         "# MAGIC # good_customers\n"
         "# MAGIC\n"
         f"# MAGIC Converted from `good_customers.sql` (generic SQL) by SparkShift "
-        f"{sparkshift.__version__}. Tables are read by name from the current "
-        "catalog and schema: run `USE CATALOG` and `USE SCHEMA` first if they are "
-        "elsewhere.\n"
+        f"{sparkshift.__version__}. Tables are read by name from the catalog and "
+        "schema in the `catalog` and `schema` widgets at the top of the notebook; "
+        "leave a widget empty to use the current one.\n"
         "# MAGIC\n"
         "# MAGIC Needs a PySpark 4 client: on serverless compute, use environment "
         "version 4 or later.\n"
+        "\n"
+        "# COMMAND ----------\n"
+        "\n"
+        f"{location_cell()}\n"
         "\n"
         "# COMMAND ----------\n"
         "\n"
@@ -63,7 +84,7 @@ def test_each_section_of_the_code_is_a_cell() -> None:
         "FROM big o JOIN customers c ON o.customer_id = c.customer_id"
     )
 
-    code_cells = cells(to_notebook(result))[1:-1]
+    code_cells = cells(to_notebook(result))[2:-1]
 
     # The import sections share a cell; the others keep the code's sections.
     sections = result.code.strip("\n").split("\n\n")
@@ -97,9 +118,9 @@ def test_warnings_are_listed_for_review() -> None:
 
     assert description.splitlines()[3:] == [
         "# MAGIC Converted from `job.sas` (SAS) by SparkShift "
-        f"{sparkshift.__version__}. Tables are read by name from the current "
-        "catalog and schema: run `USE CATALOG` and `USE SCHEMA` first if they are "
-        "elsewhere.",
+        f"{sparkshift.__version__}. Tables are read by name from the catalog and "
+        "schema in the `catalog` and `schema` widgets at the top of the notebook; "
+        "leave a widget empty to use the current one.",
         "# MAGIC",
         "# MAGIC Needs a PySpark 4 client: on serverless compute, use environment "
         "version 4 or later.",
@@ -143,9 +164,9 @@ def test_without_a_source() -> None:
         "# MAGIC # Converted code",
         "# MAGIC",
         "# MAGIC Converted from code (generic SQL) by SparkShift "
-        f"{sparkshift.__version__}. Tables are read by name from the current "
-        "catalog and schema: run `USE CATALOG` and `USE SCHEMA` first if they are "
-        "elsewhere.",
+        f"{sparkshift.__version__}. Tables are read by name from the catalog and "
+        "schema in the `catalog` and `schema` widgets at the top of the notebook; "
+        "leave a widget empty to use the current one.",
     ]
 
 
@@ -157,9 +178,7 @@ def test_multiline_sas_warning_remains_notebook_metadata() -> None:
     )
     assert result.warnings
     notebook = to_notebook(result, source="deduplicate.sas", dialect="sas")
-    assert ast.dump(ast.parse(notebook)) == ast.dump(
-        ast.parse(result.code + "\ndisplay(result)\n")
-    )
+    assert ast.dump(ast.parse(notebook)) == ast.dump(ast.parse(program(result.code)))
     assert all(line.startswith("# MAGIC") for line in cells(notebook)[0].splitlines())
 
 
@@ -179,8 +198,44 @@ def test_metadata_cannot_create_executable_code_or_notebook_cells(
         options[field] = payload
     result = ConversionResult("result = spark.table('t')\n", (Diagnostic(**values),))
     notebook = to_notebook(result, **options)
-    assert ast.dump(ast.parse(notebook)) == ast.dump(
-        ast.parse(result.code + "\ndisplay(result)\n")
-    )
-    assert notebook.splitlines().count(CELL_SEPARATOR) == 2
+    assert ast.dump(ast.parse(notebook)) == ast.dump(ast.parse(program(result.code)))
+    assert notebook.splitlines().count(CELL_SEPARATOR) == 3
     assert all(line.startswith("# MAGIC") for line in cells(notebook)[0].splitlines())
+
+
+def test_widgets_start_with_the_given_catalog_and_schema() -> None:
+    result = ConversionResult("result = spark.table('t')\n")
+
+    notebook = to_notebook(result, catalog="workspace", schema="sparkshift")
+
+    assert cells(notebook)[1] == location_cell("workspace", "sparkshift")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        'main"; import os; "',
+        "back\\slash",
+        "line\nbreak",
+        f"x\n{CELL_SEPARATOR}\nraise RuntimeError('injected')",
+        "`odd name`",
+        "Zoë",
+    ],
+)
+def test_any_catalog_or_schema_name_stays_a_plain_value(name: str) -> None:
+    """A name is a Python string value, never code: whatever it contains, the
+    widget's default is exactly that name and the program is unchanged."""
+    result = ConversionResult("result = spark.table('t')\n")
+
+    notebook = to_notebook(result, catalog=name, schema=name)
+
+    tree = ast.parse(notebook)
+    defaults = [
+        node.args[1].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "dbutils.widgets.text"
+    ]
+    assert defaults == [name, name]
+    assert len(tree.body) == len(ast.parse(program(result.code)).body)
+    assert notebook.splitlines().count(CELL_SEPARATOR) == 3

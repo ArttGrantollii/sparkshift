@@ -274,6 +274,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Generated notebooks say in their first cell that the code needs a PySpark
   4 client: serverless environment version 4 or later. Phase 5 (Databricks)
   is complete.
+- Generated notebooks have `catalog` and `schema` widgets, text boxes at the
+  top of the notebook that select where tables are read from, with the
+  catalog API (names are never put into SQL text). `convert --notebook` and
+  `upload` take `--catalog` and `--schema` for their initial values; empty
+  keeps the current ones. Before, a notebook whose tables were in another
+  schema failed with `TABLE_OR_VIEW_NOT_FOUND` unless the user added `USE`
+  statements.
 
 - Decimal literals are generated as their text cast to their exact type,
   `F.lit("1.10").cast("decimal(3,2)")`, instead of `F.lit(Decimal("1.10"))`,

@@ -13,11 +13,12 @@ hand-derived SAS rows. On the workspace, it:
 
 1. creates or replaces the schema's tables (default workspace.sparkshift)
    with the same rows and column types;
-2. uploads the examples with `sparkshift upload` under FOLDER/examples, and a
-   driver notebook at FOLDER/driver;
-3. runs the driver once on serverless compute. The driver selects the schema,
-   runs each example notebook with %run, and compares its `result` with the
-   local column types and rows (as a multiset; order is checked locally).
+2. uploads the examples with `sparkshift upload --catalog --schema` under
+   FOLDER/examples, and a driver notebook at FOLDER/driver;
+3. runs the driver once on serverless compute. The driver runs each example
+   notebook with %run, whose widgets select the schema, and compares its
+   `result` with the local column types and rows (as a multiset; order is
+   checked locally).
 
 It prints one line per example and exits with 1 if any differ. Credentials
 come only from the profile; nothing here prints them.
@@ -151,8 +152,7 @@ def driver_source(
             '        .option("overwriteSchema", "true")',
             f'        .saveAsTable("{catalog}.{schema}." + _name)',
             "    )",
-            f'spark.sql("USE CATALOG {catalog}")',
-            f'spark.sql("USE SCHEMA {schema}")',
+            # No USE statements: each example's widgets select the schema.
         ]
     )
     cells = [setup, load]
@@ -168,10 +168,13 @@ def driver_source(
     return f"# Databricks notebook source\n{body}\n"
 
 
-def upload_examples(folder: str, profile: str) -> None:
-    """Upload every example folder with `sparkshift upload`."""
+def upload_examples(folder: str, profile: str, catalog: str, schema: str) -> None:
+    """Upload every example folder with `sparkshift upload`, with notebook
+    widgets that select the test tables' catalog and schema."""
     from sparkshift.cli import main
 
+    common = ["--overwrite", "--profile", profile]
+    common += ["--catalog", catalog, "--schema", schema]
     for directory in sorted((EXAMPLES / "sql").iterdir()):
         arguments = [
             "upload",
@@ -181,10 +184,10 @@ def upload_examples(folder: str, profile: str) -> None:
         ]
         if directory.name != "generic":
             arguments += ["--dialect", directory.name]
-        if main([*arguments, "--overwrite", "--profile", profile]) != 0:
+        if main([*arguments, *common]) != 0:
             raise SystemExit(f"uploading {directory} failed")
     sas = ["upload", str(EXAMPLES / "sas"), "--to", f"{folder}/examples/sas"]
-    if main([*sas, "--overwrite", "--profile", profile]) != 0:
+    if main([*sas, *common]) != 0:
         raise SystemExit("uploading examples/sas failed")
 
 
@@ -246,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print("computing the expected results on local Spark", file=sys.stderr)
     expected = local_results()
-    upload_examples(arguments.folder, arguments.profile)
+    upload_examples(arguments.folder, arguments.profile, catalog, schema)
 
     from sparkshift.databricks import connect
 

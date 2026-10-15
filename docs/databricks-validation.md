@@ -16,10 +16,12 @@ an account's credentials. It:
    examples against rows derived by hand from SAS's documentation;
 2. creates the same tables, with the same column types and rows, in the
    schema `workspace.sparkshift`;
-3. uploads the examples as notebooks with `sparkshift upload`, plus a driver
-   notebook;
+3. uploads the examples as notebooks with `sparkshift upload --catalog
+   workspace --schema sparkshift`, plus a driver notebook;
 4. runs the driver once as a serverless job. For each example, it runs the
-   example's notebook with `%run`, then compares `result` with the expected
+   example's notebook with `%run`; the notebook's own `catalog` and `schema`
+   widgets select the tables (the driver runs no `USE` statement). It then
+   compares `result` with the expected
    column types (`DataFrame.schema.simpleString()`) and rows, as a multiset:
    decimals exactly, dates as ISO text, and doubles to 10 significant
    digits. Row order is checked by the local tests.
@@ -44,6 +46,10 @@ It prints one line per example and exits with 1 if any differ.
 The examples are the 8 SQL queries in `examples/sql` (generic SQL,
 BigQuery, MySQL, Oracle, PostgreSQL, Snowflake, and T-SQL) and the 3 SAS
 programs in `examples/sas`.
+
+A later run on the same day, after the notebooks gained their `catalog` and
+`schema` widgets, matched 11 of 11 in environment 4 with the driver's `USE`
+statements removed: the widgets alone selected the schema.
 
 To check that the comparison can fail, one run had two expectations changed
 on purpose: a row removed from one example and a column type changed in
