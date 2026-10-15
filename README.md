@@ -285,6 +285,17 @@ sparkshift upload jobs/ --to /Workspace/Users/you@example.com/migrated
 
 See [ADR 0010](docs/adr/0010-upload-notebooks-with-the-databricks-sdk.md).
 
+### Running on Databricks
+
+The generated code uses PySpark 4 APIs, such as `Column.outer()` for
+correlated subqueries, so it needs a PySpark 4 client. On serverless compute
+that is environment version 4 or later; environment versions 2 and 3 have a
+PySpark 3.5 client even though the server runs Spark 4. Every example in
+`examples/sql` and `examples/sas` has been run on a Databricks Free Edition
+workspace in serverless
+environments 4 and 5 and returned the same column types and rows as on local
+Spark; see [docs/databricks-validation.md](docs/databricks-validation.md).
+
 ## Playground
 
 The [playground](https://arttgrantollii.github.io/sparkshift/) runs SparkShift entirely in the browser, with
@@ -561,6 +572,8 @@ databases.
 
 The Spark tests also run through Spark Connect, the way Databricks serverless
 compute runs code, in a separate CI job. See [docs/testing.md](docs/testing.md).
+The gallery examples have also been run on a Databricks workspace and matched
+local Spark; see [docs/databricks-validation.md](docs/databricks-validation.md).
 
 ## Development setup
 

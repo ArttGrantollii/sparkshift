@@ -2,7 +2,8 @@
 
 > **Status:** SQL and the documented SAS subset use the shared pipeline.
 > The Python API, CLI, public playground, notebook generation, and notebook
-> upload exist; live workspace validation is in progress.
+> upload exist; the examples have been validated on a Databricks workspace
+> ([databricks-validation.md](databricks-validation.md)).
 
 ## The core idea
 

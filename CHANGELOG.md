@@ -262,6 +262,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sparkshift[databricks]` (the Databricks SDK); credentials come only from
   the SDK's environment variables or `~/.databrickscfg` profiles and are
   redacted from every message. `.env.example` documents the variables.
+- Validation on Databricks: `tools/validate_databricks.py` uploads every
+  example with `sparkshift upload`, runs them in a serverless job, and
+  compares each result with local Spark. On a Free Edition workspace, all 11
+  examples matched in serverless environments 4 (PySpark 4.0.0) and 5
+  (PySpark 4.1.0); environments 2 and 3 have a PySpark 3.5 client, which
+  lacks `Column.outer()`. Recorded in `docs/databricks-validation.md`.
 
 ### Changed
 
