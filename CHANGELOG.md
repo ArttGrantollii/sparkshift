@@ -274,6 +274,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Generated notebooks say in their first cell that the code needs a PySpark
   4 client: serverless environment version 4 or later. Phase 5 (Databricks)
   is complete.
+- Release automation (ADR 0011): pushing a version tag runs every CI job,
+  checks the tag against the version and the CHANGELOG, publishes to
+  TestPyPI, installs it from there, and, after a maintainer's approval,
+  publishes to PyPI with Trusted Publishing (no token) and creates a GitHub
+  release. The PyPI description is the README with its relative links
+  rewritten to GitHub. Package description and keywords now mention SAS and
+  Databricks.
 - Documentation: the README is now a front page (about 200 lines, down from
   630); the details moved, unchanged, into guides: `docs/supported-sql.md`,
   `docs/cli.md`, `docs/databricks.md`, and a new `docs/api.md` for the

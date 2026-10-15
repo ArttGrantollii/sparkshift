@@ -1,0 +1,142 @@
+name: Release
+
+# Publishes a version when its tag (v0.1.0, or v0.1.0rc1 for a pre-release) is
+# pushed. Trusted Publishing: PyPI and TestPyPI trust this workflow's identity,
+# so no token exists anywhere. See docs/releasing.md and ADR 0011.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # Every CI job, on the tagged commit.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build and check
+    needs: ci
+    runs-on: ubuntu-latest
+    outputs:
+      prerelease: ${{ steps.check.outputs.prerelease }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.2.0
+
+      - name: Check the tag matches the version and the CHANGELOG
+        id: check
+        run: |
+          python3 tools/release.py check "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build the source distribution and wheel
+        run: uv build
+
+      - name: Check the wheel's dependencies, contents, and description
+        run: python3 tools/check_wheel.py dist/*.whl
+
+      - name: Check the package description renders on PyPI
+        run: uvx twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  testpypi:
+    name: Publish to TestPyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/sparkshift/${{ needs.build.outputs.version }}/
+    permissions:
+      id-token: write  # Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@v1.14.2
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  # Install what TestPyPI now serves, in a clean environment, and use it.
+  verify:
+    name: Install from TestPyPI
+    needs: [build, testpypi]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: astral-sh/setup-uv@v10.2.0
+
+      - name: Install and run the published package
+        run: |
+          uv venv /tmp/clean
+          # Only SparkShift comes from TestPyPI, where anyone can upload a
+          # package named like a dependency; its dependencies come from PyPI.
+          # A new release can take a moment to appear in the index.
+          for attempt in 1 2 3 4 5 6; do
+            if uv pip install --python /tmp/clean --no-cache --no-deps \
+                --index-url https://test.pypi.org/simple/ "sparkshift==$VERSION"; then
+              break
+            fi
+            sleep 20
+          done
+          /tmp/clean/bin/python -c "
+          from importlib.metadata import requires
+          print('\n'.join(r for r in requires('sparkshift') if 'extra ==' not in r))
+          " > requirements.txt
+          uv pip install --python /tmp/clean -r requirements.txt
+          test "$(/tmp/clean/bin/sparkshift --version)" = "sparkshift $VERSION"
+          echo "SELECT name FROM customers WHERE country = 'US'" \
+            | /tmp/clean/bin/sparkshift convert -
+
+  pypi:
+    name: Publish to PyPI
+    needs: [build, verify]
+    # Pre-releases stop at TestPyPI.
+    if: needs.build.outputs.prerelease == 'false'
+    runs-on: ubuntu-latest
+    # The environment requires a maintainer's approval before this job runs.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/sparkshift/${{ needs.build.outputs.version }}/
+    permissions:
+      id-token: write  # Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@v1.14.2
+
+  github-release:
+    name: GitHub release
+    needs: [build, pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Create the release with the CHANGELOG notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          python3 tools/release.py notes "$VERSION" > notes.md
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "SparkShift $VERSION" --notes-file notes.md --verify-tag

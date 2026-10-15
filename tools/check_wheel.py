@@ -5,7 +5,8 @@ Usage: python tools/check_wheel.py dist/sparkshift-*.whl
 Checks what a development checkout cannot show: that the wheel's only runtime
 dependency is SQLGlot (PySpark is never required, see ADR 0002) and its only
 optional one the Databricks SDK, in the ``databricks`` extra (ADR 0010), that
-it contains the package, its type information, its license, and the
+its description (the README) has no links PyPI cannot follow, that it
+contains the package, its type information, its license, and the
 ``sparkshift`` command, and nothing from the repository besides the package.
 Prints each problem and exits with 1 if there are any.
 """
@@ -25,6 +26,13 @@ REQUIRED_FILES = [
 ]
 COMMAND = "sparkshift = sparkshift.cli:main"
 _EXTRA = re.compile(r"""extra\s*==\s*["']([^"']+)["']""")
+# A Markdown link whose target is not a full URL: PyPI cannot follow it.
+_RELATIVE_LINK = re.compile(r"\]\((?![a-z]+:)([^)\s]+)\)")
+
+
+def relative_links(description: str) -> list[str]:
+    """Link targets in the package description that PyPI cannot follow."""
+    return _RELATIVE_LINK.findall(description)
 
 
 def problems(wheel_path: str) -> list[str]:
@@ -51,6 +59,11 @@ def problems(wheel_path: str) -> list[str]:
         )
     if extras != ALLOWED_EXTRAS:
         found.append(f"optional dependencies should be {ALLOWED_EXTRAS}: {extras}")
+    description = metadata.get_payload()
+    if not isinstance(description, str) or "SparkShift" not in description:
+        found.append("the package description is missing")
+    elif links := relative_links(description):
+        found.append(f"the description has links PyPI cannot follow: {links}")
     found += [f"missing {name}" for name in REQUIRED_FILES if name not in names]
     if not any(name.endswith(".dist-info/licenses/LICENSE") for name in names):
         found.append("missing the LICENSE file")

@@ -1,17 +1,26 @@
 [build-system]
-requires = ["hatchling>=1.27"]
+# hatch-fancy-pypi-readme rewrites the README's relative links for PyPI.
+requires = ["hatchling>=1.27", "hatch-fancy-pypi-readme>=25.1"]
 build-backend = "hatchling.build"
 
 [project]
 name = "sparkshift"
-dynamic = ["version"]
-description = "Convert SQL into readable, idiomatic, tested PySpark DataFrame code."
-readme = "README.md"
+dynamic = ["version", "readme"]
+description = "Convert SQL and SAS programs into readable, tested PySpark DataFrame code."
 requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Art Grantolli" }]
-keywords = ["pyspark", "spark", "sql", "transpiler", "migration", "data-engineering"]
+keywords = [
+    "pyspark",
+    "spark",
+    "sql",
+    "sas",
+    "databricks",
+    "transpiler",
+    "migration",
+    "data-engineering",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -47,6 +56,23 @@ path = "src/sparkshift/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sparkshift"]
+
+# PyPI shows the README as the package description but cannot follow links
+# into the repository, so relative links become links to GitHub there. On
+# GitHub, the README keeps its relative links.
+[tool.hatch.metadata.hooks.fancy-pypi-readme]
+content-type = "text/markdown"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.fragments]]
+path = "README.md"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '\]\((?![a-z]+:|#)([^)\s]+)\)'
+replacement = '](https://github.com/ArttGrantollii/sparkshift/blob/main/\1)'
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '\]\(#([^)\s]+)\)'
+replacement = '](https://github.com/ArttGrantollii/sparkshift#\1)'
 
 [dependency-groups]
 dev = [

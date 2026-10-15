@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The release workflow runs every job here before it publishes.
+  workflow_call:
 
 # Read-only access is all this workflow needs.
 permissions:

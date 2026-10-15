@@ -70,3 +70,6 @@ Significant design decisions get an ADR in [docs/adr/](docs/adr/).
 - Every CI job must pass.
 - Never commit credentials: tokens, passwords, `.env` files. See
   [SECURITY.md](SECURITY.md).
+
+Releases are published by pushing a version tag; see
+[docs/releasing.md](docs/releasing.md).
