@@ -19,6 +19,8 @@ Status legend: **Done** · **In progress** · **Planned**
 | 4 | SAS → PySpark for a documented subset (DATA step, PROC SQL/SORT/MEANS/FREQ) | Done |
 | 5 | Databricks notebooks, Spark Connect testing, upload to a workspace, and validation on Databricks | Done |
 | 7 | Documentation polish and the first release on PyPI (0.1.0) | Done |
+| 8 | Playground 2.0: a redesigned playground, converting whole folders in the browser, notebooks that write their results to tables, and deploying them to Databricks as a job | In progress |
+| 9 | Lakeflow Declarative Pipelines (formerly Delta Live Tables) as a conversion and deployment target, alongside jobs | Planned |
 
 ## Guiding principle
 
