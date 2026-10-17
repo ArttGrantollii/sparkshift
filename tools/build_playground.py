@@ -2,8 +2,8 @@
 
 Usage: uv run python tools/build_playground.py [OUTPUT]   (default: _site)
 
-The site holds the playground's files, the SparkShift wheel built from this
-checkout, the SQLGlot wheel pinned in uv.lock (checked against its recorded
+The site holds the playground's files and fonts, the SparkShift wheel built
+from this checkout, the SQLGlot wheel pinned in uv.lock (checked against its recorded
 hash), and manifest.json, which lists the wheels and the examples gallery. It
 needs no server: any static host, or ``python -m http.server``, can serve it.
 """
@@ -21,11 +21,14 @@ ROOT = Path(__file__).resolve().parents[1]
 PLAYGROUND_FILES = [
     "index.html",
     "style.css",
+    "theme.js",
     "app.js",
     "worker-client.js",
     "worker.js",
     "bridge.py",
 ]
+# Served by the site itself, with their licenses (SIL Open Font License).
+FONT_FILES = ["*.woff2", "OFL-*.txt"]
 
 
 def build(output: Path) -> None:
@@ -35,6 +38,11 @@ def build(output: Path) -> None:
     wheels.mkdir(parents=True)
     for name in PLAYGROUND_FILES:
         shutil.copy2(ROOT / "playground" / name, output / name)
+    fonts = output / "fonts"
+    fonts.mkdir()
+    for pattern in FONT_FILES:
+        for path in (ROOT / "playground" / "fonts").glob(pattern):
+            shutil.copy2(path, fonts / path.name)
 
     subprocess.run(
         ["uv", "build", "--wheel", "--quiet", "--out-dir", str(wheels)],

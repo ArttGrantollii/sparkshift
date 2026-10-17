@@ -22,6 +22,16 @@ def convert_for_page(sql: str, dialect: str) -> str:
     ``{"ok": false, "error": ..., "issues": [...]}`` when it cannot be
     converted; ``issues`` lists each unsupported construct separately.
     """
+    return _convert(sql, dialect, notebook=False)
+
+
+def notebook_for_page(sql: str, dialect: str) -> str:
+    """As ``convert_for_page``, with the code written as a Databricks
+    notebook, exactly as ``sparkshift convert --notebook`` writes it."""
+    return _convert(sql, dialect, notebook=True)
+
+
+def _convert(sql: str, dialect: str, *, notebook: bool) -> str:
     if len(sql.encode("utf-8")) > MAX_SOURCE_BYTES:
         return json.dumps(
             {
@@ -51,10 +61,15 @@ def convert_for_page(sql: str, dialect: str) -> str:
                 "issues": [_issue(issue) for issue in issues],
             }
         )
+    code = (
+        sparkshift.to_notebook(result, dialect=dialect or None)
+        if notebook
+        else result.code
+    )
     return json.dumps(
         {
             "ok": True,
-            "code": result.code,
+            "code": code,
             "warnings": [str(warning) for warning in result.warnings],
         }
     )

@@ -239,6 +239,103 @@ def test_ctrl_enter_converts(session: dict) -> None:
     )
 
 
+def test_notebook_output_is_what_the_command_line_writes(session: dict) -> None:
+    page = session["page"]
+    sql = "SELECT TOP 3 name FROM customers ORDER BY name"
+    convert_in_page(page, sql, "tsql")
+
+    page.click("#output-notebook")
+    page.wait_for_selector("#output:visible", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+
+    result = sparkshift.convert(sql, dialect="tsql")
+    assert page.text_content("#code") == sparkshift.to_notebook(result, dialect="tsql")
+    assert page.text_content("#output-label") == "Notebook"
+    assert page.get_attribute("#output-notebook", "aria-checked") == "true"
+
+    page.click("#output-code")
+    page.wait_for_selector("#output:visible", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    assert page.text_content("#code") == result.code
+    assert page.text_content("#output-label") == "PySpark"
+
+
+def test_input_highlighting_shows_exactly_the_source(session: dict) -> None:
+    page = session["page"]
+    sql = "SELECT name, 'x' AS y\nFROM customers -- a comment\nWHERE id = 3\n"
+
+    page.fill("#sql", sql)
+
+    assert page.text_content("#sql-view") == sql
+    # One numbered line per line of source, including the empty last line.
+    assert page.locator("#sql-view .ln").count() == 4
+    for token_class in ("keyword", "string", "number"):
+        assert page.locator(f"#sql-view span.{token_class}").count() > 0, token_class
+
+
+def test_line_numbers_are_not_part_of_the_code(session: dict) -> None:
+    page = session["page"]
+    sql = "SELECT name FROM customers"
+    convert_in_page(page, sql, "")
+
+    code = sparkshift.convert(sql).code
+    assert page.locator("#code .ln").count() == code.count("\n")
+    assert page.text_content("#code") == code
+    assert page.text_content("#output-lines") == f"{code.count(chr(10))} lines"
+
+
+def test_download_saves_exactly_the_code(session: dict) -> None:
+    page = session["page"]
+    sql = "SELECT name FROM customers WHERE country = 'US'"
+    convert_in_page(page, sql, "")
+
+    with page.expect_download() as download_info:
+        page.click("#download")
+    download = download_info.value
+
+    assert download.suggested_filename == "converted.py"
+    assert Path(download.path()).read_text(encoding="utf-8") == (
+        sparkshift.convert(sql).code
+    )
+    assert page.text_content("#status") == "Downloaded converted.py."
+
+
+def test_theme_choice_is_applied_and_remembered(browser: Any, site_url: str) -> None:
+    page = open_page(browser, site_url, color_scheme="dark")
+    assert page.get_attribute("#theme", "aria-label") == "Switch to light theme"
+    dark_background = page.evaluate("getComputedStyle(document.body).backgroundColor")
+
+    page.click("#theme")
+
+    assert page.get_attribute("html", "data-theme") == "light"
+    assert page.get_attribute("#theme", "aria-label") == "Switch to dark theme"
+    assert page.evaluate("getComputedStyle(document.body).backgroundColor") != (
+        dark_background
+    )
+    page.reload()
+    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    assert page.get_attribute("html", "data-theme") == "light"
+    page.context.close()
+
+
+def test_fonts_are_served_by_the_site(session: dict) -> None:
+    page = session["page"]
+
+    loaded = page.evaluate(
+        """async () => {
+            await document.fonts.ready;
+            return [...document.fonts]
+                .filter((font) => font.status === "loaded")
+                .map((font) => font.family.replaceAll('"', ""));
+        }"""
+    )
+
+    assert "IBM Plex Sans" in loaded
+    assert "JetBrains Mono" in loaded
+    # Every request the page made, fonts included, stayed on allowed origins.
+    assert session["origins"] <= ALLOWED_ORIGINS
+
+
 # --- Copying and sharing -------------------------------------------------------
 
 

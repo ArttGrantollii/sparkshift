@@ -3,6 +3,7 @@
 import { loadPyodide } from "https://cdn.jsdelivr.net/pyodide/v314.0.7/full/pyodide.mjs";
 
 let convertForPage = null;
+let notebookForPage = null;
 
 async function fetchOk(path) {
   const response = await fetch(path);
@@ -10,7 +11,7 @@ async function fetchOk(path) {
   return response;
 }
 
-self.onmessage = async ({ data: { id, type, sql, dialect } }) => {
+self.onmessage = async ({ data: { id, type, sql, dialect, notebook } }) => {
   try {
     if (type === "init") {
       const [pyodide, manifest] = await Promise.all([
@@ -23,12 +24,13 @@ self.onmessage = async ({ data: { id, type, sql, dialect } }) => {
       }
       pyodide.runPython(await (await fetchOk("bridge.py")).text());
       convertForPage = pyodide.globals.get("convert_for_page");
+      notebookForPage = pyodide.globals.get("notebook_for_page");
       const aboutFunction = pyodide.globals.get("about");
       const about = JSON.parse(aboutFunction());
       aboutFunction.destroy();
       self.postMessage({ id, result: { about, manifest, pyodideVersion: pyodide.version } });
     } else if (type === "convert" && convertForPage !== null) {
-      const result = JSON.parse(convertForPage(sql, dialect));
+      const result = JSON.parse((notebook ? notebookForPage : convertForPage)(sql, dialect));
       self.postMessage({ id, result });
     } else {
       throw new Error("Unexpected worker request.");

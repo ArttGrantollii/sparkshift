@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The playground has a new design: side-by-side editors with line numbers and
+  syntax highlighting, a dark and a light theme (remembered per browser), and
+  self-hosted fonts.
+
+### Added
+
+- The playground can show the Databricks notebook that `convert --notebook`
+  writes, and download the result as a `.py` file.
+
 ## [0.1.0] - 2026-10-15
 
 The first public release. SparkShift converts SQL `SELECT` queries, from

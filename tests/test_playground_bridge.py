@@ -35,6 +35,33 @@ def test_converted_query(bridge: ModuleType) -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("sql", "dialect"),
+    [
+        ("SELECT TOP 3 name FROM customers ORDER BY name", "tsql"),
+        ("SELECT a FROM t", ""),
+        ("proc sort data=orders out=dedup nodupkey; by customer_id; run;", "sas"),
+    ],
+)
+def test_a_notebook_is_what_the_command_line_writes(
+    bridge: ModuleType, sql: str, dialect: str
+) -> None:
+    result = json.loads(bridge.notebook_for_page(sql, dialect))
+
+    converted = sparkshift.convert(sql, dialect=dialect or None)
+    assert result == {
+        "ok": True,
+        "code": sparkshift.to_notebook(converted, dialect=dialect or None),
+        "warnings": [str(warning) for warning in converted.warnings],
+    }
+
+
+def test_a_notebook_request_reports_errors_like_code(bridge: ModuleType) -> None:
+    sql = "SELECT my_udf(a) AS x FROM t"
+
+    assert bridge.notebook_for_page(sql, "") == bridge.convert_for_page(sql, "")
+
+
 def test_empty_dialect_means_generic_sql(bridge: ModuleType) -> None:
     result = json.loads(bridge.convert_for_page("SELECT a FROM t", ""))
 

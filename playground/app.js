@@ -21,14 +21,24 @@ const elements = Object.fromEntries(
     "retry",
     "share",
     "status",
+    "statusbar",
     "sql",
+    "sql-view",
     "language",
     "output",
+    "output-empty",
+    "output-label",
+    "output-code",
+    "output-notebook",
     "code",
     "copy",
+    "download",
     "errors",
     "warnings",
     "input-limit",
+    "input-lines",
+    "output-lines",
+    "theme",
   ].map((id) => [id, document.getElementById(id)]),
 );
 
@@ -39,9 +49,12 @@ let revision = 0;
 let populated = false;
 let examples = [];
 let maxSourceBytes = null;
+let notebook = false;
 
-function setStatus(text) {
+// The dot beside the status: busy, ready, ok, warn, or bad.
+function setStatus(text, state = "ready") {
   elements.status.textContent = text;
+  elements.statusbar.dataset.state = state;
 }
 
 function updateControls() {
@@ -62,7 +75,7 @@ async function start(first = false, recoveryStatus = "Ready to convert again.") 
   elements.convert.disabled = true;
   elements.cancel.hidden = true;
   const reason = recoveryStatus.startsWith("Ready") ? "" : `${recoveryStatus.split(".")[0]}. `;
-  setStatus(first ? "Loading Python…" : `${reason}Reloading Python…`);
+  setStatus(first ? "Loading Python…" : `${reason}Reloading Python…`, "busy");
   let candidate;
   try {
     candidate = new ConversionWorker(() => {
@@ -97,7 +110,7 @@ async function start(first = false, recoveryStatus = "Ready to convert again.") 
       const shared = new URLSearchParams(location.hash.slice(1)).has("sql");
       const success = await (shared ? loadSharedQuery() : loadExample(0));
       if (success && !shared && runtime === candidate) {
-        setStatus(`Ready. SparkShift ${about.version}, running on Pyodide ${pyodideVersion}.`);
+        setStatus(`Ready. SparkShift ${about.version}, running on Pyodide ${pyodideVersion}.`, "ok");
       }
     } else {
       setStatus(recoveryStatus);
@@ -109,7 +122,7 @@ async function start(first = false, recoveryStatus = "Ready to convert again.") 
     ready = false;
     updateControls();
     setStatus("The playground could not start. Check your connection to cdn.jsdelivr.net " +
-      "and this site, then choose Retry loading Python.");
+      "and this site, then choose Retry loading Python.", "bad");
   }
 }
 
@@ -134,7 +147,7 @@ function loadSharedQuery() {
   }
   const dialect = parameters.get("dialect") ?? "";
   elements.dialect.value = dialect in DIALECT_NAMES ? dialect : "";
-  elements.sql.value = sql;
+  setSource(sql);
   return convert();
 }
 
@@ -145,9 +158,14 @@ function loadExample(index) {
   if (example === undefined) {
     return;
   }
-  elements.sql.value = example.sql;
+  setSource(example.sql);
   elements.dialect.value = example.dialect;
   return convert();
+}
+
+function setSource(text) {
+  elements.sql.value = text;
+  showSource();
 }
 
 // The input pane is named after its language: SQL, or a SAS program.
@@ -159,7 +177,10 @@ function showInputLanguage() {
 // never leave a previous query's output visible or available to Copy.
 function clearOutput() {
   elements.copy.disabled = true;
+  elements.download.disabled = true;
   elements.output.hidden = true;
+  elements["output-empty"].hidden = false;
+  elements["output-lines"].textContent = "";
   elements.code.replaceChildren();
   for (const panel of [elements.errors, elements.warnings]) {
     panel.replaceChildren();
@@ -169,6 +190,7 @@ function clearOutput() {
 
 function inputChanged() {
   showInputLanguage();
+  showSource();
   clearOutput();
   if (busy) {
     cancelConversion("Input changed. Convert to update the PySpark code.");
@@ -181,7 +203,7 @@ function conversionFailed(result) {
   clearOutput();
   elements.errors.hidden = false;
   showErrors(result);
-  setStatus("Conversion failed.");
+  setStatus("Conversion failed.", "bad");
 }
 
 function cancelConversion(message = "Conversion cancelled. Ready to convert again.") {
@@ -201,7 +223,7 @@ async function convert() {
   const currentRevision = ++revision;
   busy = true;
   updateControls();
-  setStatus("Converting…");
+  setStatus("Converting…", "busy");
   try {
     // UTF-8 bytes, matching the Python bridge (not UTF-16 string length).
     if (new TextEncoder().encode(elements.sql.value).length > maxSourceBytes) {
@@ -215,6 +237,7 @@ async function convert() {
     const result = await candidate.request("convert", {
       sql: elements.sql.value,
       dialect: elements.dialect.value,
+      notebook,
     }, CONVERSION_TIMEOUT_MS);
     // Input edits and cancellation invalidate results, even if they arrive late.
     if (runtime !== candidate || revision !== currentRevision) return false;
@@ -222,13 +245,16 @@ async function convert() {
       conversionFailed(result);
       return false;
     }
-    elements.code.replaceChildren(highlight(result.code));
+    elements.code.replaceChildren(highlightLines(result.code, "python"));
+    elements["output-lines"].textContent = lineCount(result.code);
     showWarnings(result.warnings);
+    elements["output-empty"].hidden = true;
     elements.output.hidden = false;
     elements.copy.disabled = false;
+    elements.download.disabled = false;
     setStatus(result.warnings.length
       ? `Converted with ${result.warnings.length} warning${result.warnings.length === 1 ? "" : "s"}. Review before running.`
-      : "Converted successfully.");
+      : "Converted successfully.", result.warnings.length ? "warn" : "ok");
     return true;
   } catch (error) {
     if (runtime !== candidate || revision !== currentRevision) return false;
@@ -293,26 +319,125 @@ function showErrors(result) {
 
 // --- Highlighting -----------------------------------------------------------
 //
-// Generated code uses a small part of Python, so a few patterns are enough.
-// Highlighting only wraps text in spans: the code's text, and what Copy
-// copies, stay exactly the generated code.
+// Each line becomes a span whose number CSS draws (::before), and tokens are
+// wrapped in spans by kind. Only spans are added: the text, and what Copy
+// copies, stay exactly the generated code. A few patterns are enough for the
+// small part of each language involved.
 
-const TOKENS = /("(?:[^"\\\n]|\\.)*")|\b(from|import|as|True|False|None)\b|\b((?:F|Window)\.\w+)|\b(\d+(?:\.\d+)?)\b/g;
-const TOKEN_CLASSES = ["string", "keyword", "function", "number"];
+const PATTERNS = {
+  python: /("(?:[^"\\\n]|\\.)*")|\b(from|import|as|if|True|False|None)\b|\b((?:F|Window|spark|dbutils)\.\w+|display)\b|\b(\d+(?:\.\d+)?)\b/g,
+  sql: /('(?:[^'\n]|'')*'|"[^"\n]*")|\b(SELECT|FROM|WHERE|JOIN|INNER|LEFT|RIGHT|FULL|OUTER|CROSS|ON|USING|GROUP|BY|ORDER|HAVING|LIMIT|TOP|AS|AND|OR|NOT|IN|IS|NULL|BETWEEN|LIKE|CASE|WHEN|THEN|ELSE|END|DISTINCT|UNION|ALL|EXCEPT|INTERSECT|WITH|OVER|PARTITION|QUALIFY|ASC|DESC|CAST|EXISTS|FETCH|FIRST|ROWS|ONLY|NULLS|LAST)\b|()(\b\d+(?:\.\d+)?\b)/gi,
+  sas: /('(?:[^'\n]|'')*'|"[^"\n]*")|\b(data|set|run|quit|proc|where|keep|drop|rename|if|then|else|do|end|length|by|class|var|output|out|tables|create|table|select|from|group|order|as|and|or|not|in|sort|means|summary|freq|sql|nodupkey|noprint|nway|descending)\b|()(\b\d+(?:\.\d+)?\b)/gi,
+};
+const CLASSES = ["string", "keyword", "function", "number"];
+const COMMENT = { python: /^\s*#/, sql: /^\s*--/, sas: /^\s*(\*|\/\*)/ };
 
-function highlight(code) {
+function highlightLine(line, language) {
   const fragment = document.createDocumentFragment();
-  let end = 0;
-  for (const match of code.matchAll(TOKENS)) {
-    fragment.append(code.slice(end, match.index));
+  if (COMMENT[language].test(line)) {
     const span = document.createElement("span");
-    span.className = TOKEN_CLASSES[match.slice(1).findIndex((group) => group !== undefined)];
+    span.className = "comment";
+    span.textContent = line;
+    fragment.append(span);
+    return fragment;
+  }
+  let end = 0;
+  for (const match of line.matchAll(PATTERNS[language])) {
+    if (match[0] === "") continue;
+    fragment.append(line.slice(end, match.index));
+    const span = document.createElement("span");
+    span.className = CLASSES[match.slice(1).findIndex((group) => group)];
     span.textContent = match[0];
     fragment.append(span);
     end = match.index + match[0].length;
   }
-  fragment.append(code.slice(end));
+  fragment.append(line.slice(end));
   return fragment;
+}
+
+// Lines joined by "\n" text, so textContent is exactly ``text``. A final
+// newline gets no numbered line, unless ``numberLastLine`` (the editor,
+// where the caret can be on it).
+function highlightLines(text, language, numberLastLine = false) {
+  const fragment = document.createDocumentFragment();
+  const lines = text.split("\n");
+  lines.forEach((line, index) => {
+    if (index > 0) fragment.append("\n");
+    if (index === lines.length - 1 && line === "" && !numberLastLine) return;
+    const span = document.createElement("span");
+    span.className = "ln";
+    span.append(highlightLine(line, language));
+    fragment.append(span);
+  });
+  return fragment;
+}
+
+function lineCount(text) {
+  const lines = text.replace(/\n$/, "").split("\n").length;
+  return `${lines} line${lines === 1 ? "" : "s"}`;
+}
+
+function showSource() {
+  const language = elements.dialect.value === "sas" ? "sas" : "sql";
+  const text = elements.sql.value;
+  elements["sql-view"].replaceChildren(highlightLines(text, language, true));
+  elements["input-lines"].textContent = text ? lineCount(text) : "";
+  syncScroll();
+}
+
+function syncScroll() {
+  elements["sql-view"].scrollTop = elements.sql.scrollTop;
+  elements["sql-view"].scrollLeft = elements.sql.scrollLeft;
+}
+
+// --- Output kind and theme --------------------------------------------------
+
+function chooseOutput(asNotebook) {
+  if (notebook === asNotebook) return;
+  notebook = asNotebook;
+  elements["output-code"].setAttribute("aria-checked", String(!asNotebook));
+  elements["output-notebook"].setAttribute("aria-checked", String(asNotebook));
+  elements["output-label"].textContent = asNotebook ? "Notebook" : "PySpark";
+  elements.download.textContent = "Download .py";
+  if (ready && !busy) {
+    void convert();
+  } else {
+    clearOutput();
+  }
+}
+
+function effectiveTheme() {
+  const chosen = document.documentElement.dataset.theme;
+  if (chosen) return chosen;
+  return matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+}
+
+function showThemeButton() {
+  const other = effectiveTheme() === "dark" ? "light" : "dark";
+  elements.theme.setAttribute("aria-label", `Switch to ${other} theme`);
+  elements.theme.title = `Switch to ${other} theme`;
+}
+
+function toggleTheme() {
+  const theme = effectiveTheme() === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = theme;
+  try {
+    localStorage.setItem("sparkshift-theme", theme);
+  } catch {
+    // Storage can be blocked; the choice then lasts until the page closes.
+  }
+  showThemeButton();
+}
+
+function download() {
+  const blob = new Blob([elements.code.textContent], { type: "text/x-python" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = notebook ? "converted_notebook.py" : "converted.py";
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+  setStatus(`Downloaded ${link.download}.`, "ok");
 }
 
 // --- Events -----------------------------------------------------------------
@@ -322,6 +447,7 @@ elements.cancel.addEventListener("click", () => cancelConversion());
 elements.retry.addEventListener("click", () => { void start(); });
 elements.dialect.addEventListener("change", inputChanged);
 elements.sql.addEventListener("input", inputChanged);
+elements.sql.addEventListener("scroll", syncScroll);
 elements.example.addEventListener("change", () => {
   loadExample(Number(elements.example.value));
   elements.example.value = "";
@@ -334,13 +460,20 @@ elements.sql.addEventListener("keydown", (event) => {
 });
 elements.copy.addEventListener("click", async () => {
   await navigator.clipboard.writeText(elements.code.textContent);
-  setStatus("Copied the PySpark code.");
+  setStatus("Copied the PySpark code.", "ok");
 });
+elements.download.addEventListener("click", download);
 elements.share.addEventListener("click", async () => {
   const link = sharedQueryLink();
   history.replaceState(null, "", link);
   await navigator.clipboard.writeText(link);
-  setStatus("Copied a link to this query.");
+  setStatus("Copied a link to this query.", "ok");
 });
+elements["output-code"].addEventListener("click", () => chooseOutput(false));
+elements["output-notebook"].addEventListener("click", () => chooseOutput(true));
+elements.theme.addEventListener("click", toggleTheme);
+matchMedia("(prefers-color-scheme: light)").addEventListener("change", showThemeButton);
 
+showThemeButton();
+showSource();
 void start(true);
