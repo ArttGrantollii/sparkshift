@@ -29,6 +29,10 @@
           <h1 class="wordmark">spark<span class="slash">/</span>shift</h1>
           <p class="tagline">SQL and SAS to readable PySpark, in your browser</p>
         </div>
+        <div class="segmented" role="tablist" aria-label="Convert">
+          <button id="tab-file" type="button" role="tab" aria-selected="true" aria-controls="view-file">File</button>
+          <button id="tab-folder" type="button" role="tab" aria-selected="false" aria-controls="view-folder" tabindex="-1">Folder</button>
+        </div>
         <a class="link" href="https://github.com/ArttGrantollii/sparkshift">GitHub</a>
         <button id="theme" class="icon-button" type="button" aria-label="Switch to light theme">
           <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M8 2a6 6 0 0 1 0 12z" fill="currentColor"/></svg>
@@ -48,7 +52,7 @@
             <button id="output-code" type="button" role="radio" aria-checked="true">PySpark</button>
             <button id="output-notebook" type="button" role="radio" aria-checked="false">Notebook</button>
           </div>
-          <label class="field">
+          <label class="field" id="example-field">
             <span class="visually-hidden">Example</span>
             <select id="example" class="select" disabled>
               <option value="">Load an example…</option>
@@ -66,31 +70,83 @@
           <p class="notice">The playground runs Python in your browser and needs JavaScript.</p>
         </noscript>
 
-        <div class="panes">
-          <section class="pane" aria-labelledby="language">
-            <div class="pane-head">
-              <span class="pane-label"><label for="sql" id="language">SQL</label></span>
-              <span class="pane-meta" id="input-lines"></span>
-            </div>
-            <div class="editor">
-              <pre class="code" id="sql-view" aria-hidden="true"></pre>
-              <textarea id="sql" class="code" aria-describedby="input-limit" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off"></textarea>
-            </div>
-          </section>
-          <section class="pane" aria-labelledby="output-label">
-            <div class="pane-head">
-              <h2 class="pane-label" id="output-label">PySpark</h2>
-              <span class="pane-meta" id="output-lines"></span>
-            </div>
-            <div class="editor">
-              <p id="output-empty" class="empty">The converted code appears here.</p>
-              <pre id="output" class="code" hidden tabindex="0" aria-labelledby="output-label"><code id="code"></code></pre>
-            </div>
-          </section>
+        <div id="view-file" class="view" role="tabpanel" aria-labelledby="tab-file">
+          <div class="panes">
+            <section class="pane" aria-labelledby="language">
+              <div class="pane-head">
+                <span class="pane-label"><label for="sql" id="language">SQL</label></span>
+                <span class="pane-meta" id="input-lines"></span>
+              </div>
+              <div class="editor">
+                <pre class="code" id="sql-view" aria-hidden="true"></pre>
+                <textarea id="sql" class="code" aria-describedby="input-limit" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off"></textarea>
+              </div>
+            </section>
+            <section class="pane" aria-labelledby="output-label">
+              <div class="pane-head">
+                <h2 class="pane-label" id="output-label">PySpark</h2>
+                <span class="pane-meta" id="output-lines"></span>
+              </div>
+              <div class="editor">
+                <p id="output-empty" class="empty">The converted code appears here.</p>
+                <pre id="output" class="code" hidden tabindex="0" aria-labelledby="output-label"><code id="code"></code></pre>
+              </div>
+            </section>
+          </div>
+
+          <div id="warnings" class="panel warn" role="status" aria-live="polite" hidden></div>
+          <div id="errors" class="panel bad" role="alert" hidden></div>
         </div>
 
-        <div id="warnings" class="panel warn" role="status" aria-live="polite" hidden></div>
-        <div id="errors" class="panel bad" role="alert" hidden></div>
+        <div id="view-folder" class="view folder" role="tabpanel" aria-labelledby="tab-folder" hidden>
+          <aside class="tree" aria-label="Files">
+            <div class="summary">
+              <p class="big" id="folder-count">No files chosen</p>
+              <div class="bar" id="folder-bar" aria-hidden="true"></div>
+              <ul class="legend" id="folder-legend"></ul>
+            </div>
+            <ul class="files" id="files" aria-label="Converted files"></ul>
+            <div class="drop" id="drop">
+              <p><b>Drop a folder or files here</b>, or</p>
+              <div class="drop-actions">
+                <button id="choose-folder" class="button" type="button" disabled>Choose folder</button>
+                <button id="choose-files" class="button" type="button" disabled>Choose files</button>
+              </div>
+              <p class="fineprint">.sql files are read as the dialect above; .sas files are always SAS. Files are read in your browser only.</p>
+              <input id="pick-folder" type="file" webkitdirectory multiple hidden />
+              <input id="pick-files" type="file" multiple accept=".sql,.sas" hidden />
+            </div>
+          </aside>
+          <div class="detail">
+            <div id="folder-errors" class="panel bad" role="alert" hidden></div>
+            <div class="panes">
+              <section class="pane" aria-labelledby="file-source-label">
+                <div class="pane-head">
+                  <h2 class="pane-label" id="file-source-label">Source</h2>
+                  <span class="pane-name" id="file-source-name"></span>
+                  <span class="pane-meta" id="file-source-lines"></span>
+                </div>
+                <div class="editor">
+                  <p id="file-source-empty" class="empty">Choose a folder or files to convert them all at once.</p>
+                  <pre id="file-source" class="code" hidden tabindex="0" aria-labelledby="file-source-label"></pre>
+                </div>
+              </section>
+              <section class="pane" aria-labelledby="file-output-label">
+                <div class="pane-head">
+                  <h2 class="pane-label" id="file-output-label">PySpark</h2>
+                  <span class="pane-name" id="file-output-name"></span>
+                  <span class="pane-meta" id="file-output-lines"></span>
+                </div>
+                <div class="editor">
+                  <p id="file-output-empty" class="empty">The converted code appears here.</p>
+                  <pre id="file-output" class="code" hidden tabindex="0" aria-labelledby="file-output-label"><code id="file-code"></code></pre>
+                </div>
+              </section>
+            </div>
+            <div id="file-warnings" class="panel warn" hidden></div>
+            <div id="file-errors" class="panel bad" hidden></div>
+          </div>
+        </div>
 
         <div class="statusbar" id="statusbar" data-state="busy">
           <span class="dot" aria-hidden="true"></span>
@@ -101,6 +157,7 @@
             <button id="copy" class="button" type="button" disabled>Copy</button>
             <button id="download" class="button" type="button" disabled>Download .py</button>
             <button id="share" class="button" type="button" disabled>Copy link</button>
+            <button id="download-zip" class="button" type="button" disabled hidden>Download .zip</button>
           </div>
         </div>
         <p id="input-limit" class="fineprint"></p>

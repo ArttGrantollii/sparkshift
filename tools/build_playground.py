@@ -23,6 +23,8 @@ PLAYGROUND_FILES = [
     "style.css",
     "theme.js",
     "app.js",
+    "highlight.js",
+    "files.js",
     "worker-client.js",
     "worker.js",
     "bridge.py",

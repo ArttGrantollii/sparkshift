@@ -1,8 +1,11 @@
 """The playground's bridge, run here with CPython; in the browser, Pyodide
 runs the same file (see tests/playground for the browser tests)."""
 
+import base64
 import importlib.util
+import io
 import json
+import zipfile
 from pathlib import Path
 from types import ModuleType
 
@@ -127,7 +130,213 @@ def test_about(bridge: ModuleType) -> None:
         "version": sparkshift.__version__,
         "dialects": list(DIALECT_CHOICES),
         "max_source_bytes": 50_000,
+        "max_batch_files": 200,
     }
+
+
+def test_a_notebook_is_titled_after_its_source_file(bridge: ModuleType) -> None:
+    sql = "SELECT a FROM t"
+
+    result = json.loads(bridge.notebook_for_page(sql, "postgres", "daily.sql"))
+
+    converted = sparkshift.convert(sql, dialect="postgres")
+    assert result["code"] == sparkshift.to_notebook(
+        converted, source="daily.sql", dialect="postgres"
+    )
+
+
+# --- Folders -------------------------------------------------------------------
+
+COVERAGE = Path(__file__).parents[1] / "examples" / "coverage"
+
+
+def chosen_folder(folder: Path) -> list[str]:
+    """The paths a browser reports for a chosen folder: every file, relative
+    to the folder's parent, in no particular order."""
+    return [
+        path.relative_to(folder.parent).as_posix()
+        for path in reversed(sorted(folder.rglob("*")))
+        if path.is_file()
+    ]
+
+
+def plan(bridge: ModuleType, paths: list[str], dialect: str = "", **options: bool):
+    return json.loads(
+        bridge.plan_for_page(json.dumps(paths), dialect, options.get("notebook", False))
+    )
+
+
+def test_a_folder_is_planned_as_the_command_line_converts_it(
+    bridge: ModuleType,
+) -> None:
+    paths = chosen_folder(COVERAGE)
+
+    result = plan(bridge, paths, "snowflake")
+
+    sources = sorted(
+        path
+        for path in COVERAGE.rglob("*")
+        if path.suffix in (".sql", ".sas") and path.is_file()
+    )
+    assert result["ok"] is True
+    assert result["folder"] == "coverage_pyspark"
+    assert [file["name"] for file in result["files"]] == [
+        path.relative_to(COVERAGE).as_posix() for path in sources
+    ]
+    assert [file["output"] for file in result["files"]] == [
+        path.relative_to(COVERAGE).with_suffix(".py").as_posix() for path in sources
+    ]
+    assert [paths[file["index"]] for file in result["files"]] == [
+        f"coverage/{file['name']}" for file in result["files"]
+    ]
+    assert {file["dialect"] for file in result["files"]} == {"snowflake"}
+    assert result["skipped"] == len(paths) - len(sources)
+
+
+def test_sas_files_are_always_sas_and_the_sas_dialect_selects_only_them(
+    bridge: ModuleType,
+) -> None:
+    paths = ["jobs/load.sql", "jobs/report.SAS", "jobs/notes.txt"]
+
+    mixed = plan(bridge, paths, "tsql")
+    sas_only = plan(bridge, paths, "sas")
+
+    assert [(f["name"], f["dialect"]) for f in mixed["files"]] == [
+        ("load.sql", "tsql"),
+        ("report.SAS", "sas"),
+    ]
+    assert mixed["skipped"] == 1
+    assert [(f["name"], f["dialect"]) for f in sas_only["files"]] == [
+        ("report.SAS", "sas")
+    ]
+    assert sas_only["skipped"] == 2
+
+
+def test_files_chosen_one_by_one_keep_their_names(bridge: ModuleType) -> None:
+    result = plan(bridge, ["b.sql", "a.sql"], notebook=True)
+
+    assert result["folder"] == "converted_notebooks"
+    assert [(f["name"], f["output"]) for f in result["files"]] == [
+        ("a.sql", "a.py"),
+        ("b.sql", "b.py"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("paths", "colliding"),
+    [
+        (["q/report.sql", "q/Report.sas", "q/other.sql"], ["Report.sas", "report.sql"]),
+        (["q/a.sql", "q/a.py/x.sql"], ["a.py/x.sql", "a.sql"]),
+    ],
+)
+def test_colliding_outputs_convert_nothing(
+    bridge: ModuleType, paths: list[str], colliding: list[str]
+) -> None:
+    result = plan(bridge, paths)
+
+    assert result["ok"] is False
+    assert "Nothing was converted" in result["error"]
+    assert [collision["name"] for collision in result["collisions"]] == colliding
+
+
+@pytest.mark.parametrize(
+    ("paths", "dialect", "error"),
+    [
+        (["docs/readme.md"], "", "There are no .sql or .sas files to convert."),
+        (
+            ["docs/readme.md", "docs/load.sql"],
+            "sas",
+            "There are no .sas files to convert.",
+        ),
+        ([], "", "There are no .sql or .sas files to convert."),
+    ],
+)
+def test_nothing_to_convert(
+    bridge: ModuleType, paths: list[str], dialect: str, error: str
+) -> None:
+    result = plan(bridge, paths, dialect)
+
+    assert result == {"ok": False, "error": error, "issues": []}
+
+
+def test_a_batch_is_limited(bridge: ModuleType) -> None:
+    exactly = plan(bridge, [f"q/{n}.sql" for n in range(200)])
+    over = plan(bridge, [f"q/{n}.sql" for n in range(201)])
+
+    assert exactly["ok"] is True
+    assert over["ok"] is False
+    assert "up to 200 files" in over["error"]
+    assert "CLI" in over["error"]
+
+
+@pytest.mark.parametrize(
+    "path", ["../a.sql", "/a.sql", "q//a.sql", "q/./a.sql", "q/../a.sql", "q\\a.sql"]
+)
+def test_unusable_paths_are_refused(bridge: ModuleType, path: str) -> None:
+    result = plan(bridge, ["q/b.sql", path])
+
+    assert result["ok"] is False
+    assert result["issues"] == []
+
+
+def test_the_zip_holds_what_the_command_line_writes(
+    bridge: ModuleType, tmp_path: Path
+) -> None:
+    from sparkshift.cli import main
+
+    written = tmp_path / "cli"
+    main(["convert", str(COVERAGE), "-o", str(written), "-d", "snowflake"])
+
+    planned = plan(bridge, chosen_folder(COVERAGE), "snowflake")
+    converted = []
+    for file in planned["files"]:
+        sql = (COVERAGE / file["name"]).read_text(encoding="utf-8")
+        result = json.loads(bridge.convert_for_page(sql, file["dialect"]))
+        if result["ok"]:
+            converted.append({"output": file["output"], "code": result["code"]})
+    archive = zipfile.ZipFile(io.BytesIO(packed(bridge, "coverage_pyspark", converted)))
+
+    expected = {
+        f"coverage_pyspark/{path.relative_to(written).as_posix()}": path.read_bytes()
+        for path in written.rglob("*")
+        if path.is_file()
+    }
+    assert {name: archive.read(name) for name in archive.namelist()} == expected
+    # Some file fails, so the comparison covers files that get no output.
+    assert len(converted) < len(planned["files"])
+
+
+def packed(bridge: ModuleType, folder: str, files: list[dict[str, str]]) -> bytes:
+    result = json.loads(bridge.zip_for_page(folder, json.dumps(files)))
+    assert result["ok"] is True
+    return base64.b64decode(result["zip"])
+
+
+def test_the_same_files_make_the_same_zip(bridge: ModuleType) -> None:
+    files = [
+        {"output": "a.py", "code": "result = x\n"},
+        {"output": "b/c.py", "code": "é\n"},
+    ]
+
+    first = packed(bridge, "converted_pyspark", files)
+
+    assert packed(bridge, "converted_pyspark", files) == first
+    archive = zipfile.ZipFile(io.BytesIO(first))
+    assert archive.namelist() == ["converted_pyspark/a.py", "converted_pyspark/b/c.py"]
+    assert archive.read("converted_pyspark/b/c.py") == "é\n".encode()
+
+
+@pytest.mark.parametrize("output", ["../a.py", "/a.py", "b/../../a.py"])
+def test_the_zip_refuses_paths_outside_its_folder(
+    bridge: ModuleType, output: str
+) -> None:
+    result = json.loads(
+        bridge.zip_for_page(
+            "converted_pyspark", json.dumps([{"output": output, "code": ""}])
+        )
+    )
+
+    assert result["ok"] is False
 
 
 @pytest.mark.parametrize("extra_bytes", [-1, 0, 1])

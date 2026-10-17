@@ -20,6 +20,34 @@ choice is remembered in the browser's local storage, otherwise the page follows
 the system setting. Fonts (IBM Plex Sans and JetBrains Mono, under the SIL Open
 Font License, see `fonts/OFL-*.txt`) are served by the site itself.
 
+## Folders
+
+The **Folder** tab converts many files at once: drop a folder or files on the
+page, or use **Choose folder** or **Choose files**. Files are read in the
+browser and never uploaded. The page follows the command line's rules for
+`sparkshift convert FOLDER -o OUT`, from the same code (`sparkshift.batch`):
+
+- every `.sql` and `.sas` file is converted, in sorted order (with the SAS
+  dialect, only `.sas` files); a `.sas` file is always a SAS program, and
+  `.sql` files use the chosen dialect; other files are skipped and counted;
+- files are read as strict UTF-8 with any line ending read as `\n`, as Python
+  reads them; a file that is not UTF-8 text is reported, not guessed at;
+- each output keeps its input's relative path, with `.py`; if two outputs would
+  have the same path ignoring case (`report.sql` and `report.sas`), nothing is
+  converted and the colliding files are listed.
+
+The list shows every file's state, and selecting one shows its source, its
+code, and its warnings or errors. **Download .zip** saves the converted files
+in a folder named after the chosen one (`claims_pyspark/`, or
+`claims_notebooks/` for notebooks); files that cannot be converted get no
+output, as on the command line, so the zip holds exactly what the CLI would
+write. Changing the dialect or the output kind converts the files again.
+
+Each file converts in its own worker request, with the same limits and
+deadline as a single file. A file that reaches the deadline is reported, Python
+reloads, and the next file converts; **Cancel conversion** stops the whole
+batch. The demo converts at most **200 files** at a time.
+
 ## Warnings, errors and input limits
 
 Successful conversions show the same warnings as the Python API alongside the
@@ -59,10 +87,12 @@ revision so late replies cannot replace the current query's output. See
 | `index.html`, `style.css` | The page |
 | `theme.js` | Applies a remembered theme before the page is drawn, so it does not flash |
 | `fonts/` | Self-hosted WOFF2 fonts and their licenses |
-| `app.js` | Owns UI state, highlights code, renders results and handles cancellation/recovery |
+| `app.js` | Owns UI state, renders results and handles cancellation/recovery |
+| `highlight.js` | Highlights code and numbers its lines without changing its text |
+| `files.js` | Collects chosen or dropped files and reads them as the command line does |
 | `worker-client.js` | Matches request IDs, bounds loading/conversion time, and terminates workers |
 | `worker.js` | Loads Pyodide and the wheels and invokes the Python bridge off the UI thread |
-| `bridge.py` | Runs inside Pyodide: converts SQL and returns JSON with the code or the issues |
+| `bridge.py` | Runs inside Pyodide: converts SQL and returns JSON with the code or the issues; plans folders and packs their zip |
 
 `tools/build_playground.py` assembles the site: these files, the SparkShift
 wheel built from the checkout, the SQLGlot wheel pinned in `uv.lock`, and
@@ -92,7 +122,10 @@ Pages after CI passes on `main`, from the exact commit CI tested.
   must clear stale results, and shared links must restore the query. Notebook
   output must match the command line, highlighting and line numbers must not
   change the text, downloads must contain exactly the code, and the theme choice
-  must be remembered. The page
+  must be remembered. A chosen folder must give a zip identical to what the
+  command line writes, including files with Windows line endings or that are
+  not UTF-8; colliding outputs, dropped folders, a file past the deadline and
+  cancelling a folder are covered too. The page
   must contact no other sites, fit a phone screen, and pass an axe-core
   accessibility audit (WCAG 2.1 AA) in light and dark mode, with and without
   warnings. Fault injection covers Python failures and malformed JSON; tests

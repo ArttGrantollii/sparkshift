@@ -35,8 +35,9 @@ from typing import TypeVar
 
 from sparkshift import __version__, databricks
 from sparkshift.api import convert
+from sparkshift.batch import colliding, dialect_of, source_suffixes
 from sparkshift.diagnostics import ConversionResult
-from sparkshift.dialects import DIALECT_CHOICES, SAS, is_sas
+from sparkshift.dialects import DIALECT_CHOICES
 from sparkshift.errors import SparkShiftError
 from sparkshift.notebook import to_notebook
 from sparkshift.report import Report, assess, to_json, to_markdown, to_text, unreadable
@@ -226,7 +227,7 @@ def _add_location_arguments(command: argparse.ArgumentParser, condition: str) ->
 def _convert_one(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int:
     name = "standard input" if arguments.input == _STDIN else arguments.input
     sql = _read(parser, arguments.input)
-    dialect = _dialect_of(Path(arguments.input), arguments.dialect)
+    dialect = dialect_of(Path(arguments.input), arguments.dialect)
     result = _conversion(parser.prog, sql, name, dialect, strict=arguments.strict)
     if result is None:
         return EXIT_NOT_CONVERTED
@@ -260,7 +261,7 @@ def _convert_directory(
         if sql is None:
             print(f"{parser.prog}: cannot read {path}: {reason}", file=sys.stderr)
             continue
-        dialect = _dialect_of(path, arguments.dialect)
+        dialect = dialect_of(path, arguments.dialect)
         result = _conversion(
             parser.prog, sql, str(path), dialect, strict=arguments.strict
         )
@@ -297,27 +298,14 @@ def _batch_outputs(
         (path, output.joinpath(*path.relative_to(source).with_suffix(suffix).parts))
         for path in files
     ]
-    by_name: dict[tuple[str, ...], list[Path]] = {}
-    for path, destination in planned:
-        # Compare whole components, so a.py_extra is not a child of a.py.
-        # Case-fold even on Linux: batches should remain portable to Windows.
-        name = tuple(part.casefold() for part in destination.relative_to(output).parts)
-        by_name.setdefault(name, []).append(path)
-
-    conflicts: set[Path] = set()
-    for name, inputs in by_name.items():
-        if len(inputs) > 1:
-            conflicts.update(inputs)
-        for depth in range(1, len(name)):
-            if ancestor_inputs := by_name.get(name[:depth]):
-                conflicts.update(ancestor_inputs)
-                conflicts.update(inputs)
-
+    conflicts = colliding(
+        [destination.relative_to(output) for _, destination in planned]
+    )
     if conflicts:
         mappings = "\n".join(
             f"  {path} -> {destination}"
-            for path, destination in planned
-            if path in conflicts
+            for index, (path, destination) in enumerate(planned)
+            if index in conflicts
         )
         parser.error(
             f"batch output paths collide:\n{mappings}\n"
@@ -351,7 +339,7 @@ def _report(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> i
         if sql is None:
             outcomes.append(unreadable(name, str(reason)))
         else:
-            outcomes.append(assess(name, sql, _dialect_of(path, arguments.dialect)))
+            outcomes.append(assess(name, sql, dialect_of(path, arguments.dialect)))
     report = Report(arguments.input, arguments.dialect, tuple(outcomes))
 
     text = _REPORT_FORMATS[arguments.format](report)
@@ -397,7 +385,7 @@ def _upload(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> i
         if sql is None:
             print(f"{parser.prog}: cannot read {path}: {reason}", file=sys.stderr)
             continue
-        dialect = _dialect_of(path, arguments.dialect)
+        dialect = dialect_of(path, arguments.dialect)
         result = _conversion(
             parser.prog, sql, str(path), dialect, strict=arguments.strict
         )
@@ -464,7 +452,7 @@ def _source_files(
     """Every .sql and .sas file under a directory (only .sas files with
     --dialect sas), in sorted order. Exits with a usage error if there are
     none."""
-    suffixes = (".sas",) if is_sas(dialect) else (".sql", ".sas")
+    suffixes = source_suffixes(dialect)
     files = sorted(
         path
         for path in source.rglob("*")
@@ -491,11 +479,6 @@ def _output(
         catalog=arguments.catalog,
         schema=arguments.schema,
     )
-
-
-def _dialect_of(path: Path, dialect: str | None) -> str | None:
-    """The dialect to convert a file in: a .sas file is a SAS program."""
-    return SAS if path.suffix.lower() == ".sas" else dialect
 
 
 def _read_text(path: Path) -> tuple[str | None, str | None]:

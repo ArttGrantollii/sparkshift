@@ -371,6 +371,306 @@ def test_shared_link_restores_the_query(session: dict, browser: Any) -> None:
     shared.context.close()
 
 
+# --- Folders ---------------------------------------------------------------------
+
+COVERAGE = ROOT / "examples" / "coverage"
+
+
+def reset_file_view(page: Any) -> None:
+    """Generic SQL and plain code, in the file view, with nothing converting."""
+    page.click("#tab-file")
+    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    if page.input_value("#dialect") != "":
+        page.select_option("#dialect", "")
+    if page.get_attribute("#output-notebook", "aria-checked") == "true":
+        page.click("#output-code")
+        page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+
+
+@pytest.fixture
+def folder_view(session: dict) -> Iterator[Any]:
+    """The shared page in its folder view, for generic SQL and plain code;
+    back in the file view afterwards."""
+    page = session["page"]
+    reset_file_view(page)
+    page.click("#tab-folder")
+    yield page
+    reset_file_view(page)
+
+
+def choose(page: Any, files: Any, picker: str = "#pick-folder") -> None:
+    """Choose a folder (or files, with picker #pick-files) and wait until
+    every file has converted."""
+    page.set_input_files(picker, files)
+    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+
+
+def command_line_outputs(folder: Path, out: Path, *arguments: str) -> dict[str, bytes]:
+    """What ``sparkshift convert FOLDER -o OUT`` writes, by relative path."""
+    from sparkshift.cli import main
+
+    main(["convert", str(folder), "-o", str(out), *arguments])
+    return {
+        path.relative_to(out).as_posix(): path.read_bytes()
+        for path in out.rglob("*")
+        if path.is_file()
+    }
+
+
+def downloaded_zip(page: Any) -> tuple[str, dict[str, bytes]]:
+    import zipfile
+
+    with page.expect_download() as download_info:
+        page.click("#download-zip")
+    download = download_info.value
+    with zipfile.ZipFile(download.path()) as archive:
+        files = {name: archive.read(name) for name in archive.namelist()}
+    return download.suggested_filename, files
+
+
+def file_button(page: Any, name: str) -> Any:
+    return page.locator("#files button", has=page.locator(".name", has_text=name))
+
+
+def test_a_folder_converts_as_the_command_line_does(
+    folder_view: Any, tmp_path: Path
+) -> None:
+    page = folder_view
+
+    choose(page, str(COVERAGE))
+
+    expected = command_line_outputs(COVERAGE, tmp_path)
+    sources = sorted(COVERAGE.rglob("*.sql"))
+    failed = len(sources) - len(expected)
+    assert failed > 0, "the folder should include a file that does not convert"
+    warned = sum(
+        bool(sparkshift.convert(path.read_text(encoding="utf-8")).warnings)
+        for path in sources
+        if path.relative_to(COVERAGE).with_suffix(".py").as_posix() in expected
+    )
+    status = (
+        f"Converted {len(expected)} of {len(sources)} files; "
+        f"{failed} could not be converted."
+    )
+    if warned:
+        status += f" {warned} file{'s' if warned > 1 else ''} with warnings: "
+        status += "review before running."
+    assert page.text_content("#status") == status
+    assert page.text_content("#folder-count") == (
+        f"{len(expected)} of {len(sources)} files converted"
+    )
+    name, files = downloaded_zip(page)
+    assert name == "coverage_pyspark.zip"
+    assert files == {
+        f"coverage_pyspark/{path}": code for path, code in expected.items()
+    }
+    assert page.text_content("#status") == "Downloaded coverage_pyspark.zip."
+
+
+def test_each_file_shows_its_source_code_and_issues(folder_view: Any) -> None:
+    page = folder_view
+    choose(page, str(COVERAGE))
+
+    for path in sorted(COVERAGE.rglob("*.sql")):
+        sql = path.read_text(encoding="utf-8")
+        file_button(page, path.name).click()
+        assert page.text_content("#file-source-name") == (
+            path.relative_to(COVERAGE).as_posix()
+        )
+        assert page.text_content("#file-source") == sql
+        try:
+            code = sparkshift.convert(sql).code
+        except sparkshift.SparkShiftError as error:
+            assert page.is_hidden("#file-output")
+            assert page.is_disabled("#copy")
+            assert page.is_visible("#file-errors")
+            assert str(error).split("\n")[0] in page.text_content("#file-errors")
+            assert file_button(page, path.name).text_content().endswith("Not converted")
+        else:
+            assert page.text_content("#file-code") == code
+            assert page.is_hidden("#file-errors")
+            assert page.is_enabled("#copy")
+
+
+def test_a_folder_of_notebooks(folder_view: Any) -> None:
+    page = folder_view
+    choose(page, str(COVERAGE))
+
+    page.click("#output-notebook")
+    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+
+    name, files = downloaded_zip(page)
+    assert name == "coverage_notebooks.zip"
+    revenue = COVERAGE / "orders" / "daily_revenue.sql"
+    expected = sparkshift.to_notebook(
+        sparkshift.convert(revenue.read_text(encoding="utf-8")),
+        source="daily_revenue.sql",
+    )
+    assert files["coverage_notebooks/orders/daily_revenue.py"] == expected.encode()
+
+
+def test_files_chosen_one_by_one_use_the_dialect_except_sas(folder_view: Any) -> None:
+    page = folder_view
+    page.select_option("#dialect", "tsql")
+    # Files chosen by an earlier test convert again in the new dialect.
+    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    query = ROOT / "examples" / "sql" / "tsql" / "top_customers.sql"
+    program = ROOT / "examples" / "sas" / "status_counts.sas"
+
+    choose(page, [str(query), str(program)], picker="#pick-files")
+
+    _, files = downloaded_zip(page)
+    assert files == {
+        "converted_pyspark/status_counts.py": sparkshift.convert(
+            program.read_text(encoding="utf-8"), dialect="sas"
+        ).code.encode(),
+        "converted_pyspark/top_customers.py": sparkshift.convert(
+            query.read_text(encoding="utf-8"), dialect="tsql"
+        ).code.encode(),
+    }
+    file_button(page, "status_counts.sas").click()
+    assert page.text_content("#file-source-label") == "SAS program"
+
+
+def test_changing_the_dialect_converts_the_folder_again(folder_view: Any) -> None:
+    page = folder_view
+    choose(page, str(COVERAGE))
+
+    page.select_option("#dialect", "sas")
+    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+
+    assert page.text_content("#folder-errors") == "There are no .sas files to convert."
+    assert page.text_content("#status") == "Conversion failed."
+    assert page.is_disabled("#download-zip")
+
+
+def test_colliding_outputs_convert_nothing(folder_view: Any, tmp_path: Path) -> None:
+    page = folder_view
+    folder = tmp_path / "jobs"
+    folder.mkdir()
+    (folder / "report.sql").write_text("SELECT a FROM t\n", encoding="utf-8")
+    (folder / "report.sas").write_text("data x; set t; run;\n", encoding="utf-8")
+
+    choose(page, str(folder))
+
+    errors = page.text_content("#folder-errors")
+    assert "Nothing was converted" in errors
+    assert "report.sas → report.py" in errors
+    assert "report.sql → report.py" in errors
+    assert page.locator("#files button").count() == 0
+    assert page.is_disabled("#download-zip")
+
+
+def test_files_are_read_as_the_command_line_reads_them(
+    folder_view: Any, tmp_path: Path
+) -> None:
+    page = folder_view
+    folder = tmp_path / "mixed"
+    folder.mkdir()
+    # Line ends inside literals reach the generated code; "\r" alone ends a
+    # line too, for Python.
+    (folder / "windows.sql").write_bytes(
+        b"SELECT 'two\r\nlines' AS a,\r\n  'old\rmac' AS b\r\nFROM t\r\n"
+    )
+    (folder / "latin1.sql").write_bytes("SELECT 'café' AS a FROM t".encode("latin-1"))
+
+    choose(page, str(folder))
+
+    expected = command_line_outputs(folder, tmp_path / "cli")
+    _, files = downloaded_zip(page)
+    assert files == {f"mixed_pyspark/{path}": code for path, code in expected.items()}
+    assert list(expected) == ["windows.py"]
+    file_button(page, "latin1.sql").click()
+    assert page.text_content("#file-errors") == (
+        "Cannot read this file: it is not UTF-8 text."
+    )
+
+
+def test_dropped_files_are_converted(folder_view: Any) -> None:
+    page = folder_view
+
+    page.evaluate(
+        """() => {
+            const transfer = new DataTransfer();
+            transfer.items.add(new File(["SELECT a FROM t"], "dropped.sql"));
+            const drop = document.getElementById("drop");
+            const event = { dataTransfer: transfer, bubbles: true };
+            drop.dispatchEvent(new DragEvent("drop", event));
+        }"""
+    )
+    page.wait_for_selector("#files button", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+
+    assert page.text_content("#file-code") == sparkshift.convert("SELECT a FROM t").code
+    assert page.text_content("#status") == "Converted 1 of 1 file."
+
+
+def test_dropped_folders_are_read_in_full(session: dict) -> None:
+    page = session["page"]
+
+    # A folder's entries arrive in batches; the walk must read them all.
+    found = page.evaluate(
+        """async () => {
+            const { filesFromDrop } = await import("./files.js");
+            const file = (path) => ({
+                isFile: true,
+                fullPath: path,
+                file: (resolve) => resolve(new File([path], path.split("/").pop())),
+            });
+            const folder = (path, batches) => ({
+                isDirectory: true,
+                fullPath: path,
+                createReader: () => ({
+                    readEntries: (resolve) => resolve(batches.shift() ?? []),
+                }),
+            });
+            const root = folder("/claims", [
+                [
+                    file("/claims/a.sas"),
+                    folder("/claims/legacy", [[file("/claims/legacy/b.sas")]]),
+                ],
+                [file("/claims/c.sql")],
+            ]);
+            const found = await filesFromDrop({
+                items: [{ webkitGetAsEntry: () => root }],
+                files: [],
+            });
+            return found.map(({ path, file }) => [path, file.name]);
+        }"""
+    )
+
+    assert found == [
+        ["claims/a.sas", "a.sas"],
+        ["claims/legacy/b.sas", "b.sas"],
+        ["claims/c.sql", "c.sql"],
+    ]
+
+
+def test_views_keep_their_own_status_and_tabs_follow_the_keyboard(
+    folder_view: Any,
+) -> None:
+    page = folder_view
+    choose(page, str(COVERAGE))
+    folder_status = page.text_content("#status")
+    assert page.is_hidden("#view-file")
+    assert page.is_hidden("#download")
+    assert page.is_hidden("#share")
+    assert page.is_visible("#download-zip")
+
+    page.focus("#tab-folder")
+    page.keyboard.press("ArrowLeft")
+
+    assert page.get_attribute("#tab-file", "aria-selected") == "true"
+    assert page.evaluate("document.activeElement.id") == "tab-file"
+    assert page.is_visible("#view-file")
+    assert page.is_hidden("#view-folder")
+    assert page.is_hidden("#download-zip")
+    assert page.text_content("#status") != folder_status
+    page.keyboard.press("ArrowRight")
+    assert page.is_visible("#view-folder")
+    assert page.text_content("#status") == folder_status
+
+
 # --- The page itself ------------------------------------------------------------
 
 
@@ -409,6 +709,41 @@ def test_page_fits_a_phone_screen(browser: Any, site_url: str) -> None:
     page = open_page(browser, site_url, viewport={"width": 375, "height": 812})
 
     convert_in_page(page, WARNING_PROGRAM, "sas")
+    scroll_width = page.evaluate("document.documentElement.scrollWidth")
+
+    assert scroll_width <= 375
+    page.context.close()
+
+
+@pytest.mark.parametrize("color_scheme", ["light", "dark"])
+def test_folder_view_has_no_accessibility_violations(
+    browser: Any, site_url: str, color_scheme: str
+) -> None:
+    from axe_playwright_python.sync_playwright import Axe
+
+    page = open_page(browser, site_url, bypass_csp=True, color_scheme=color_scheme)
+    page.click("#tab-folder")
+    assert page.text_content("#status") == (
+        "Choose a folder or files to convert them all at once."
+    )
+    choose(page, str(COVERAGE))
+    # A file with errors, while the summary shows every state.
+    file_button(page, "unfinished.sql").click()
+    assert page.is_visible("#file-errors")
+
+    results = Axe().run(
+        page, options={"runOnly": ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"]}
+    )
+
+    assert results.violations_count == 0, results.generate_report()
+    page.context.close()
+
+
+def test_folder_view_fits_a_phone_screen(browser: Any, site_url: str) -> None:
+    page = open_page(browser, site_url, viewport={"width": 375, "height": 812})
+    page.click("#tab-folder")
+
+    choose(page, str(COVERAGE))
     scroll_width = page.evaluate("document.documentElement.scrollWidth")
 
     assert scroll_width <= 375
@@ -762,6 +1097,74 @@ def test_successful_requests_disarm_their_deadlines(blocked_worker_page: Any) ->
     assert (
         page.text_content("#code")
         == sparkshift.convert("SELECT name FROM customers").code
+    )
+
+
+def busy_folder(tmp_path: Path) -> Path:
+    """A folder whose second file blocks Python (see blocked_worker_page)."""
+    folder = tmp_path / "busy"
+    folder.mkdir()
+    for name, sql in [
+        ("a.sql", "SELECT a FROM t"),
+        ("b.sql", "SELECT worker_busy FROM t"),
+        ("c.sql", "SELECT c FROM t"),
+    ]:
+        (folder / name).write_text(sql, encoding="utf-8")
+    return folder
+
+
+def block_python_in_a_folder(page: Any, folder: Path) -> None:
+    page.click("#tab-folder")
+    with page.expect_console_message(
+        predicate=lambda message: message.text == "worker CPU fault entered"
+    ):
+        page.set_input_files("#pick-folder", str(folder))
+    # What decides the results stays fixed while the files convert.
+    for control in ["#dialect", "#output-notebook", "#choose-folder", "#convert"]:
+        assert page.is_disabled(control)
+    assert page.is_visible("#cancel")
+
+
+def test_a_file_past_the_deadline_does_not_stop_its_folder(
+    blocked_worker_page: Any, tmp_path: Path
+) -> None:
+    page = blocked_worker_page
+    page.clock.install()
+    block_python_in_a_folder(page, busy_folder(tmp_path))
+
+    page.clock.fast_forward(10_001)
+    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+
+    assert page.text_content("#status") == (
+        "Converted 2 of 3 files; 1 could not be converted."
+    )
+    file_button(page, "b.sql").click()
+    assert "10-second limit" in page.text_content("#file-errors")
+    _, files = downloaded_zip(page)
+    assert files == {
+        "busy_pyspark/a.py": sparkshift.convert("SELECT a FROM t").code.encode(),
+        "busy_pyspark/c.py": sparkshift.convert("SELECT c FROM t").code.encode(),
+    }
+
+
+def test_cancelling_a_folder_stops_all_its_files(
+    blocked_worker_page: Any, tmp_path: Path
+) -> None:
+    page = blocked_worker_page
+    block_python_in_a_folder(page, busy_folder(tmp_path))
+
+    page.click("#cancel")
+    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+
+    assert "cancelled" in page.text_content("#status")
+    assert page.locator("#files .tag").all_text_contents() == ["Waiting"] * 3
+    assert page.is_hidden("#file-output")
+    assert page.is_disabled("#download-zip")
+    assert page.is_disabled("#copy")
+    page.click("#tab-file")
+    convert_in_page(page, "SELECT id FROM orders", "")
+    assert (
+        page.text_content("#code") == sparkshift.convert("SELECT id FROM orders").code
     )
 
 

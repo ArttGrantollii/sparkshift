@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The playground can show the Databricks notebook that `convert --notebook`
   writes, and download the result as a `.py` file.
+- The playground converts folders: drop or choose a folder or files, see each
+  file's result, and download a zip with exactly what `sparkshift convert
+  FOLDER -o OUT` would write. The command line and the playground share the
+  batch rules (`sparkshift.batch`).
 
 ## [0.1.0] - 2026-10-15
 

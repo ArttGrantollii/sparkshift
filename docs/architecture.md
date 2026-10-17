@@ -43,6 +43,7 @@ flowchart LR
 | Notebooks | `notebook.py` | Generated code as a Databricks source-format notebook: a Markdown description, one cell per section, and `display(result)` ([ADR 0007](adr/0007-databricks-notebooks.md)) |
 | Analysis | `report.py` | Calls `convert` for many files and summarizes the outcomes: pure functions and data, with text, Markdown, and JSON formats; it reads no files |
 | Databricks | `databricks.py` | Imports notebooks into a workspace through the optional Databricks SDK, imported only when uploading; credentials come from the SDK's own sources and are redacted from every message ([ADR 0010](adr/0010-upload-notebooks-with-the-databricks-sdk.md)) |
+| Batches | `batch.py` | The rules for converting many files, shared by the command line and the playground: which files are converted, the dialect of each, and which output paths collide |
 | Command line | `cli.py` | Reads and writes files, and calls `convert`, `report`, or the upload |
 
 Only `parsing.py` and `translate.py` may import SQLGlot; the IR, the emitter,

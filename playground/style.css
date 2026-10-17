@@ -243,9 +243,12 @@ a {
 
 /* Toolbar */
 
-.workspace {
+.workspace,
+.view,
+.detail {
   display: grid;
   gap: 12px;
+  min-width: 0;
 }
 
 .toolbar {
@@ -308,10 +311,16 @@ a {
   cursor: pointer;
 }
 
-.segmented button[aria-checked="true"] {
+.segmented button[aria-checked="true"],
+.segmented button[aria-selected="true"] {
   background: var(--raised);
   color: var(--fg);
   box-shadow: 0 0 0 1px var(--line-strong);
+}
+
+.segmented button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 .button {
@@ -397,6 +406,16 @@ kbd {
   margin-left: auto;
   font-family: var(--font-code);
   font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.pane-name {
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--font-code);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .editor {
@@ -530,6 +549,202 @@ kbd {
   background: var(--bad-surface);
 }
 
+/* Folder view: the files and their summary beside the selected file */
+
+.folder {
+  grid-template-columns: 300px minmax(0, 1fr);
+  align-items: start;
+}
+
+.tree {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.summary {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.summary .big {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+}
+
+.bar {
+  display: flex;
+  gap: 2px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--raised);
+  overflow: hidden;
+}
+
+.bar i {
+  display: block;
+  height: 100%;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.files {
+  display: grid;
+  gap: 1px;
+  max-height: 32rem;
+  margin: 0;
+  padding: 6px;
+  list-style: none;
+  overflow: auto;
+}
+
+.files:empty {
+  display: none;
+}
+
+.files .dir {
+  padding: 8px 10px 4px;
+  color: var(--muted);
+  font: 11.5px var(--font-code);
+  overflow-wrap: anywhere;
+}
+
+.files button {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  font: 12.5px var(--font-code);
+  text-align: left;
+  cursor: pointer;
+}
+
+.files button:hover {
+  background: var(--raised);
+}
+
+.files button[aria-current="true"] {
+  background: var(--accent-soft);
+}
+
+.files .name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.files .tag {
+  color: var(--muted);
+  font: 11.5px var(--font-ui);
+}
+
+.files button[data-state="warn"] .tag {
+  color: var(--warn);
+}
+
+.files button[data-state="bad"] .tag {
+  color: var(--bad);
+}
+
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--line-strong);
+}
+
+.files button[data-state="ok"] .dot,
+.legend .dot[data-state="ok"],
+.bar i[data-state="ok"] {
+  background: var(--ok);
+}
+
+.files button[data-state="warn"] .dot,
+.legend .dot[data-state="warn"],
+.bar i[data-state="warn"] {
+  background: var(--warn);
+}
+
+.files button[data-state="bad"] .dot,
+.legend .dot[data-state="bad"],
+.bar i[data-state="bad"] {
+  background: var(--bad);
+}
+
+.files button[data-state="busy"] .dot {
+  background: var(--accent);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.legend .dot[data-state="skipped"] {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--muted);
+}
+
+.drop {
+  display: grid;
+  gap: 10px;
+  justify-items: center;
+  margin: 6px;
+  padding: 16px 14px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 12.5px;
+  text-align: center;
+}
+
+.drop p {
+  margin: 0;
+}
+
+.drop b {
+  color: var(--fg);
+  font-weight: 500;
+}
+
+.drop.dragging {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.drop-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+}
+
 /* Status bar */
 
 .statusbar {
@@ -605,7 +820,8 @@ footer code,
 /* Narrow screens */
 
 @media (max-width: 900px) {
-  .panes {
+  .panes,
+  .folder {
     grid-template-columns: minmax(0, 1fr);
   }
 
