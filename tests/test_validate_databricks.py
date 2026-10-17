@@ -74,6 +74,27 @@ def test_the_driver_runs_and_checks_every_example(tool: ModuleType) -> None:
     assert "USE " not in source
 
 
+def test_the_driver_checks_the_tables_each_example_writes(tool: ModuleType) -> None:
+    expected = {name: ("struct<x:int>", ["[1]"]) for name, _, _ in tool.examples()}
+    written = {name: {"t1": ("struct<x:int>", ["[1]"])} for name in expected}
+
+    source = tool.driver_source(
+        expected, "workspace", "sparkshift", written, "workspace.results"
+    )
+
+    ast.parse(source)
+    assert 'spark.sql("CREATE SCHEMA IF NOT EXISTS workspace.results")' in source
+    # Every table exists first, with other columns, so writes replace it.
+    assert "spark.range(1).write.mode('overwrite')" in source
+    for name in expected:
+        assert (
+            f"_validation_check({name!r}, result)\n_validation_check_tables({name!r})"
+        ) in source
+    without = tool.driver_source(expected, "c", "s")
+    assert "\n_validation_check_tables(" not in without
+    assert "CREATE SCHEMA IF NOT EXISTS workspace.results" not in without
+
+
 def test_the_driver_check_reports_differences(tool: ModuleType) -> None:
     """Run the driver's setup cell with a fake DataFrame: the comparison
     must pass on equal results and report each kind of difference."""
@@ -100,7 +121,11 @@ def test_the_driver_check_reports_differences(tool: ModuleType) -> None:
     check("ok", Frame([("a",)], "struct<x:int>"))  # type: ignore[operator]
     check("bad", Frame([("a",), ("b",)], "struct<x:bigint>"))  # type: ignore[operator]
 
-    ok, bad = scope["_validation_report"]  # type: ignore[misc]
+    # A table is checked against its own expected rows.
+    check("ok -> t", Frame([("a",)], "struct<x:int>"), ("struct<x:int>", ['["a"]']))  # type: ignore[operator]
+
+    ok, bad, table = scope["_validation_report"]  # type: ignore[misc]
+    assert table == {"example": "ok -> t", "status": "pass"}
     assert ok == {"example": "ok", "status": "pass"}
     assert bad["status"] == "fail"
     assert bad["types"] == ["struct<x:int>", "struct<x:bigint>"]

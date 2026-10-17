@@ -34,6 +34,13 @@ uv run python tools/validate_databricks.py --profile sparkshift \
 
 It prints one line per example and exits with 1 if any differ.
 
+With `--write-schema CATALOG.SCHEMA`, the notebooks are uploaded with
+`--output-catalog` and `--output-schema` as well, so each also writes its
+results to tables there. Before running them, the driver creates every one of
+those tables with other columns, so each write must replace a table, schema
+included; after each example it compares every table the example wrote with
+the expected types and rows of that table.
+
 ## Results
 
 ### 2026-10-15, Databricks Free Edition, serverless compute
@@ -55,6 +62,16 @@ To check that the comparison can fail, one run had two expectations changed
 on purpose: a row removed from one example and a column type changed in
 another. It reported exactly those two examples as different, with the extra
 row and both types.
+
+### 2026-10-17, writing results to tables
+
+With `--write-schema workspace.sparkshift_results`, in serverless environment
+4 (Spark 4.2.0, PySpark 4.0.0): **23 of 23** matched local Spark, the 11
+examples' results and the 12 tables their notebooks wrote: one per SQL query,
+named after its file, and one per SAS data set, both data sets for
+`customer_ratings.sas` (`rated` and `ranked`). Every table existed before the
+run with other columns, so every write replaced a Unity Catalog table and its
+schema.
 
 ### A PySpark 4 client is needed
 

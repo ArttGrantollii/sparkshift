@@ -1,7 +1,7 @@
 """SparkShift: convert SQL into readable, idiomatic, tested PySpark DataFrame code."""
 
 from sparkshift.api import convert
-from sparkshift.diagnostics import ConversionResult, Diagnostic
+from sparkshift.diagnostics import ConversionResult, DataSet, Diagnostic
 from sparkshift.errors import (
     MultipleStatementsError,
     SASParseError,
@@ -16,6 +16,7 @@ __version__ = "0.2.0.dev0"
 
 __all__ = [
     "ConversionResult",
+    "DataSet",
     "Diagnostic",
     "MultipleStatementsError",
     "SASParseError",

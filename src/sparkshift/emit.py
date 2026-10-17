@@ -22,7 +22,10 @@ RESULT_VARIABLE = "result"
 _Argument: TypeAlias = ir.Expression | ir.SortKey | str
 
 # Names the generated code already uses; table variables must not shadow them.
-_RESERVED_NAMES = frozenset({RESULT_VARIABLE, "spark", "F", "Decimal", "Window"})
+# Names the code uses, and those Databricks notebooks predefine and call.
+_RESERVED_NAMES = frozenset(
+    {RESULT_VARIABLE, "spark", "F", "Decimal", "Window", "dbutils", "display"}
+)
 
 _INDENT = "    "
 _MAX_LINE_LENGTH = 88
@@ -102,9 +105,18 @@ def emit_datasets(
     """Return PySpark code that assigns each data set to its own variable, in
     order, whether or not a later one uses it, and the last one to ``result``,
     as a SAS program creates its data sets one step at a time."""
+    return emit_datasets_and_variables(datasets, line_length=line_length)[0]
+
+
+def emit_datasets_and_variables(
+    datasets: Sequence[ir.Named], *, line_length: int = _MAX_LINE_LENGTH
+) -> tuple[str, dict[ir.Named, str]]:
+    """As ``emit_datasets``, with the variable that holds each data set."""
     if not datasets:
         raise ValueError("emit_datasets needs at least one data set")
-    return _Emitter(line_length).datasets(datasets)
+    emitter = _Emitter(line_length)
+    code = emitter.datasets(datasets)
+    return code, {dataset: emitter.named_variables[dataset] for dataset in datasets}
 
 
 def emit_expression(expression: ir.Expression) -> str:

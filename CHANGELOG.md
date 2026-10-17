@@ -21,6 +21,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file's result, and download a zip with exactly what `sparkshift convert
   FOLDER -o OUT` would write. The command line and the playground share the
   batch rules (`sparkshift.batch`).
+- Notebooks can write their results to tables: `output_catalog` and
+  `output_schema` widgets (`--output-catalog`, `--output-schema` on
+  `convert --notebook` and `upload`) choose where; a SAS program writes each
+  data set it creates, a SQL query its result, named after its file, and
+  existing tables are replaced. Nothing is written while `output_schema` is
+  empty.
+- `ConversionResult.datasets` lists the data sets a SAS program creates, as
+  `DataSet(name, variable)`.
+
+### Fixed
+
+- A SAS data set named `display` or `dbutils` no longer gets a variable of
+  that name, which hid the functions a Databricks notebook calls after the
+  code; it is named `display_df` or `dbutils_df`.
 
 ## [0.1.0] - 2026-10-15
 

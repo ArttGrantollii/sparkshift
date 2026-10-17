@@ -47,6 +47,18 @@ compute on Spark 4.2.0, the version SparkShift is tested with, and
   passed as values, never put into SQL text. `--catalog` and `--schema` give
   their initial values; empty keeps the current catalog or schema, so names
   are still never guessed. Widgets are also job parameters.)
+- **Results can be written to tables** (amended 2026-10-17, for jobs that
+  must produce tables, not only a display). `output_catalog` and
+  `output_schema` widgets choose where; nothing is written while
+  `output_schema` is empty, so opening a notebook never changes a table. A
+  SAS program writes every data set it creates under its own name (SAS
+  output data sets are always `WORK` data sets, so the output schema plays
+  the part of `WORK`); a SQL query writes its result as a table named after
+  its file, as there is no other name to give it. Writes replace the table,
+  columns included (`overwriteSchema`), as a SAS step replaces a data set.
+  Reading and writing locations stay separate widgets: a SQL migration
+  usually reads from one schema and writes to another, and notebooks that
+  read each other's tables read from the schema they write to.
 - `sparkshift convert --notebook` and `sparkshift.to_notebook(...)` write it,
   for SQL and SAS alike.
 

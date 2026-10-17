@@ -20,6 +20,12 @@ hand-derived SAS rows. On the workspace, it:
    `result` with the local column types and rows (as a multiset; order is
    checked locally).
 
+With --write-schema CATALOG.SCHEMA, the notebooks also write their results
+there (`sparkshift upload --output-catalog --output-schema`): the driver
+first fills that schema with tables of the same names and other columns, so
+every write must replace a table, and after each example compares every table
+it wrote with the rows that table should hold.
+
 It prints one line per example and exits with 1 if any differ. Credentials
 come only from the profile; nothing here prints them.
 """
@@ -66,8 +72,12 @@ def examples() -> list[tuple[str, Path, str | None]]:
     return found
 
 
-def local_results() -> dict[str, tuple[str, list[str]]]:
-    """Each example's column types and rows on local Spark."""
+def local_results() -> tuple[
+    dict[str, tuple[str, list[str]]], dict[str, dict[str, tuple[str, list[str]]]]
+]:
+    """Each example's column types and rows on local Spark, and those of each
+    table its notebook writes: a SQL query's result, named after its file, or
+    each data set of a SAS program (the last of each name)."""
     from datasets import TABLES
     from pyspark.sql import SparkSession
 
@@ -84,21 +94,34 @@ def local_results() -> dict[str, tuple[str, list[str]]]:
         for name, (schema, rows) in TABLES.items():
             spark.createDataFrame(rows, schema).createOrReplaceTempView(name)
         results = {}
+        tables = {}
         for name, path, dialect in examples():
-            code = sparkshift.convert(path.read_text(), dialect=dialect).code
+            converted = sparkshift.convert(path.read_text(), dialect=dialect)
             scope: dict[str, Any] = {"spark": spark}
-            exec(code, scope)
+            exec(converted.code, scope)
             frame = scope["result"]
             results[name] = (frame.schema.simpleString(), rows_of(frame))
-        return results
+            written = {path.stem.lower(): "result"}
+            if converted.datasets:
+                written = {d.name: d.variable for d in converted.datasets}
+            tables[name] = {
+                table: (scope[variable].schema.simpleString(), rows_of(scope[variable]))
+                for table, variable in written.items()
+            }
+        return results, tables
     finally:
         spark.stop()
 
 
 def driver_source(
-    expected: dict[str, tuple[str, list[str]]], catalog: str, schema: str
+    expected: dict[str, tuple[str, list[str]]],
+    catalog: str,
+    schema: str,
+    written: dict[str, dict[str, tuple[str, list[str]]]] | None = None,
+    write_schema: str | None = None,
 ) -> str:
-    """The driver notebook, in Databricks source format."""
+    """The driver notebook, in Databricks source format. With ``written`` and
+    ``write_schema``, it also checks the tables each example writes."""
     from datasets import TABLES
 
     tables = {
@@ -123,9 +146,23 @@ def driver_source(
             "_validation_report = []",
             "",
             "",
-            "def _validation_check(name, frame):",
+            f"_validation_written = {written or {}!r}",
+            f"_validation_write_schema = {write_schema!r}",
+            "",
+            "",
+            "def _validation_check_tables(name):",
+            '    """Compare each table an example wrote with its expected rows."""',
+            "    for table, expected in _validation_written.get(name, {}).items():",
+            "        _validation_check(",
+            '            f"{name} -> {table}",',
+            '            spark.table(f"{_validation_write_schema}.{table}"),',
+            "            expected,",
+            "        )",
+            "",
+            "",
+            "def _validation_check(name, frame, expected=None):",
             '    """Compare a result with the expected types and rows."""',
-            "    types, rows = _validation_expected[name]",
+            "    types, rows = expected or _validation_expected[name]",
             "    actual = rows_of(frame)",
             "    entry = {'example': name, 'status': 'pass'}",
             "    if frame.schema.simpleString() != types:",
@@ -155,10 +192,26 @@ def driver_source(
             # No USE statements: each example's widgets select the schema.
         ]
     )
+    if write_schema:
+        # Tables with other columns, so every write must replace one.
+        load += "\n".join(
+            [
+                "",
+                f'spark.sql("CREATE SCHEMA IF NOT EXISTS {write_schema}")',
+                "for _tables in _validation_written.values():",
+                "    for _table in _tables:",
+                "        spark.range(1).write.mode('overwrite').option(",
+                "            'overwriteSchema', 'true'",
+                f"        ).saveAsTable('{write_schema}.' + _table)",
+            ]
+        )
     cells = [setup, load]
     for name, _, _ in examples():
         cells.append(f"# MAGIC %run ./examples/{name}")
-        cells.append(f"_validation_check({name!r}, result)")
+        check = f"_validation_check({name!r}, result)"
+        if write_schema:
+            check += f"\n_validation_check_tables({name!r})"
+        cells.append(check)
     cells.append(
         "import pyspark\n"
         "dbutils.notebook.exit(json.dumps({'spark_version': spark.version, "
@@ -168,13 +221,20 @@ def driver_source(
     return f"# Databricks notebook source\n{body}\n"
 
 
-def upload_examples(folder: str, profile: str, catalog: str, schema: str) -> None:
+def upload_examples(
+    folder: str, profile: str, catalog: str, schema: str, write_schema: str | None
+) -> None:
     """Upload every example folder with `sparkshift upload`, with notebook
-    widgets that select the test tables' catalog and schema."""
+    widgets that select the test tables' catalog and schema, and the schema
+    to write results to, if any."""
     from sparkshift.cli import main
 
     common = ["--overwrite", "--profile", profile]
     common += ["--catalog", catalog, "--schema", schema]
+    if write_schema:
+        output_catalog, output_schema = write_schema.split(".")
+        common += ["--output-catalog", output_catalog]
+        common += ["--output-schema", output_schema]
     for directory in sorted((EXAMPLES / "sql").iterdir()):
         arguments = [
             "upload",
@@ -244,21 +304,28 @@ def main(argv: list[str] | None = None) -> int:
         help="serverless environment version; 4 is the first with a PySpark 4 "
         "client (default: 4)",
     )
+    parser.add_argument(
+        "--write-schema",
+        help="also write the notebooks' results to this CATALOG.SCHEMA, "
+        "replacing its tables of the same names, and check them",
+    )
     arguments = parser.parse_args(argv)
     catalog, schema = arguments.schema.split(".")
+    write_schema = arguments.write_schema
 
     print("computing the expected results on local Spark", file=sys.stderr)
-    expected = local_results()
-    upload_examples(arguments.folder, arguments.profile, catalog, schema)
+    expected, written = local_results()
+    upload_examples(arguments.folder, arguments.profile, catalog, schema, write_schema)
 
     from sparkshift.databricks import connect
 
     workspace = connect(arguments.profile)
     workspace.mkdirs(arguments.folder)
     driver = f"{arguments.folder}/driver"
-    workspace.import_notebook(
-        driver, driver_source(expected, catalog, schema), overwrite=True
+    source = driver_source(
+        expected, catalog, schema, written if write_schema else None, write_schema
     )
+    workspace.import_notebook(driver, source, overwrite=True)
     report = run_driver(arguments.profile, driver, arguments.environment)
 
     print(
@@ -273,8 +340,11 @@ def main(argv: list[str] | None = None) -> int:
             details = {k: v for k, v in entry.items() if k not in ("status", "example")}
             print(json.dumps(details, indent=2, ensure_ascii=False))
     checked = len(report["results"])
-    print(f"{checked - failed} of {len(expected)} examples match local Spark")
-    return 0 if failed == 0 and checked == len(expected) else 1
+    total = len(expected)
+    if write_schema:
+        total += sum(len(tables) for tables in written.values())
+    print(f"{checked - failed} of {total} results and tables match local Spark")
+    return 0 if failed == 0 and checked == total else 1
 
 
 if __name__ == "__main__":

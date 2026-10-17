@@ -63,8 +63,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _report(parser, arguments)
     if arguments.command == "upload":
         return _upload(parser, arguments)
-    if (arguments.catalog or arguments.schema) and not arguments.notebook:
-        parser.error("--catalog and --schema need --notebook")
+    locations = (
+        arguments.catalog,
+        arguments.schema,
+        arguments.output_catalog,
+        arguments.output_schema,
+    )
+    if any(locations) and not arguments.notebook:
+        parser.error(
+            "--catalog, --schema, --output-catalog and --output-schema need --notebook"
+        )
     if arguments.input != _STDIN and Path(arguments.input).is_dir():
         return _convert_directory(parser, arguments)
     return _convert_one(parser, arguments)
@@ -214,7 +222,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _add_location_arguments(command: argparse.ArgumentParser, condition: str) -> None:
-    """--catalog and --schema: the notebooks' widget values."""
+    """--catalog, --schema, --output-catalog and --output-schema: the
+    notebooks' widget values."""
     for name in ("catalog", "schema"):
         command.add_argument(
             f"--{name}",
@@ -222,6 +231,20 @@ def _add_location_arguments(command: argparse.ArgumentParser, condition: str) ->
             help=f"{condition}the {name} the notebooks read tables from, as the "
             f"initial value of their {name} widget (default: the current one)",
         )
+    command.add_argument(
+        "--output-catalog",
+        default="",
+        help=f"{condition}the catalog the notebooks write their results to, as "
+        "the initial value of their output_catalog widget (default: the current "
+        "one)",
+    )
+    command.add_argument(
+        "--output-schema",
+        default="",
+        help=f"{condition}the schema the notebooks write their results to, "
+        "replacing tables of the same names, as the initial value of their "
+        "output_schema widget (default: none, nothing is written)",
+    )
 
 
 def _convert_one(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int:
@@ -396,6 +419,8 @@ def _upload(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> i
                 dialect=dialect,
                 catalog=arguments.catalog,
                 schema=arguments.schema,
+                output_catalog=arguments.output_catalog,
+                output_schema=arguments.output_schema,
             )
             notebooks.append((path, notebook_path, notebook))
 
@@ -478,6 +503,8 @@ def _output(
         dialect=dialect,
         catalog=arguments.catalog,
         schema=arguments.schema,
+        output_catalog=arguments.output_catalog,
+        output_schema=arguments.output_schema,
     )
 
 

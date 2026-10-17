@@ -125,6 +125,7 @@ def test_a_notebook_starts_its_widgets_at_the_given_catalog_and_schema(
 ) -> None:
     arguments = ["convert", str(sql_file), "--notebook"]
     arguments += ["--catalog", "workspace", "--schema", "sparkshift"]
+    arguments += ["--output-catalog", "main", "--output-schema", "results"]
 
     assert main(arguments) == EXIT_CONVERTED
 
@@ -133,11 +134,15 @@ def test_a_notebook_starts_its_widgets_at_the_given_catalog_and_schema(
         source=str(sql_file),
         catalog="workspace",
         schema="sparkshift",
+        output_catalog="main",
+        output_schema="results",
     )
     assert capsys.readouterr().out == expected
 
 
-@pytest.mark.parametrize("option", ["--catalog", "--schema"])
+@pytest.mark.parametrize(
+    "option", ["--catalog", "--schema", "--output-catalog", "--output-schema"]
+)
 def test_catalog_and_schema_need_a_notebook(sql_file: Path, option: str) -> None:
     with pytest.raises(SystemExit) as caught:
         main(["convert", str(sql_file), option, "x"])

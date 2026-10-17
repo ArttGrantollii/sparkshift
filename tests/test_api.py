@@ -117,6 +117,26 @@ def test_convert_a_sas_program() -> None:
     assert [warning.message for warning in result.warnings] == [
         "KEEP of several variables"
     ]
+    assert result.datasets == (sparkshift.DataSet(name="us", variable="us"),)
+
+
+def test_a_sas_program_lists_the_data_sets_it_creates() -> None:
+    result = sparkshift.convert(
+        "data Big; set orders; run;\n"
+        "proc sort data=big out=work.ranked; by amount; run;\n"
+        "data display; set ranked; run;",
+        dialect="sas",
+    )
+
+    assert [(dataset.name, dataset.variable) for dataset in result.datasets] == [
+        ("big", "big"),
+        ("ranked", "ranked"),
+        ("display", "display_df"),
+    ]
+
+
+def test_a_query_creates_no_data_sets() -> None:
+    assert sparkshift.convert("SELECT a FROM t").datasets == ()
 
 
 def test_a_sas_parse_error_is_an_sql_parse_error() -> None:

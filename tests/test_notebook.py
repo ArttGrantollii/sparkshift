@@ -7,6 +7,7 @@ import pytest
 import sparkshift
 from sparkshift.diagnostics import ConversionResult, Diagnostic
 from sparkshift.notebook import CELL_SEPARATOR, HEADER, to_notebook
+from sparkshift.notebook import _table_name as table_name
 
 SEPARATOR = f"\n\n{CELL_SEPARATOR}\n\n"
 
@@ -18,11 +19,19 @@ def cells(notebook: str) -> list[str]:
     return notebook[len(HEADER) + 1 : -1].split(SEPARATOR)
 
 
-def location_cell(catalog: str = "", schema: str = "") -> str:
-    """The cell whose widgets choose where tables are read from."""
+def location_cell(
+    catalog: str = "",
+    schema: str = "",
+    output_catalog: str = "",
+    output_schema: str = "",
+) -> str:
+    """The cell whose widgets choose where tables are read from and where
+    results are written."""
     return (
         f'dbutils.widgets.text("catalog", "{catalog}")\n'
         f'dbutils.widgets.text("schema", "{schema}")\n'
+        f'dbutils.widgets.text("output_catalog", "{output_catalog}")\n'
+        f'dbutils.widgets.text("output_schema", "{output_schema}")\n'
         'if dbutils.widgets.get("catalog"):\n'
         '    spark.catalog.setCurrentCatalog(dbutils.widgets.get("catalog"))\n'
         'if dbutils.widgets.get("schema"):\n'
@@ -30,9 +39,45 @@ def location_cell(catalog: str = "", schema: str = "") -> str:
     )
 
 
-def program(code: str) -> str:
-    """What a notebook runs: the widget cell, the code, and display(result)."""
-    return f"{location_cell()}\n{code}\ndisplay(result)\n"
+def write_cell(*tables: tuple[str, str], save: str = "save_table") -> str:
+    """The cell that writes each (variable, table) when output_schema is set."""
+    calls = "".join(
+        f'\n    {save}({variable}, "{table}")' for variable, table in tables
+    )
+    return (
+        f"def {save}(dataframe, name):\n"
+        '    """Replace the table ``name`` in the output catalog and schema."""\n'
+        '    catalog = dbutils.widgets.get("output_catalog")\n'
+        "    parts = [\n"
+        "        catalog or spark.catalog.currentCatalog(),\n"
+        '        dbutils.widgets.get("output_schema"),\n'
+        "        name,\n"
+        "    ]\n"
+        '    table = ".".join("`" + part.replace("`", "``") + "`" for part in parts)\n'
+        '    writer = dataframe.write.mode("overwrite")\n'
+        '    writer.option("overwriteSchema", "true").saveAsTable(table)\n'
+        "\n"
+        "\n"
+        'if dbutils.widgets.get("output_schema"):' + calls
+    )
+
+
+def program(code: str, table: str = "result") -> str:
+    """What a notebook runs: the widget cell, the code, the write cell, and
+    display(result)."""
+    return (
+        f"{location_cell()}\n{code}\n{write_cell(('result', table))}\ndisplay(result)\n"
+    )
+
+
+def writing(what: str) -> str:
+    """The description's paragraph on writing results."""
+    return (
+        f"# MAGIC Set the `output_schema` widget to save {what} in that schema, in "
+        "the catalog in the `output_catalog` widget or the current one. Tables of "
+        "the same name are replaced. Leave `output_schema` empty to only display "
+        "the result."
+    )
 
 
 def test_a_notebook_in_databricks_source_format() -> None:
@@ -52,6 +97,8 @@ def test_a_notebook_in_databricks_source_format() -> None:
         "# MAGIC\n"
         "# MAGIC Needs a PySpark 4 client: on serverless compute, use environment "
         "version 4 or later.\n"
+        "# MAGIC\n"
+        f"{writing('the result as the table `good_customers`')}\n"
         "\n"
         "# COMMAND ----------\n"
         "\n"
@@ -71,6 +118,10 @@ def test_a_notebook_in_databricks_source_format() -> None:
         "\n"
         "# COMMAND ----------\n"
         "\n"
+        f"{write_cell(('result', 'good_customers'))}\n"
+        "\n"
+        "# COMMAND ----------\n"
+        "\n"
         "display(result)\n"
     )
 
@@ -84,7 +135,7 @@ def test_each_section_of_the_code_is_a_cell() -> None:
         "FROM big o JOIN customers c ON o.customer_id = c.customer_id"
     )
 
-    code_cells = cells(to_notebook(result))[2:-1]
+    code_cells = cells(to_notebook(result))[2:-2]
 
     # The import sections share a cell; the others keep the code's sections.
     sections = result.code.strip("\n").split("\n\n")
@@ -124,6 +175,8 @@ def test_warnings_are_listed_for_review() -> None:
         "# MAGIC",
         "# MAGIC Needs a PySpark 4 client: on serverless compute, use environment "
         "version 4 or later.",
+        "# MAGIC",
+        writing("the result as the table `job`"),
         "# MAGIC",
         "# MAGIC **Review before running:**",
         "# MAGIC",
@@ -178,7 +231,11 @@ def test_multiline_sas_warning_remains_notebook_metadata() -> None:
     )
     assert result.warnings
     notebook = to_notebook(result, source="deduplicate.sas", dialect="sas")
-    assert ast.dump(ast.parse(notebook)) == ast.dump(ast.parse(program(result.code)))
+    expected = program(result.code).replace(
+        'save_table(result, "result")',
+        'save_table(unique_customers, "unique_customers")',
+    )
+    assert ast.dump(ast.parse(notebook)) == ast.dump(ast.parse(expected))
     assert all(line.startswith("# MAGIC") for line in cells(notebook)[0].splitlines())
 
 
@@ -198,17 +255,95 @@ def test_metadata_cannot_create_executable_code_or_notebook_cells(
         options[field] = payload
     result = ConversionResult("result = spark.table('t')\n", (Diagnostic(**values),))
     notebook = to_notebook(result, **options)
-    assert ast.dump(ast.parse(notebook)) == ast.dump(ast.parse(program(result.code)))
-    assert notebook.splitlines().count(CELL_SEPARATOR) == 3
+    table = table_name(options["source"])
+    assert ast.dump(ast.parse(notebook)) == ast.dump(
+        ast.parse(program(result.code, table))
+    )
+    assert notebook.splitlines().count(CELL_SEPARATOR) == 4
     assert all(line.startswith("# MAGIC") for line in cells(notebook)[0].splitlines())
 
 
 def test_widgets_start_with_the_given_catalog_and_schema() -> None:
     result = ConversionResult("result = spark.table('t')\n")
 
-    notebook = to_notebook(result, catalog="workspace", schema="sparkshift")
+    notebook = to_notebook(
+        result,
+        catalog="workspace",
+        schema="raw",
+        output_catalog="main",
+        output_schema="claims",
+    )
 
-    assert cells(notebook)[1] == location_cell("workspace", "sparkshift")
+    assert cells(notebook)[1] == location_cell("workspace", "raw", "main", "claims")
+
+
+@pytest.mark.parametrize(
+    ("source", "table"),
+    [
+        ("queries/good_customers.sql", "good_customers"),
+        ("Daily Revenue.sql", "daily_revenue"),
+        ("2024-q1.v2.sql", "2024_q1_v2"),
+        ("Zoë.sql", "zo_"),
+        (None, "result"),
+    ],
+)
+def test_a_query_result_is_written_to_a_table_named_after_its_file(
+    source: str | None, table: str
+) -> None:
+    result = ConversionResult("result = spark.table('t')\n")
+
+    notebook_cells = cells(to_notebook(result, source=source))
+
+    assert notebook_cells[-2] == write_cell(("result", table))
+    assert f"the result as the table `{table}`" in notebook_cells[0]
+
+
+def test_each_data_set_of_a_sas_program_is_written() -> None:
+    program_text = (
+        "data big; set orders; where amount > 100; run;\n"
+        "proc sort data=big out=sorted; by amount; run;\n"
+        # The same name again: SAS replaces the data set, so only this is written.
+        "data big; set sorted; where amount > 200; run;\n"
+        # A name the code itself uses: its variable has another name.
+        "data result; set big; run;\n"
+    )
+    result = sparkshift.convert(program_text, dialect="sas")
+
+    notebook_cells = cells(to_notebook(result, source="job.sas", dialect="sas"))
+
+    assert [(d.name, d.variable) for d in result.datasets] == [
+        ("big", "big"),
+        ("sorted", "sorted"),
+        ("big", "big_2"),
+        ("result", "result_df"),
+    ]
+    assert notebook_cells[-2] == write_cell(
+        ("sorted", "sorted"), ("big_2", "big"), ("result_df", "result")
+    )
+    assert (
+        "the data sets `sorted`, `big`, `result` as tables of the same names"
+        in notebook_cells[0]
+    )
+
+
+def test_one_data_set_is_named_in_the_singular() -> None:
+    result = sparkshift.convert("data big; set orders; run;", dialect="sas")
+
+    description = cells(to_notebook(result, dialect="sas"))[0]
+
+    assert "the data set `big` as a table of the same name in" in description
+
+
+def test_the_writer_does_not_replace_a_name_the_code_uses() -> None:
+    result = ConversionResult(
+        "save_table = spark.table('a')\n"
+        "save_table_2 = save_table\n"
+        "result = save_table\n"
+    )
+
+    notebook_cells = cells(to_notebook(result))
+
+    assert notebook_cells[-2] == write_cell(("result", "result"), save="save_table_3")
 
 
 @pytest.mark.parametrize(
@@ -227,7 +362,9 @@ def test_any_catalog_or_schema_name_stays_a_plain_value(name: str) -> None:
     widget's default is exactly that name and the program is unchanged."""
     result = ConversionResult("result = spark.table('t')\n")
 
-    notebook = to_notebook(result, catalog=name, schema=name)
+    notebook = to_notebook(
+        result, catalog=name, schema=name, output_catalog=name, output_schema=name
+    )
 
     tree = ast.parse(notebook)
     defaults = [
@@ -236,6 +373,6 @@ def test_any_catalog_or_schema_name_stays_a_plain_value(name: str) -> None:
         if isinstance(node, ast.Call)
         and ast.unparse(node.func) == "dbutils.widgets.text"
     ]
-    assert defaults == [name, name]
+    assert defaults == [name] * 4
     assert len(tree.body) == len(ast.parse(program(result.code)).body)
-    assert notebook.splitlines().count(CELL_SEPARATOR) == 3
+    assert notebook.splitlines().count(CELL_SEPARATOR) == 4

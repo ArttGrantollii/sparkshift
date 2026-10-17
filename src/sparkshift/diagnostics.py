@@ -34,12 +34,24 @@ class Diagnostic:
 
 
 @dataclass(frozen=True)
+class DataSet:
+    """A data set a SAS program creates: its ``name`` in the program, in
+    lowercase, and the ``variable`` that holds it in the generated code."""
+
+    name: str
+    variable: str
+
+
+@dataclass(frozen=True)
 class ConversionResult:
     """The outcome of a successful conversion.
 
     ``code`` assigns the final DataFrame to a variable named ``result`` and
     expects a SparkSession named ``spark`` to exist, as in a Databricks notebook.
+    ``datasets`` lists the data sets a SAS program creates, in order; it is
+    empty for SQL.
     """
 
     code: str
     warnings: tuple[Diagnostic, ...] = ()
+    datasets: tuple[DataSet, ...] = ()

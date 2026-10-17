@@ -42,7 +42,8 @@ result = (
 | `-d`, `--dialect` | The SQL dialect: `tsql`, `postgres`, `mysql`, `snowflake`, `bigquery`, `oracle`, or `sas`. Omit it for generic SQL. A `.sas` file is always a SAS program; in a directory, `--dialect sas` selects only the `.sas` files |
 | `-o`, `--output` | The file to write, or for a directory input, the directory to write `.py` files into (required) |
 | `--notebook` | Write Databricks notebooks instead of plain code; see [databricks.md](databricks.md) |
-| `--catalog`, `--schema` | With `--notebook`: the initial values of the notebooks' `catalog` and `schema` widgets |
+| `--catalog`, `--schema` | With `--notebook`: the initial values of the notebooks' `catalog` and `schema` widgets, where tables are read from |
+| `--output-catalog`, `--output-schema` | With `--notebook`: the initial values of the `output_catalog` and `output_schema` widgets, where results are written; nothing is written without an output schema. See [databricks.md](databricks.md#writing-results-to-tables) |
 | `--strict` | Reject any conversion with warnings and write no output for it |
 
 The code goes to standard output and every message to standard error, so
@@ -135,8 +136,9 @@ blocker's hint, an example file, and every file's status. The JSON has a
 
 `sparkshift upload PATH --to FOLDER` converts a file, or every `.sql` and
 `.sas` file in a directory, into notebooks and imports them into a Databricks
-workspace folder. It takes `--dialect`, `--catalog`, `--schema`, and
-`--strict` as `convert` does, plus `--profile`, `--overwrite`, and
+workspace folder. It takes `--dialect`, `--catalog`, `--schema`,
+`--output-catalog`, `--output-schema`, and `--strict` as `convert` does,
+plus `--profile`, `--overwrite`, and
 `--dry-run`. It needs `pip install 'sparkshift[databricks]'`, except with
 `--dry-run`. See [databricks.md](databricks.md#uploading-to-a-workspace).
 

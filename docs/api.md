@@ -35,6 +35,16 @@ The outcome of a successful conversion, an immutable dataclass:
 |---|---|---|
 | `code` | `str` | The generated PySpark code |
 | `warnings` | `tuple[Diagnostic, ...]` | Things to review before running the code, such as a SAS rule the code follows only partly; empty when there are none |
+| `datasets` | `tuple[DataSet, ...]` | The data sets a SAS program creates, in order; empty for SQL |
+
+## `DataSet`
+
+A data set a SAS program creates, an immutable dataclass:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `name` | `str` | Its name in the program, in lowercase |
+| `variable` | `str` | The variable that holds it in the generated code, usually the same name; another one when the name is taken, such as `result_df` for a data set named `result` |
 
 ## `Diagnostic`
 
@@ -50,13 +60,17 @@ One finding about one construct, used for warnings and for the issues of
 `str(diagnostic)` gives `message: sql. Hint: hint`, with long fragments
 shortened.
 
-## `to_notebook(result, *, source=None, dialect=None, catalog="", schema="")`
+## `to_notebook(result, *, source=None, dialect=None, catalog="", schema="", output_catalog="", output_schema="")`
 
 Returns `result.code` as a Databricks notebook in source format (see
 [databricks.md](databricks.md)). `source` names the file the code came from,
-for the title; `dialect` is the language it was converted from, as given to
-`convert`; `catalog` and `schema` are the initial values of the notebook's
-`catalog` and `schema` widgets (empty keeps the current ones).
+for the title and the name of a query's table; `dialect` is the language it
+was converted from, as given to `convert`; `catalog` and `schema` are the
+initial values of the notebook's `catalog` and `schema` widgets (empty keeps
+the current ones); `output_catalog` and `output_schema` are those of the
+widgets that choose where results are written (nothing is written while
+`output_schema` is empty; see
+[writing results](databricks.md#writing-results-to-tables)).
 
 ## Errors
 

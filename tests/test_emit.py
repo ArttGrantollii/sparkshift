@@ -9,6 +9,7 @@ from sparkshift.emit import (
     decimal_type,
     emit,
     emit_datasets,
+    emit_datasets_and_variables,
     emit_expression,
     python_string,
     spark_identifier,
@@ -1546,6 +1547,15 @@ def test_a_dataset_named_result_does_not_clash() -> None:
     code = emit_datasets([ir.Named("result", TableScan(("t",)))])
 
     assert code == 'result_df = spark.table("t")\n\nresult = result_df\n'
+
+
+@pytest.mark.parametrize("name", ["display", "dbutils"])
+def test_a_dataset_cannot_hide_what_notebooks_call(name: str) -> None:
+    # A notebook calls display(result) and dbutils.widgets after the code.
+    code, variables = emit_datasets_and_variables([ir.Named(name, TableScan(("t",)))])
+
+    assert code == f'{name}_df = spark.table("t")\n\nresult = {name}_df\n'
+    assert list(variables.values()) == [f"{name}_df"]
 
 
 def test_with_column_sets_a_column() -> None:

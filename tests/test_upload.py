@@ -101,6 +101,7 @@ def test_uploaded_notebooks_start_at_the_given_catalog_and_schema(
 ) -> None:
     path = jobs / "daily" / "orders.sql"
     arguments = [str(path), "--to", FOLDER, "--catalog", "main", "--schema", "sales"]
+    arguments += ["--output-catalog", "lake", "--output-schema", "reports"]
 
     assert upload(*arguments) == EXIT_CONVERTED
 
@@ -110,6 +111,8 @@ def test_uploaded_notebooks_start_at_the_given_catalog_and_schema(
         source="orders.sql",
         catalog="main",
         schema="sales",
+        output_catalog="lake",
+        output_schema="reports",
     )
 
 

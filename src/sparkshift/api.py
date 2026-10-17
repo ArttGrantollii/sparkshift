@@ -1,8 +1,8 @@
 """The public conversion entry point: SQL text in, PySpark code out."""
 
-from sparkshift.diagnostics import ConversionResult
+from sparkshift.diagnostics import ConversionResult, DataSet
 from sparkshift.dialects import is_sas, resolve_dialect
-from sparkshift.emit import emit, emit_datasets
+from sparkshift.emit import emit, emit_datasets_and_variables
 from sparkshift.parsing import parse_sql
 from sparkshift.sas_parser import parse_sas
 from sparkshift.sas_translate import translate_sas
@@ -14,8 +14,8 @@ def convert(sql: str, dialect: str | None = None) -> ConversionResult:
 
     ``dialect`` names the SQL dialect of the input (for example ``"tsql"`` or
     ``"snowflake"``); omit it for generic SQL. With ``"sas"``, the input is a
-    SAS program: each data set it creates becomes a DataFrame variable, and
-    ``result`` is the last one.
+    SAS program: each data set it creates becomes a DataFrame variable, listed
+    in the result's ``datasets``, and ``result`` is the last one.
 
     Raises:
         UnsupportedDialectError: ``dialect`` is not supported.
@@ -27,8 +27,14 @@ def convert(sql: str, dialect: str | None = None) -> ConversionResult:
     """
     if is_sas(dialect):
         translation = translate_sas(parse_sas(sql), sql)
+        code, variables = emit_datasets_and_variables(translation.datasets)
         return ConversionResult(
-            code=emit_datasets(translation.datasets), warnings=translation.warnings
+            code=code,
+            warnings=translation.warnings,
+            datasets=tuple(
+                DataSet(dataset.name, variables[dataset])
+                for dataset in translation.datasets
+            ),
         )
     read = resolve_dialect(dialect)
     tree = parse_sql(sql, read)
