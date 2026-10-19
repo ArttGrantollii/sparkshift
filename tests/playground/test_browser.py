@@ -28,6 +28,8 @@ playwright_api = pytest.importorskip("playwright.sync_api")
 
 # Pyodide's first load downloads about 10 MB.
 READY_TIMEOUT_MS = 180_000
+# Python is ready and nothing is converting (Convert also needs input).
+IDLE = "#statusbar[data-python='ready'][data-working='false']"
 ALLOWED_ORIGINS = {"127.0.0.1", "cdn.jsdelivr.net"}
 
 
@@ -60,7 +62,7 @@ def open_page(browser: Any, url: str, **context_options: Any) -> Any:
     context = browser.new_context(**context_options)
     page = context.new_page()
     page.goto(url)
-    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
     return page
 
 
@@ -81,7 +83,7 @@ def session(browser: Any, site_url: str) -> Iterator[dict]:
         ),
     )
     page.goto(site_url)
-    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
     yield {"page": page, "origins": origins, "errors": errors}
     context.close()
 
@@ -90,7 +92,7 @@ def convert_in_page(page: Any, sql: str, dialect: str) -> None:
     page.select_option("#dialect", dialect)
     page.fill("#sql", sql)
     page.click("#convert")
-    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
 
 
 # --- Converting ---------------------------------------------------------------
@@ -116,6 +118,186 @@ def test_page_is_ready_with_every_dialect(session: dict) -> None:
     ]
 
 
+def test_the_page_starts_empty_and_waits_for_input(session: dict) -> None:
+    page = session["page"]
+
+    # Nothing is converted until the visitor gives the page something.
+    assert page.input_value("#sql") == ""
+    assert page.get_attribute("#sql", "placeholder") == (
+        "Paste your code here, or open a file."
+    )
+    assert page.locator("#sql-view .ln").count() == 0
+    assert page.is_disabled("#share")
+    assert page.is_hidden("#output")
+    assert page.text_content("#output-empty") == (
+        "Your PySpark appears here after you press Convert."
+    )
+    assert page.is_disabled("#convert")
+    status = page.text_content("#status")
+    page.press("#sql", "Control+Enter")
+    page.wait_for_timeout(300)
+    assert page.is_hidden("#output")
+    assert page.is_hidden("#errors")
+    assert page.text_content("#status") == status
+    page.fill("#sql", "SELECT a FROM t")
+    assert page.is_enabled("#convert")
+    assert page.is_enabled("#share")
+    page.fill("#sql", "   \n")
+    assert page.is_disabled("#convert")
+    assert page.is_disabled("#share")
+
+
+def test_choosing_notebooks_converts_nothing_that_was_not_converted(
+    session: dict,
+) -> None:
+    page = session["page"]
+    page.fill("#sql", "SELECT a FROM t")
+
+    for kind in ("#output-notebook", "#output-code"):
+        page.click(kind)
+        # Wait as long as a conversion would take, had one started.
+        page.wait_for_timeout(500)
+        page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
+        assert page.is_hidden("#output"), kind
+        assert page.is_enabled("#convert")
+
+
+# --- Opening files, and the source language ---------------------------------------
+
+SAS_PROGRAM = "data big;\n    set orders;\n    where amount > 100;\nrun;\n"
+
+
+def test_an_opened_sas_file_fills_the_editor_as_sas(
+    session: dict, tmp_path: Path
+) -> None:
+    page = session["page"]
+    path = tmp_path / "flag_big.sas"
+    path.write_bytes(SAS_PROGRAM.replace("\n", "\r\n").encode())
+
+    page.set_input_files("#pick-source", str(path))
+    page.wait_for_selector("#status:has-text('Opened flag_big.sas.')")
+
+    # Read as the command line reads it, and not converted yet.
+    assert page.input_value("#sql") == SAS_PROGRAM
+    assert page.input_value("#dialect") == "sas"
+    assert page.is_hidden("#output")
+    assert page.text_content("#language") == "SAS program"
+    page.click("#convert")
+    page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
+    assert page.text_content("#code") == (
+        sparkshift.convert(SAS_PROGRAM, dialect="sas").code
+    )
+
+
+@pytest.mark.parametrize(
+    ("chosen", "expected"), [("sas", ""), ("tsql", "tsql"), ("", "")]
+)
+def test_an_opened_sql_file_keeps_the_chosen_sql_dialect(
+    session: dict, tmp_path: Path, chosen: str, expected: str
+) -> None:
+    page = session["page"]
+    page.select_option("#dialect", chosen)
+    path = tmp_path / "top.sql"
+    path.write_text("SELECT a FROM t\n", encoding="utf-8")
+
+    page.set_input_files("#pick-source", str(path))
+    page.wait_for_selector("#status:has-text('Opened top.sql.')")
+
+    assert page.input_value("#dialect") == expected
+    assert page.input_value("#sql") == "SELECT a FROM t\n"
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        ("SELECT 'café' AS c FROM t".encode("latin-1"), "it is not UTF-8 text"),
+        (b"-- " + b"x" * 100_001, "is larger than the browser demo"),
+    ],
+)
+def test_a_file_that_cannot_be_opened_is_explained(
+    session: dict, tmp_path: Path, content: bytes, message: str
+) -> None:
+    page = session["page"]
+    page.fill("#sql", "SELECT kept FROM t")
+    path = tmp_path / "bad.sql"
+    path.write_bytes(content)
+
+    page.set_input_files("#pick-source", str(path))
+    page.wait_for_selector(f"#status:has-text('{message}')")
+
+    assert page.get_attribute("#statusbar", "data-state") == "bad"
+    assert page.input_value("#sql") == "SELECT kept FROM t"
+
+
+def test_a_sas_program_under_sql_offers_to_switch(session: dict) -> None:
+    page = session["page"]
+    page.select_option("#dialect", "postgres")
+
+    page.fill("#sql", SAS_PROGRAM)
+
+    assert page.is_visible("#language-hint")
+    assert page.text_content("#language-hint-text") == (
+        "This looks like a SAS program, not SQL."
+    )
+    # It only suggests: the dialect stays until the visitor switches.
+    assert page.input_value("#dialect") == "postgres"
+    page.click("#language-switch")
+    assert page.input_value("#dialect") == "sas"
+    assert page.is_hidden("#language-hint")
+
+
+def test_sql_under_sas_offers_to_switch_but_proc_sql_does_not(session: dict) -> None:
+    page = session["page"]
+    page.select_option("#dialect", "sas")
+
+    page.fill("#sql", "SELECT name FROM customers")
+    assert page.text_content("#language-switch") == "Switch to Generic SQL"
+    page.fill(
+        "#sql", "proc sql;\n  create table x as select name from customers;\nquit;"
+    )
+    assert page.is_hidden("#language-hint")
+    page.fill("#sql", "SELECT name FROM customers")
+    page.click("#language-switch")
+    assert page.input_value("#dialect") == ""
+
+
+@pytest.mark.parametrize(
+    ("source", "sas", "sql"),
+    [
+        ("data a; set b; run;", True, False),
+        ("DATA work.a (keep=x y) b;\n set c;\nrun;", True, False),
+        ("proc sort data=a out=b; by x; run;", True, False),
+        ("* a comment;\nproc means data=a; run;", True, False),
+        ("SELECT a FROM t", False, True),
+        ("  with x as (select 1 as a from t) select a from x", False, True),
+        ("-- data a; run;\nSELECT a FROM t", False, True),
+        ("SELECT 'data a; run;' AS text FROM t", False, True),
+        (
+            "WITH totals AS (SELECT 1 AS n FROM t),\ndata AS (SELECT n FROM totals)\n"
+            "SELECT n FROM data;",
+            False,
+            True,
+        ),
+        ("UPDATE t SET a = 1", False, False),
+        ("", False, False),
+    ],
+)
+def test_sas_and_sql_are_told_apart(
+    session: dict, source: str, sas: bool, sql: bool
+) -> None:
+    page = session["page"]
+
+    found = page.evaluate(
+        """async (source) => {
+            const { looksLikeSas, looksLikeSql } = await import("./language.js");
+            return [looksLikeSas(source), looksLikeSql(source)];
+        }""",
+        source,
+    )
+
+    assert found == [sas, sql]
+
+
 def test_every_example_matches_the_command_line(session: dict) -> None:
     page = session["page"]
     examples = [
@@ -130,7 +312,13 @@ def test_every_example_matches_the_command_line(session: dict) -> None:
 
     for index in range(len(examples)):
         page.select_option("#example", str(index))
-        page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+        # An example fills the editor and waits for Convert.
+        assert page.is_hidden("#output"), labels[index]
+        assert page.text_content("#status").startswith(
+            f"Loaded the example “{labels[index]}”. Press Convert"
+        )
+        page.click("#convert")
+        page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
         dialect = page.input_value("#dialect")
         sql = page.input_value("#sql")
 
@@ -231,7 +419,7 @@ def test_ctrl_enter_converts(session: dict) -> None:
     page.fill("#sql", "SELECT name FROM customers")
 
     page.press("#sql", "Control+Enter")
-    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
 
     assert (
         page.text_content("#code")
@@ -246,7 +434,7 @@ def test_notebook_output_is_what_the_command_line_writes(session: dict) -> None:
 
     page.click("#output-notebook")
     page.wait_for_selector("#output:visible", timeout=READY_TIMEOUT_MS)
-    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
 
     result = sparkshift.convert(sql, dialect="tsql")
     assert page.text_content("#code") == sparkshift.to_notebook(result, dialect="tsql")
@@ -255,7 +443,7 @@ def test_notebook_output_is_what_the_command_line_writes(session: dict) -> None:
 
     page.click("#output-code")
     page.wait_for_selector("#output:visible", timeout=READY_TIMEOUT_MS)
-    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
     assert page.text_content("#code") == result.code
     assert page.text_content("#output-label") == "PySpark"
 
@@ -313,7 +501,7 @@ def test_theme_choice_is_applied_and_remembered(browser: Any, site_url: str) -> 
         dark_background
     )
     page.reload()
-    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
     assert page.get_attribute("html", "data-theme") == "light"
     page.context.close()
 
@@ -367,6 +555,11 @@ def test_shared_link_restores_the_query(session: dict, browser: Any) -> None:
     shared = open_page(browser, link)
     assert shared.input_value("#sql") == sql
     assert shared.input_value("#dialect") == "tsql"
+    # A shared query waits for Convert, like any other.
+    assert shared.is_hidden("#output")
+    assert shared.text_content("#status").startswith("Loaded a shared query.")
+    shared.click("#convert")
+    shared.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
     assert shared.text_content("#code") == sparkshift.convert(sql, dialect="tsql").code
     shared.context.close()
 
@@ -379,12 +572,12 @@ COVERAGE = ROOT / "examples" / "coverage"
 def reset_file_view(page: Any) -> None:
     """Generic SQL and plain code, in the file view, with nothing converting."""
     page.click("#tab-file")
-    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
     if page.input_value("#dialect") != "":
         page.select_option("#dialect", "")
     if page.get_attribute("#output-notebook", "aria-checked") == "true":
         page.click("#output-code")
-        page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+        page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
 
 
 @pytest.fixture
@@ -402,7 +595,7 @@ def choose(page: Any, files: Any, picker: str = "#pick-folder") -> None:
     """Choose a folder (or files, with picker #pick-files) and wait until
     every file has converted."""
     page.set_input_files(picker, files)
-    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
 
 
 def command_line_outputs(folder: Path, out: Path, *arguments: str) -> dict[str, bytes]:
@@ -497,7 +690,7 @@ def test_a_folder_of_notebooks(folder_view: Any) -> None:
     choose(page, str(COVERAGE))
 
     page.click("#output-notebook")
-    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
 
     name, files = downloaded_zip(page)
     assert name == "coverage_notebooks.zip"
@@ -513,7 +706,7 @@ def test_files_chosen_one_by_one_use_the_dialect_except_sas(folder_view: Any) ->
     page = folder_view
     page.select_option("#dialect", "tsql")
     # Files chosen by an earlier test convert again in the new dialect.
-    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
     query = ROOT / "examples" / "sql" / "tsql" / "top_customers.sql"
     program = ROOT / "examples" / "sas" / "status_counts.sas"
 
@@ -537,7 +730,7 @@ def test_changing_the_dialect_converts_the_folder_again(folder_view: Any) -> Non
     choose(page, str(COVERAGE))
 
     page.select_option("#dialect", "sas")
-    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
 
     assert page.text_content("#folder-errors") == "There are no .sas files to convert."
     assert page.text_content("#status") == "Conversion failed."
@@ -599,7 +792,7 @@ def test_dropped_files_are_converted(folder_view: Any) -> None:
         }"""
     )
     page.wait_for_selector("#files button", timeout=READY_TIMEOUT_MS)
-    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
 
     assert page.text_content("#file-code") == sparkshift.convert("SELECT a FROM t").code
     assert page.text_content("#status") == "Converted 1 of 1 file."
@@ -1206,7 +1399,7 @@ def test_runtime_boundary_recovers_without_showing_stale_output(
     page.on("pageerror", lambda error: errors.append(str(error)))
     try:
         page.goto(site_url, wait_until="domcontentloaded")
-        page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+        page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
         convert_in_page(page, WARNING_PROGRAM, "sas")
         convert_in_page(page, "SELECT forced_fault FROM t", "")
         if fault == "warning_markup":
@@ -1259,34 +1452,36 @@ def test_browser_accepts_exactly_the_unicode_byte_limit(session: dict) -> None:
     assert page.text_content("#code") == sparkshift.convert(sql).code
 
 
-def test_initial_conversion_failure_is_not_reported_as_ready(
-    browser: Any, site_url: str
-) -> None:
+def test_starting_converts_nothing(browser: Any, site_url: str) -> None:
+    """Python converts only when the visitor presses Convert: starting the
+    page, or a shared link, never calls it."""
     context = browser.new_context()
 
-    def bridge_fault(route: Any) -> None:
+    def counted(route: Any) -> None:
         response = route.fetch()
-        injected = response.text() + "\n_original = convert_for_page\n_attempts = 0\n"
+        injected = response.text() + "\n_original = convert_for_page\n"
         injected += (
             "def convert_for_page(sql, dialect):\n"
-            "    global _attempts\n"
-            "    _attempts += 1\n"
-            "    if _attempts == 1:\n"
-            "        raise RuntimeError('startup conversion failure')\n"
+            "    from js import console\n"
+            "    console.log('conversion requested')\n"
             "    return _original(sql, dialect)\n"
         )
         route.fulfill(response=response, body=injected)
 
-    context.route("**/bridge.py", bridge_fault)
+    context.route("**/bridge.py", counted)
     page = context.new_page()
+    logged: list[str] = []
+    page.on("console", lambda message: logged.append(message.text))
     try:
-        page.goto(site_url, wait_until="domcontentloaded")
-        page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
-        assert_failed_output_is_cleared(page)
-        convert_in_page(page, "SELECT id FROM t", "")
-        assert page.text_content("#code") == sparkshift.convert("SELECT id FROM t").code
-        assert page.is_hidden("#errors")
-        assert page.is_enabled("#copy")
+        page.goto(f"{site_url}#dialect=tsql&sql=SELECT+TOP+1+a+FROM+t")
+        page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
+        page.wait_for_timeout(500)
+        assert "conversion requested" not in logged
+        assert page.input_value("#sql") == "SELECT TOP 1 a FROM t"
+        assert page.is_hidden("#output")
+        page.click("#convert")
+        page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
+        assert logged.count("conversion requested") == 1
     finally:
         context.close()
 
@@ -1321,7 +1516,7 @@ def blocked_worker_page(browser: Any, site_url: str) -> Iterator[Any]:
     page = context.new_page()
     try:
         page.goto(site_url)
-        page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+        page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
         # Do not run the blocking fault if worker isolation regresses.
         assert page.evaluate("typeof loadPyodide") == "undefined"
         yield page
@@ -1378,7 +1573,7 @@ def test_a_blocked_python_worker_can_be_cancelled_and_recovered(
     assert page.is_disabled("#convert")
     assert "Reloading Python" in page.text_content("#status")
     assert "Ready" not in page.text_content("#status")
-    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
     assert page.is_hidden("#cancel")
     assert page.is_hidden("#output")
     assert page.is_disabled("#copy")
@@ -1403,7 +1598,7 @@ def test_blocked_python_is_terminated_at_the_conversion_deadline(
     block_python(page)
     page.clock.fast_forward(10_001)
     page.wait_for_selector("#errors:has-text('10-second limit')")
-    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
     assert page.is_hidden("#output")
     assert page.is_disabled("#copy")
     assert "CLI" in page.text_content("#errors")
@@ -1466,7 +1661,7 @@ def test_a_file_past_the_deadline_does_not_stop_its_folder(
     block_python_in_a_folder(page, busy_folder(tmp_path))
 
     page.clock.fast_forward(10_001)
-    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
 
     assert page.text_content("#status") == (
         "Converted 2 of 3 files; 1 could not be converted."
@@ -1487,7 +1682,7 @@ def test_cancelling_a_folder_stops_all_its_files(
     block_python_in_a_folder(page, busy_folder(tmp_path))
 
     page.click("#cancel")
-    page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
 
     assert "cancelled" in page.text_content("#status")
     assert page.locator("#files .tag").all_text_contents() == ["Waiting"] * 3
@@ -1524,7 +1719,7 @@ def test_stale_worker_messages_cannot_replace_current_output(
     page = context.new_page()
     try:
         page.goto(site_url)
-        page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+        page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
         convert_in_page(page, "SELECT id FROM orders", "")
         assert (
             page.text_content("#code")
@@ -1559,7 +1754,7 @@ def test_worker_crash_clears_output_and_reloads_python(
     page.on("pageerror", lambda error: errors.append(str(error)))
     try:
         page.goto(site_url)
-        page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+        page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
         convert_in_page(page, WARNING_PROGRAM, "sas")
         convert_in_page(page, "SELECT forced_crash FROM t", "")
         assert page.is_hidden("#output")
@@ -1593,7 +1788,7 @@ def test_startup_failure_offers_a_working_retry(browser: Any, site_url: str) -> 
         assert page.is_disabled("#copy")
         context.unroute("https://cdn.jsdelivr.net/**", blocked)
         page.click("#retry")
-        page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+        page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
         assert page.is_hidden("#retry")
         convert_in_page(page, "SELECT id FROM orders", "")
         assert (
@@ -1655,10 +1850,10 @@ def test_worker_crash_while_idle_invalidates_output_and_recovers(
     page = context.new_page()
     try:
         page.goto(site_url)
-        page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+        page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
         convert_in_page(page, "SELECT idle_crash FROM t", "")
         page.wait_for_selector("#errors:has-text('stopped unexpectedly')")
-        page.wait_for_selector("#convert:enabled", timeout=READY_TIMEOUT_MS)
+        page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
         assert page.is_hidden("#output")
         assert page.is_disabled("#copy")
         assert "idle crash sentinel" not in page.text_content("#errors")

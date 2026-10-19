@@ -44,8 +44,8 @@
       <main class="workspace">
         <div class="toolbar">
           <div class="toolbar-group" id="convert-controls">
-            <label class="field">
-              <span class="visually-hidden">Dialect</span>
+            <label class="field labelled">
+              <span class="field-label">Source language</span>
               <select id="dialect" class="select" disabled>
                 <option value="">Generic SQL</option>
               </select>
@@ -55,10 +55,12 @@
               <button id="output-code" type="button" role="radio" aria-checked="true">PySpark</button>
               <button id="output-notebook" type="button" role="radio" aria-checked="false">Notebook</button>
             </div>
+            <button id="open-file" class="button" type="button" disabled>Open file</button>
+            <input id="pick-source" type="file" accept=".sql,.sas" hidden />
             <label class="field" id="example-field">
               <span class="visually-hidden">Example</span>
               <select id="example" class="select" disabled>
-                <option value="">Load an example…</option>
+                <option value="">Try an example…</option>
               </select>
             </label>
           </div>
@@ -75,6 +77,10 @@
         </noscript>
 
         <div id="view-file" class="view" role="tabpanel" aria-labelledby="tab-file">
+          <p id="language-hint" class="hint-bar" role="status" hidden>
+            <span id="language-hint-text"></span>
+            <button id="language-switch" class="button" type="button"></button>
+          </p>
           <div class="panes">
             <section class="pane" aria-labelledby="language">
               <div class="pane-head">
@@ -83,7 +89,7 @@
               </div>
               <div class="editor">
                 <pre class="code" id="sql-view" aria-hidden="true"></pre>
-                <textarea id="sql" class="code" aria-describedby="input-limit" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off"></textarea>
+                <textarea id="sql" class="code" aria-describedby="input-limit" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off" placeholder="Paste your code here, or open a file."></textarea>
               </div>
             </section>
             <section class="pane" aria-labelledby="output-label">
@@ -92,7 +98,7 @@
                 <span class="pane-meta" id="output-lines"></span>
               </div>
               <div class="editor">
-                <p id="output-empty" class="empty">The converted code appears here.</p>
+                <p id="output-empty" class="empty">Your PySpark appears here after you press Convert.</p>
                 <pre id="output" class="code" hidden tabindex="0" aria-labelledby="output-label"><code id="code"></code></pre>
               </div>
             </section>
@@ -226,7 +232,7 @@
           </section>
         </div>
 
-        <div class="statusbar" id="statusbar" data-state="busy">
+        <div class="statusbar" id="statusbar" data-state="busy" data-python="loading" data-working="false">
           <span class="dot" aria-hidden="true"></span>
           <p id="status" role="status" aria-live="polite">
             Loading Python (about 10 MB, only on your first visit)…

@@ -9,9 +9,19 @@ server: the SQL a visitor types never leaves their browser. See
 
 ## Using it
 
-Pick a source dialect (or SAS), type or load an example, and press **Convert**
-(or Ctrl+Enter). The **PySpark / Notebook** switch chooses between the plain
-code and the Databricks notebook that `sparkshift convert --notebook` writes.
+The page starts empty, and nothing is converted until you press **Convert**
+(or Ctrl+Enter). Choose the **source language**, then paste your SQL or SAS,
+or **Open file** to read a `.sql` or `.sas` file into the editor (in the
+browser only; a `.sas` file is a SAS program and a `.sql` file keeps the
+chosen SQL dialect, as on the command line). **Try an example** fills the
+editor with one of the built-in examples, and a shared link with its query;
+both wait for Convert too. If what you paste looks like a SAS program while a
+SQL dialect is chosen, or like SQL while SAS is chosen, a hint offers to
+switch; nothing switches by itself. SQL dialects are not guessed: the same
+query can return different results in different databases (NULL ordering,
+integer division, string lengths), so you choose one. The **PySpark /
+Notebook** switch chooses between the plain code and the Databricks notebook
+that `sparkshift convert --notebook` writes.
 Both editors show line numbers and syntax highlighting; the numbers are drawn
 by CSS, so **Copy** and **Download .py** give exactly the generated code.
 **Copy link** puts the query in the link's `#` fragment, which browsers do not
@@ -119,6 +129,7 @@ revision so late replies cannot replace the current query's output. See
 | `highlight.js` | Highlights code and numbers its lines without changing its text |
 | `files.js` | Collects chosen or dropped files and reads them as the command line does |
 | `deploy.js` | Checks workspace URLs and calls the workspace API with the visitor's token |
+| `language.js` | Tells a SAS program from SQL, for the hint to switch the source language |
 | `worker-client.js` | Matches request IDs, bounds loading/conversion time, and terminates workers |
 | `worker.js` | Loads Pyodide and the wheels and invokes the Python bridge off the UI thread |
 | `bridge.py` | Runs inside Pyodide: converts SQL and returns JSON with the code or the issues; plans folders and packs their zip |

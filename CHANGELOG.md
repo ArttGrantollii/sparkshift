@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The playground has a new design: side-by-side editors with line numbers and
   syntax highlighting, a dark and a light theme (remembered per browser), and
   self-hosted fonts.
+- The playground starts empty and converts only when you press Convert:
+  examples ("Try an example") and shared links fill the editor and wait.
+  **Open file** reads a `.sql` or `.sas` file into the editor, and a hint
+  offers to switch the source language when a SAS program is pasted under a
+  SQL dialect, or SQL under SAS.
 
 ### Added
 

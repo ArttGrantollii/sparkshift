@@ -458,6 +458,39 @@ kbd {
   background: var(--accent-soft);
 }
 
+/* The textarea's text is transparent; its placeholder must not be. */
+#sql::placeholder {
+  color: var(--muted);
+  -webkit-text-fill-color: var(--muted);
+  opacity: 1;
+}
+
+.labelled {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.field-label {
+  color: var(--muted);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+.hint-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--surface);
+  font-size: 13px;
+}
+
 .editor:has(#sql:focus-visible) {
   box-shadow: inset 0 0 0 2px var(--accent);
 }

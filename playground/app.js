@@ -2,6 +2,7 @@
 import { ConversionWorker, STARTUP_TIMEOUT_MS, CONVERSION_TIMEOUT_MS } from "./worker-client.js";
 import { highlightLines, lineCount } from "./highlight.js";
 import { filesFromDrop, filesFromInput, readSource } from "./files.js";
+import { looksLikeSas, looksLikeSql } from "./language.js";
 import {
   DeployError, base64, catalogAndSchema, isWorkspaceFolder, post, workspaceOrigin,
 } from "./deploy.js";
@@ -73,6 +74,11 @@ const elements = Object.fromEntries(
     "file-code",
     "file-warnings",
     "file-errors",
+    "open-file",
+    "pick-source",
+    "language-hint",
+    "language-hint-text",
+    "language-switch",
     "tab-deploy",
     "view-deploy",
     "convert-controls",
@@ -133,10 +139,21 @@ function setStatus(text, state = "ready") {
   savedStatus[mode] = { text, state };
 }
 
+// Whether Python is ready and whether anything is converting, for whoever
+// waits on the page (its tests do): the Convert button also needs input.
+function showReadiness() {
+  elements.statusbar.dataset.python = ready ? "ready" : "loading";
+  elements.statusbar.dataset.working = String(working());
+}
+
 function updateControls() {
   const folder = mode === "folder";
-  elements.convert.disabled = !ready || working() || (folder && chosen === null);
+  // Nothing converts until the visitor gives it something to convert.
+  const input = folder ? chosen !== null : elements.sql.value.trim() !== "";
+  elements.convert.disabled = !ready || working() || !input;
   elements.cancel.hidden = !working();
+  elements["open-file"].disabled = !populated || working();
+  showReadiness();
   elements.retry.hidden = runtime !== null;
   elements.example.disabled = !populated || working();
   // A folder's results follow the dialect and output kind, so those stay
@@ -144,7 +161,8 @@ function updateControls() {
   elements.dialect.disabled = !populated || (folder && working());
   elements["output-code"].disabled = folder && working();
   elements["output-notebook"].disabled = folder && working();
-  elements.share.disabled = !populated;
+  // An empty query is nothing to share.
+  elements.share.disabled = !populated || elements.sql.value.trim() === "";
   elements["choose-folder"].disabled = !ready || working();
   elements["choose-files"].disabled = !ready || working();
   elements["download-zip"].disabled = working() || archive === null;
@@ -159,6 +177,7 @@ async function start(first = false, recoveryStatus = "Ready to convert again.") 
   elements.retry.hidden = true;
   elements.convert.disabled = true;
   elements.cancel.hidden = true;
+  showReadiness();
   const reason = recoveryStatus.startsWith("Ready") ? "" : `${recoveryStatus.split(".")[0]}. `;
   setStatus(first ? "Loading Python…" : `${reason}Reloading Python…`, "busy");
   let candidate;
@@ -193,11 +212,10 @@ async function start(first = false, recoveryStatus = "Ready to convert again.") 
     ready = true;
     updateControls();
     if (first) {
-      const shared = new URLSearchParams(location.hash.slice(1)).has("sql");
-      const success = await (shared ? loadSharedQuery() : loadExample(0));
-      if (success && !shared && runtime === candidate) {
-        setStatus(`Ready. SparkShift ${about.version}, running on Pyodide ${pyodideVersion}.`, "ok");
-      }
+      setStatus(`Ready. SparkShift ${about.version}, running on Pyodide ${pyodideVersion}. ` +
+        "Choose the source language, paste your code or open a file, then press Convert.", "ok");
+      // A shared query is filled in, and waits for Convert like any other.
+      loadSharedQuery();
     } else {
       setStatus(recoveryStatus);
     }
@@ -229,24 +247,70 @@ function loadSharedQuery() {
   const parameters = new URLSearchParams(location.hash.slice(1));
   const sql = parameters.get("sql");
   if (sql === null) {
-    return false;
+    return;
   }
   const dialect = parameters.get("dialect") ?? "";
-  elements.dialect.value = dialect in DIALECT_NAMES ? dialect : "";
-  setSource(sql);
-  return convert();
+  loadSource(sql, dialect in DIALECT_NAMES ? dialect : "", "Loaded a shared query.");
 }
 
 // --- Converting -------------------------------------------------------------
+//
+// Nothing converts by itself: examples, opened files, and shared queries fill
+// the editor, and the visitor presses Convert.
 
 function loadExample(index) {
   const example = examples[index];
   if (example === undefined) {
     return;
   }
-  setSource(example.sql);
-  elements.dialect.value = example.dialect;
-  return convert();
+  const label = elements.example.options[index + 1].textContent;
+  loadSource(example.sql, example.dialect, `Loaded the example “${label}”.`);
+}
+
+// New source in the editor, in ``dialect``: the old output is cleared.
+function loadSource(text, dialect, message) {
+  elements.dialect.value = dialect;
+  setSource(text);
+  inputChanged();
+  if (!busy) setStatus(`${message} Press Convert (Ctrl+Enter) to see the PySpark code.`);
+}
+
+async function openFile(file) {
+  // Reading "\r\n" as "\n" at most halves a file: larger ones cannot fit.
+  if (file.size > 2 * maxSourceBytes) {
+    setStatus(`${file.name} is larger than the browser demo's limit of ` +
+      `${maxSourceBytes.toLocaleString("en-US")} UTF-8 bytes. Use the CLI for larger files.`, "bad");
+    return;
+  }
+  const source = await readSource(file);
+  if (source.error) {
+    setStatus(`Cannot read ${file.name}: ${source.error}.`, "bad");
+    return;
+  }
+  // As on the command line: a .sas file is a SAS program, and a .sql file
+  // keeps the chosen SQL dialect.
+  const sas = /\.sas$/i.test(file.name);
+  const dialect = sas ? "sas" : elements.dialect.value === "sas" ? "" : elements.dialect.value;
+  loadSource(source.text, dialect, `Opened ${file.name}.`);
+}
+
+// A source that looks like the other language gets a one-click switch;
+// nothing switches by itself.
+function showLanguageHint() {
+  const text = elements.sql.value;
+  const sas = elements.dialect.value === "sas";
+  let hint = null;
+  if (!sas && looksLikeSas(text)) {
+    hint = ["This looks like a SAS program, not SQL.", "Switch to SAS", "sas"];
+  } else if (sas && looksLikeSql(text)) {
+    hint = ["This looks like SQL, not a SAS program.", "Switch to Generic SQL", ""];
+  }
+  elements["language-hint"].hidden = hint === null;
+  if (hint === null) return;
+  const [message, action, dialect] = hint;
+  elements["language-hint-text"].textContent = message;
+  elements["language-switch"].textContent = action;
+  elements["language-switch"].dataset.dialect = dialect;
 }
 
 function setSource(text) {
@@ -277,7 +341,9 @@ function clearOutput() {
 function inputChanged() {
   showInputLanguage();
   showSource();
+  showLanguageHint();
   clearOutput();
+  updateControls();
   if (busy) {
     cancelConversion("Input changed. Convert to update the PySpark code.");
   } else if (populated) {
@@ -317,7 +383,7 @@ function tooLargeMessage() {
 }
 
 async function convert() {
-  if (!ready || working()) return false;
+  if (!ready || working() || !elements.sql.value.trim()) return false;
   showInputLanguage();
   clearOutput();
   const candidate = runtime;
@@ -415,7 +481,8 @@ function showErrors(result, panel) {
 function showSource() {
   const language = elements.dialect.value === "sas" ? "sas" : "sql";
   const text = elements.sql.value;
-  elements["sql-view"].replaceChildren(highlightLines(text, language, true));
+  // An empty editor shows its placeholder, without a line number.
+  elements["sql-view"].replaceChildren(text ? highlightLines(text, language, true) : "");
   elements["input-lines"].textContent = text ? lineCount(text) : "";
   syncScroll();
 }
@@ -803,6 +870,7 @@ function chooseMode(next) {
   elements["convert-controls"].hidden = deploy;
   elements.convert.hidden = deploy;
   elements["example-field"].hidden = folder;
+  elements["open-file"].hidden = folder;
   elements.copy.hidden = deploy;
   elements.download.hidden = folder || deploy;
   elements.share.hidden = folder || deploy;
@@ -827,8 +895,11 @@ function chooseOutput(asNotebook) {
     else resetFolder();
   } else {
     resetFolder();
-    if (ready && !busy) void convert();
-    else clearOutput();
+    // Shown code is converted again in the new kind; nothing converts that
+    // the visitor has not converted yet.
+    const shown = !elements.output.hidden;
+    clearOutput();
+    if (shown && ready && !busy) void convert();
   }
 }
 
@@ -1148,6 +1219,18 @@ for (const name of MODES) {
     elements[`tab-${target}`].focus();
   });
 }
+
+elements["open-file"].addEventListener("click", () => elements["pick-source"].click());
+elements["pick-source"].addEventListener("change", () => {
+  const [file] = elements["pick-source"].files;
+  // Opening the same file again must still be noticed.
+  elements["pick-source"].value = "";
+  if (file) void openFile(file);
+});
+elements["language-switch"].addEventListener("click", () => {
+  elements.dialect.value = elements["language-switch"].dataset.dialect;
+  dialectChanged();
+});
 
 elements["deploy-form"].addEventListener("submit", deploy);
 elements["deploy-form"].addEventListener("input", () => {

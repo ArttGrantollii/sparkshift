@@ -26,6 +26,7 @@ PLAYGROUND_FILES = [
     "highlight.js",
     "files.js",
     "deploy.js",
+    "language.js",
     "worker-client.js",
     "worker.js",
     "bridge.py",
