@@ -58,7 +58,10 @@ jobs:
       - run: uv sync --locked
 
       # Browser tests run in their own job, below; database tests skip here.
-      - run: uv run pytest --cov -v -m "not browser"
+      # Four workers, one per CPU of the runner; each runs whole test files
+      # in order (loadscope) with its own SparkSession. The same tests run as
+      # in one process, in about half the time.
+      - run: uv run pytest --cov -v -m "not browser" -n 4 --dist loadscope
 
   # The Spark tests again, through Spark Connect: Databricks serverless
   # compute runs code as a Spark Connect client, and some behavior differs

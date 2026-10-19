@@ -29,9 +29,17 @@ generates PySpark code but does not need Spark to run.
 uv run pytest                  # all tests, including real Spark
 uv run pytest -m "not spark"   # fast tests only; does not start Spark
 uv run pytest --cov            # with coverage report
+uv run pytest -m "not browser" -n 4 --dist loadscope   # four processes, as CI does
 uv run ruff check .            # lint
 uv run ruff format --check .   # formatting
 ```
+
+`-n 4` runs the tests in four processes (pytest-xdist), each with its own
+SparkSession, and `--dist loadscope` keeps each test file in one process, in
+order. Each SparkSession is a Java process of its own, so keep the number of
+processes small: one per CPU of a machine with at least 2 GB of memory per
+process. Browser and database tests stay in one process, as they share a page
+or a server.
 
 To run the Spark tests through Spark Connect, as Databricks serverless compute
 does: `uv sync --group connect`, then
