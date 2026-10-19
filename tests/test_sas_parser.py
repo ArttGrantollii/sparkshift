@@ -1043,24 +1043,28 @@ def test_a_qualified_name_needs_no_spaces() -> None:
 
 
 @pytest.mark.parametrize(
-    ("statement", "names"),
+    ("statement", "names", "text_names"),
     [
-        ("format d date9.", ("d",)),
+        ("format d date9.", ("d",), set()),
         (
             "format a b date9. c $20. e 8.2 f comma10.2 g",
             ("a", "b", "c", "e", "f", "g"),
+            {"c"},
         ),
-        ("format x best12. y $char20. z yymmdd10.", ("x", "y", "z")),
-        ("format d", ("d",)),  # removes d's format
-        ("FORMAT D DATE.", ("D",)),
+        ("format x best12. y $char20. z yymmdd10.", ("x", "y", "z"), {"y"}),
+        ("format d", ("d",), set()),  # removes d's format
+        ("FORMAT D DATE.", ("D",), set()),
+        ("format A b $10. c", ("A", "b", "c"), {"a", "b"}),
     ],
 )
-def test_a_format_statement_names_its_variables(statement: str, names: tuple) -> None:
+def test_a_format_statement_names_its_variables(
+    statement: str, names: tuple, text_names: set[str]
+) -> None:
     program = parse_sas(f"data a; set b; {statement}; run;")
 
     assert program.issues == ()
     assert program.steps[0].statements[1] == FormatStatement(
-        names, program.steps[0].statements[1].span
+        names, program.steps[0].statements[1].span, frozenset(text_names)
     )
 
 
@@ -1080,7 +1084,67 @@ def test_data_lines_are_data_not_statements() -> None:
     assert statement.text == "101 John USA\n102 Sarah UK\n"
     assert statement.line == 4
     # The rows are not reported as statements (101 statement, ...).
-    assert issues(program) == ["INPUT statement"]
+    assert issues(program) == []
+
+
+def inline(statement: str) -> tuple[object, list[str]]:
+    """The shape of the first statement of a DATA step with data lines, and
+    the issues found."""
+    program = parse_sas(f"data a; {statement}; datalines;\n1\n;\nrun;")
+    return shape(program.steps[0].statements[0]), issues(program)
+
+
+def field(name: str, text: bool = False, informat: str | None = None) -> tuple:
+    return ("InputField", name, text, informat)
+
+
+def test_input_with_list_input() -> None:
+    assert inline("input id name $ when :date9. note :$20. Amount :8.2 n:best12.") == (
+        (
+            "InputStatement",
+            (
+                field("id"),
+                field("name", True),
+                field("when", informat="DATE9."),
+                field("note", informat="$20."),
+                field("Amount", informat="8.2"),
+                field("n", informat="BEST12."),
+            ),
+        ),
+        [],
+    )
+
+
+def test_input_keeps_names_without_a_blank_before_the_dollar() -> None:
+    assert inline("INPUT name$ city $")[0] == (
+        "InputStatement",
+        (field("name", True), field("city", True)),
+    )
+
+
+@pytest.mark.parametrize(
+    ("statement", "message"),
+    [
+        ("input id 1-3", "column or formatted input of id"),
+        ("input name $ 1-10", "column or formatted input of name"),
+        ("input when date9.", "column or formatted input of when"),
+        ("input amount 8.2", "column or formatted input of amount"),
+        ("input @3 id", "@ in an INPUT statement"),
+        ("input id @@", "@ in an INPUT statement"),
+        ("input id / name", "/ in an INPUT statement"),
+        ("input id #2 name", "# in an INPUT statement"),
+        ("input id +1 name", "+ in an INPUT statement"),
+        ("input (a b) ($)", "( in an INPUT statement"),
+        ("input x1-x3", "variable list in an INPUT statement"),
+    ],
+)
+def test_unsupported_input(statement: str, message: str) -> None:
+    assert inline(statement)[1] == [message]
+
+
+def test_input_needs_variables() -> None:
+    with pytest.raises(SASParseError, match="INPUT without variables"):
+        parse_sas("data a; input; datalines;\n1\n;\nrun;")
 
 
 def test_data_lines_outside_a_data_step_are_one_issue() -> None:

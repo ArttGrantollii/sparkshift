@@ -1,4 +1,5 @@
 import ast
+import datetime
 import itertools
 from decimal import Decimal
 
@@ -1719,3 +1720,106 @@ def test_windows_and_joins_inside_subqueries_are_declared() -> None:
     assert 'window = Window.orderBy(F.col("a").asc())\n' in code
     assert 'orders = spark.table("orders")\n' in code
     assert 'items = spark.table("items")\n' in code
+
+
+# --- Rows written in the code ------------------------------------------------
+
+
+def test_inline_rows_golden_output() -> None:
+    rows = ir.InlineRows(
+        (("id", "double"), ("name", "string"), ("signup", "date")),
+        (
+            (1.0, "Ann", datetime.date(2024, 1, 5)),
+            (2.5, 'say "hi"', None),
+            (None, None, None),
+        ),
+    )
+
+    assert emit_datasets([ir.Named("people", rows)]) == (
+        "import datetime\n"
+        "\n"
+        "people = spark.createDataFrame(\n"
+        "    [\n"
+        '        (1.0, "Ann", datetime.date(2024, 1, 5)),\n'
+        '        (2.5, "say \\"hi\\"", None),\n'
+        "        (None, None, None),\n"
+        "    ],\n"
+        '    "`id` double, `name` string, `signup` date",\n'
+        ")\n"
+        "\n"
+        "result = people\n"
+    )
+
+
+def test_inline_rows_without_dates_import_nothing() -> None:
+    rows = ir.InlineRows((("x", "double"),), ((1.0,), (2.0,)))
+
+    assert emit(rows) == (
+        "result = spark.createDataFrame(\n"
+        "    [\n"
+        "        (1.0,),\n"
+        "        (2.0,),\n"
+        "    ],\n"
+        '    "`x` double",\n'
+        ")\n"
+    )
+
+
+def test_inline_rows_without_rows() -> None:
+    rows = ir.InlineRows((("x", "double"),), ())
+
+    assert (
+        emit(rows) == 'result = spark.createDataFrame(\n    [],\n    "`x` double",\n)\n'
+    )
+
+
+def test_a_long_inline_row_has_one_value_per_line() -> None:
+    long = "a" * 75
+    rows = ir.InlineRows((("x", "double"), ("note", "string")), ((1.0, long),))
+
+    assert emit(rows).splitlines()[2:7] == [
+        "        (",
+        "            1.0,",
+        f'            "{long}",',
+        "        ),",
+        "    ],",
+    ]
+
+
+def test_a_long_inline_schema_is_split_into_strings_python_joins() -> None:
+    names = [f"column_number_{i}" for i in range(8)]
+    rows = ir.InlineRows(tuple((name, "string") for name in names), ())
+
+    code = emit(rows)
+
+    assert all(len(line) <= 88 for line in code.splitlines())
+    tree = ast.parse(code)
+    call = tree.body[0].value  # type: ignore[attr-defined]
+    assert ast.literal_eval(call.args[1]) == ", ".join(f"`{n}` string" for n in names)
+
+
+def test_inline_rows_wrap_at_their_depth() -> None:
+    # A row of 78 characters fits two levels deep, not three.
+    rows = ir.InlineRows((("x", "double"), ("note", "string")), ((1.0, "x" * 68),))
+
+    alone = emit(rows)
+    chained = emit(ir.WithColumn(rows, "y", Literal(1)))
+
+    assert f'        (1.0, "{"x" * 68}"),' in alone.splitlines()
+    assert "                1.0," in chained.splitlines()
+    assert all(len(line) <= 88 for line in (alone + chained).splitlines())
+
+
+def test_inline_rows_need_columns_and_rows_of_their_width() -> None:
+    with pytest.raises(ValueError):
+        ir.InlineRows((), ())
+    with pytest.raises(ValueError):
+        ir.InlineRows((("x", "double"),), ((1.0, 2.0),))
+
+
+def test_a_dataset_cannot_hide_the_datetime_module() -> None:
+    rows = ir.InlineRows((("d", "date"),), ((datetime.date(2024, 1, 1),),))
+    code = emit_datasets([ir.Named("datetime", rows)])
+
+    assert "datetime_df = spark.createDataFrame(" in code
+    assert code.endswith("result = datetime_df\n")

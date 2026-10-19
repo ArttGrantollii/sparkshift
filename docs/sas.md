@@ -22,14 +22,16 @@ against SAS itself.
 All rules come from SAS's public documentation at documentation.sas.com:
 *SAS 9.4 Language Reference: Concepts*, *SAS 9.4 Functions and CALL Routines:
 Reference* for functions, *Base SAS 9.4 Procedures Guide* for procedures, the
-FREQ procedure chapter of the *SAS/STAT User's Guide*, and the *SAS SQL
-Procedure User's Guide*.
+FREQ procedure chapter of the *SAS/STAT User's Guide*, the *SAS SQL
+Procedure User's Guide*, *SAS 9.4 Statements: Reference* for `INPUT` and
+`DATALINES`, and *SAS 9.4 Formats and Informats: Reference*.
 
 ## Supported so far
 
 | Construct | Notes |
 |---|---|
 | `DATA out; SET in; RUN;` | One output data set and one input data set per step. A step also ends at the next `DATA` or `PROC` statement, as in SAS |
+| `DATA out; INPUT ...; DATALINES;` | Data lines, read with list input: names, `$` for text, and `:informat` with `$w.`, `w.d`, `BESTw.`, `DATEw.`, `YYMMDDw.`, `MMDDYYw.`, or `DDMMYYw.`. `LENGTH` and `FORMAT` may come before `INPUT`, the statements listed here after it. The rows are written in the code. See [Data lines](#data-lines) |
 | Several DATA steps | Each data set becomes a DataFrame variable; later steps read earlier data sets. `result` is the last one |
 | `lib.member` | Permanent data sets are read with `spark.table("lib.member")`. A temporary (`WORK`) data set the program did not create is read the same way, by its name |
 | `KEEP=`, `DROP=`, `RENAME=`, `WHERE=` on the input data set | |
@@ -55,7 +57,9 @@ example `RETAIN`, `BY` with `FIRST.`/`LAST.`, `OUTPUT`, `MERGE`, arrays, `DO`
 loops, other functions (among them date functions such as `INTCK`, `INTNX`,
 `MDY`, and `TODAY`), `PROPCASE` with its own delimiters, `**`, `||`, date
 constants, variable lists such as `x1-x5` and `OF x1-x5`, macros (`%let`,
-`&name`), global statements such as `LIBNAME` and `OPTIONS`, `DATA _NULL_`,
+`&name`), global statements such as `LIBNAME`, `OPTIONS`, and `INFILE`,
+column and formatted input and `INPUT` pointers, `INPUT` with `SET`,
+`DATA _NULL_`,
 writing to a permanent library, PROC SORT's `DUPOUT=`, `NOUNIQUEKEY`, and
 collating sequences, PROC MEANS without `OUTPUT` (a printed report), quantiles
 such as `MEDIAN`, `AUTONAME`, `TYPES`, `WAYS`, `ID`, `FREQ`, and `WEIGHT`, PROC
@@ -358,7 +362,10 @@ there, which changes the order of the columns, or creates a missing number if
 the variable never gets a value. So every variable it names must exist at that
 point: read or assigned before the statement, or an input column known from
 `KEEP=` on `SET`. Otherwise the statement is rejected; move it after the
-assignment.
+assignment. Before `INPUT`, where SAS defines the variables of data lines, a
+FORMAT statement may name a new variable: it becomes a number, placed there
+(a `$` format, which would also set a text variable's length, is rejected;
+give it a `LENGTH` first).
 
 ### PROC PRINT
 
@@ -372,10 +379,58 @@ rows. `ID`, `BY`, and `SUM`, which change what is shown, are rejected.
 
 ### Data lines
 
+*SAS 9.4 Statements: Reference*, "DATALINES Statement", "INPUT Statement",
+and "INPUT Statement: List"; the informats' pages in *SAS 9.4 Formats and
+Informats: Reference*.
+
 The lines after a `DATALINES` (or `CARDS`, `LINES`) statement are data, not
 SAS code: they are read as text up to the line with a semicolon, or, after
 `DATALINES4`, up to a line starting with `;;;;`. So their values, quotes and
 all, never appear as statements in a list of unsupported constructs.
+
+A DATA step without `SET` that reads them with `INPUT` becomes
+`spark.createDataFrame(...)` with the rows written in the code: SparkShift
+reads the data lines when it converts the program, as SAS reads them when it
+runs it, by the rules of list input:
+
+- Values are separated by one or more blanks, and a period alone is a missing
+  value, for numbers and for text. A tab is rejected: SAS reads it as part of
+  a value.
+- A variable is text with `$`, with a `$w.` informat, or after a `LENGTH`
+  statement that gives it a `$` length; otherwise it is a number, a double.
+- A text variable's length comes from its first `LENGTH` statement, else the
+  width of its `$w.` informat, else it is 8. Longer values are truncated,
+  with a warning that names the line.
+- A number that the standard informat cannot read, such as `1,000`, is invalid
+  data: SAS stores a missing value and writes a note, and SparkShift warns.
+  With a `w.d` informat, a value without a decimal point is divided by 10 to
+  the power d (`1250` read with `8.2` is 12.5).
+- `DATEw.` (`01JAN2024`), `YYMMDDw.` (`2024-01-31`), `MMDDYYw.`
+  (`01/31/2024`), and `DDMMYYw.` (`31/01/2024`) read dates into a Spark `date`
+  column, which the date functions above take as SAS takes its dates. An
+  invalid date is missing, with a warning. Two-digit years are rejected: SAS
+  chooses their century with the `YEARCUTOFF=` option.
+- A line with fewer values than `INPUT` reads continues on the next line
+  (`FLOWOVER`, the default), with a warning; values left at the end of a line
+  are not read. An observation that the data end in the middle of is not
+  written (SAS's `LOST CARD` note), with a warning.
+- The columns come in the order the variables first appear: in a `LENGTH` or
+  `FORMAT` statement before `INPUT`, then in `INPUT`. A variable named only
+  in such a statement is a missing column.
+
+Only `LENGTH` and `FORMAT` statements may come before `INPUT`. After it come
+the statements listed above, which run on each observation (`WHERE` needs
+`SET`; use a subsetting `IF`). One `INPUT` statement with list input is
+supported; column input (`name 1-10`), formatted input (`name date9.`, without
+the colon), pointers and line controls (`@`, `#`, `/`, `+`), and the `&` and
+`~` modifiers are rejected.
+
+Because SparkShift reads the data, it knows the data set's columns, their
+types, and their text lengths. A later DATA step that reads it with `SET`, and
+a procedure that reads it, know which variables are new and how long text is,
+as with `KEEP=` on `SET`, and can compare two of its variables. This holds
+while the step has no statements after `INPUT` other than `FORMAT`, and no
+data set options; PROC SORT keeps it.
 
 ### PROC SORT
 
@@ -558,9 +613,11 @@ and last with `DESC`, as Spark's `.asc()` and `.desc()` place NULLs.
 - **Variable types:** SparkShift cannot see whether an input variable is a
   number or text, which SAS compares differently. A comparison needs a constant,
   arithmetic, or a variable the step assigns on one side to tell; comparing two
-  input variables is rejected.
+  input variables is rejected. The variables of a data set read from data
+  lines are known (see [Data lines](#data-lines)).
 - **Input text lengths:** SparkShift cannot see an input text variable's length,
-  so it never truncates values assigned to one.
+  so it never truncates values assigned to one, except for a data set read
+  from data lines.
 - **Number types:** SAS stores every number as a double; the generated code
   keeps Spark's types (an integer stays an integer), with the same values.
 - **Text order:** ordering comparisons on text (`<`, `>`) ignore trailing

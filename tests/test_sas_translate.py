@@ -1,5 +1,7 @@
 """Tests for translating SAS programs into the IR."""
 
+import datetime
+
 import pytest
 
 from sparkshift import ir
@@ -2092,7 +2094,244 @@ def test_unsupported_propcase(expression: str, message: str) -> None:
     assert issues(f"data a; set t; y = {expression}; run;") == [message]
 
 
-def test_inline_data_is_one_issue() -> None:
-    program = "data a;\n input x;\n datalines;\n1\n2\n;\nrun;"
+# --- Data lines --------------------------------------------------------------
 
-    assert issues(program) == ["INPUT statement", "inline data (INPUT with DATALINES)"]
+
+def lines(statements: str, data: str, *later: str) -> str:
+    """A DATA step reading data lines, then later steps."""
+    return f"data a; {statements}; datalines;\n{data}\n;\nrun; {' '.join(later)}"
+
+
+def test_data_lines_become_rows_in_the_code() -> None:
+    translation = translate(lines("input id name $", "1 Ann\n2 Bob"))
+
+    assert translation.datasets == (
+        ir.Named(
+            "a",
+            ir.InlineRows(
+                (("id", "double"), ("name", "string")),
+                ((1.0, "Ann"), (2.0, "Bob")),
+            ),
+        ),
+    )
+    assert translation.warnings == ()
+
+
+def test_columns_are_in_the_order_they_first_appear() -> None:
+    program = lines(
+        "length Name $ 20 extra 8; format when date9.; input id name when :date9.",
+        "1 Christopher 05JAN2024",
+    )
+
+    assert translate(program).datasets[0].source == ir.InlineRows(
+        (
+            ("Name", "string"),
+            ("extra", "double"),
+            ("when", "date"),
+            ("id", "double"),
+        ),
+        (("Christopher", None, datetime.date(2024, 1, 5), 1.0),),
+    )
+
+
+@pytest.mark.parametrize(
+    ("statements", "value"),
+    [
+        ("input name $", "Christop"),  # 8 by default
+        ("input name :$5.", "Chris"),  # the informat's width
+        ("length name $ 3; input name :$5.", "Chr"),  # LENGTH comes first
+        ("length name $ 20; input name", "Christopher"),  # text by its LENGTH
+    ],
+)
+def test_the_length_of_text_read(statements: str, value: str) -> None:
+    translation = translate(lines(statements, "Christopher"))
+
+    source = translation.datasets[0].source
+    assert isinstance(source, ir.InlineRows)
+    assert source.rows == ((value,),)
+    truncated = [w for w in translation.warnings if w.message.startswith("text")]
+    assert len(truncated) == (value != "Christopher")
+
+
+def test_notes_on_the_data_are_warnings_with_their_line() -> None:
+    translation = translate(lines("input id name $", "1 Christopher\nx Ann"))
+
+    assert [(w.message, w.sql) for w in translation.warnings] == [
+        ("text truncated to the length of name", "line 2: Christopher"),
+        ("invalid data for id", "line 3: x"),
+    ]
+
+
+def test_statements_after_input_run_on_the_rows() -> None:
+    translation = translate(lines("input x; y = x * 2; if x > 1", "1\n2"))
+
+    relation = translation.datasets[0].source
+    assert isinstance(relation, ir.Filter)
+    assert isinstance(relation.source, ir.WithColumn)
+    assert isinstance(relation.source.source, ir.InlineRows)
+
+
+def test_keep_drop_and_rename_apply_to_inline_data() -> None:
+    translation = translate(lines("input x y z; drop z; rename y=w", "1 2 3"))
+
+    relation = translation.datasets[0].source
+    assert isinstance(relation, ir.RenameByName)
+    assert relation.renames == (("y", "w"),)
+    assert relation.source == ir.DropColumns(
+        ir.InlineRows(
+            (("x", "double"), ("y", "double"), ("z", "double")), ((1.0, 2.0, 3.0),)
+        ),
+        ("z",),
+    )
+
+
+def test_the_variables_input_reads_are_known_after_it() -> None:
+    # A conditional assignment of a new variable, and an assignment that SAS
+    # truncates: each needs to know which variables exist.
+    program = lines(
+        "input x name $; if x > 1 then label = 'big'; size = 'S'; size = 'XL'",
+        "1 Ann",
+    )
+
+    assert [w.message for w in translate(program).warnings] == [
+        "text truncated to the length of size"
+    ]
+
+
+def test_input_variables_keep_their_length() -> None:
+    program = lines("input name $; name = 'Christopher'", "Ann")
+
+    assert [w.message for w in translate(program).warnings] == [
+        "text truncated to the length of name"
+    ]
+
+
+def test_a_later_length_of_an_input_variable_is_ignored() -> None:
+    warnings = translate(lines("input name $; length name $ 20", "Ann")).warnings
+
+    assert [w.message for w in warnings] == ["LENGTH of name ignored"]
+    assert warnings[0].hint is not None
+    assert "name comes from INPUT, which sets its length" in warnings[0].hint
+
+
+@pytest.mark.parametrize(
+    "reading",
+    [
+        "set a;",
+        "set a(keep=x name);",
+        "set a(drop=name);",
+        "set a(rename=(x=z));",
+        "set work.a;",
+    ],
+)
+def test_later_steps_know_the_columns_of_inline_data(reading: str) -> None:
+    # Without known columns, SparkShift cannot tell whether SAS truncates.
+    program = lines(
+        "input x name $", "1 Ann", f"data b; {reading} tag = 'A'; tag = 'BC'; run;"
+    )
+
+    warnings = translate(program).warnings
+    assert "text truncated to the length of tag" in [w.message for w in warnings]
+
+
+def test_proc_sort_keeps_the_known_columns() -> None:
+    program = lines(
+        "input x name $",
+        "1 Ann",
+        "proc sort data=a out=s; by x; run;",
+        "proc sort data=s; by name; run;",
+        "data b; set s; if x > 1 then label = 'big'; run;",
+    )
+
+    assert translate(program).warnings == ()
+
+
+def test_known_columns_compare_two_variables() -> None:
+    program = lines(
+        "input x y", "1 2", "data b; set a; if x = y then same = 1; else same = 0; run;"
+    )
+
+    assert translate(program).warnings == ()
+
+
+@pytest.mark.parametrize(
+    "steps",
+    [
+        # The statements after INPUT may add columns.
+        (lines("input x; y = 1", "1"),),
+        # Options may change the columns.
+        (lines("input x", "1").replace("data a;", "data a(keep=x);"),),
+        (lines("input x", "1"), "set a(drop=nothere);"),
+        # A later step replaces the data set.
+        (lines("input x", "1"), "data a; set t; run;", "set a;"),
+        (
+            lines("input x", "1"),
+            "proc sort data=a(where=(x > 0)); by x; run;",
+            "set a;",
+        ),
+        (lines("input x", "1").replace("data a;", "data lib.a;"),),
+    ],
+)
+def test_columns_are_unknown_when_they_may_change(steps: tuple[str, ...]) -> None:
+    *before, reading = steps if len(steps) > 1 else (*steps, "set a;")
+    program = " ".join(before) + f" data b; {reading} if y > 1 then label = 'x'; run;"
+
+    assert "conditional assignment of label, which may be new or an input variable" in (
+        issues(program)
+    )
+
+
+@pytest.mark.parametrize(
+    ("program", "message"),
+    [
+        (lines("x = 1; input y", "1"), "statement before INPUT"),
+        (lines("input x; where x > 1", "1"), "WHERE statement without SET"),
+        ("data a; datalines;\n1\n;\nrun;", "DATALINES without INPUT"),
+        (lines("input x; input y", "1"), "second INPUT statement"),
+        (lines("input x :comma10.", "1"), "informat COMMA10."),
+        (lines("input x :$char10.", "1"), "informat $CHAR10."),
+        (lines("length x 8; input x $", "1"), "INPUT of the number x as text"),
+        (lines("format x date9.; input x $", "1"), "INPUT of the number x as text"),
+        (
+            lines("length x $ 5; input x :date9.", "1"),
+            "informat DATE9. for the text variable x",
+        ),
+        (lines("input x $ :8.2", "1"), "informat 8.2 for the text variable x"),
+        (lines("input x x", "1 2"), "x read twice by INPUT"),
+        (
+            lines("format x $10.; input x $", "1"),
+            "$ format of x before a LENGTH statement for it",
+        ),
+        (
+            lines("format x $10.; length x $ 20; input x", "1"),
+            "$ format of x before a LENGTH statement for it",
+        ),
+        (
+            lines("length x $ 5; length x 8; input x", "1"),
+            "x declared as text and as a number",
+        ),
+        (lines("length x 4; input x", "1"), "numeric LENGTH 4"),
+        (lines("input d :date9.", "01JAN24"), "two-digit year in DATE9."),
+        (lines("input x", "1\t2"), "tab in data lines"),
+        ("data a; set b; input x; run;", "INPUT and SET in one DATA step"),
+        # The parser's issue alone: the step has an INPUT statement.
+        (lines("input id 1-3", "1"), "column or formatted input of id"),
+    ],
+)
+def test_unsupported_inline_data(program: str, message: str) -> None:
+    assert issues(program) == [message]
+
+
+def test_a_second_length_before_input_is_ignored() -> None:
+    program = lines("length name $ 5; length name $ 20; input name", "Christopher")
+
+    assert [w.message for w in translate(program).warnings] == [
+        "LENGTH of name ignored",
+        "text truncated to the length of name",
+    ]
+
+
+def test_a_statement_after_the_data_lines_is_reported() -> None:
+    program = "data a; input x; datalines;\n1\n;\ny = 1; run;"
+
+    assert issues(program) == ["statement after DATALINES"]

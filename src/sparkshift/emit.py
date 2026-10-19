@@ -6,6 +6,7 @@ import SQLGlot or PySpark.
 Generated code is deterministic: the same IR always produces the same text.
 """
 
+import datetime
 import keyword
 import re
 from collections import Counter
@@ -24,7 +25,16 @@ _Argument: TypeAlias = ir.Expression | ir.SortKey | str
 # Names the generated code already uses; table variables must not shadow them.
 # Names the code uses, and those Databricks notebooks predefine and call.
 _RESERVED_NAMES = frozenset(
-    {RESULT_VARIABLE, "spark", "F", "Decimal", "Window", "dbutils", "display"}
+    {
+        RESULT_VARIABLE,
+        "spark",
+        "F",
+        "Decimal",
+        "Window",
+        "datetime",
+        "dbutils",
+        "display",
+    }
 )
 
 _INDENT = "    "
@@ -141,6 +151,7 @@ class _Emitter:
         self.line_length = line_length
         self.uses_functions = False
         self.uses_decimal = False
+        self.uses_datetime = False
         self.uses_window = False
         self.table_variables: dict[tuple[str, ...], str] = {}
         self.table_uses: Counter[tuple[str, ...]] = Counter()
@@ -200,8 +211,13 @@ class _Emitter:
         if self.uses_functions:
             imports.append("from pyspark.sql import functions as F")
         sections = []
+        standard = []
+        if self.uses_datetime:
+            standard.append("import datetime")
         if self.uses_decimal:
-            sections.append("from decimal import Decimal")
+            standard.append("from decimal import Decimal")
+        if standard:
+            sections.append("\n".join(standard))
         if imports:
             sections.append("\n".join(imports))
         if self.table_variables:
@@ -232,6 +248,52 @@ class _Emitter:
             self.named_variables[node] = name
             self.declarations.append(f"{name} = {code}")
         return name
+
+    def inline_rows(self, plan: ir.InlineRows, depth: int) -> str:
+        """spark.createDataFrame([rows], "schema"): one tuple per row, on one
+        line when it fits, and the schema as a DDL string, every name quoted.
+        The rows are ``depth`` levels deep: 3 when the DataFrame starts a
+        chain."""
+        room = self.line_length - self.nesting - depth * len(_INDENT)
+        rows = []
+        for row in plan.rows:
+            values = [self.inline_value(value) for value in row]
+            single = f"({', '.join(values)}{',' if len(values) == 1 else ''}),"
+            if len(single) <= room:
+                rows.append(single)
+            else:
+                body = "".join(f"{_INDENT}{value},\n" for value in values)
+                rows.append(f"(\n{body}),")
+        data = "[]"
+        if rows:
+            data = "[\n" + "".join(_indent(row) + "\n" for row in rows) + "]"
+        names = [f"`{name.replace('`', '``')}` {kind}" for name, kind in plan.columns]
+        # The schema in string literals that fit; Python joins adjacent ones.
+        lines: list[str] = []
+        current = ""
+        for position, part in enumerate(names):
+            piece = part if position == len(names) - 1 else f"{part}, "
+            # The schema is a level out, before a comma.
+            if current and len(python_string(current + piece)) + 1 > room + len(
+                _INDENT
+            ):
+                lines.append(python_string(current))
+                current = ""
+            current += piece
+        lines.append(python_string(current))
+        schema = "\n".join(lines)
+        return f"spark.createDataFrame(\n{_indent(data)},\n{_indent(schema)},\n)"
+
+    def inline_value(self, value: object) -> str:
+        """A value of a row written in the code, as a Python literal."""
+        if value is None:
+            return "None"
+        if isinstance(value, float):
+            return repr(value)
+        if isinstance(value, datetime.date):
+            self.uses_datetime = True
+            return f"datetime.date({value.year}, {value.month}, {value.day})"
+        return python_string(str(value))
 
     def column_name(self, name: str | ir.HelperName) -> str:
         """A literal user name or a Python variable bound to a helper name."""
@@ -321,6 +383,9 @@ class _Emitter:
 
     def relation(self, plan: ir.Relation) -> str:
         """Render a relation as a method chain, one call per line."""
+        if isinstance(plan, ir.InlineRows):
+            # Not the start of a chain, so not indented by one.
+            return self.inline_rows(plan, depth=2)
         source, calls = self.chain(plan)
         if not calls:
             return source
@@ -333,6 +398,8 @@ class _Emitter:
         match plan:
             case ir.TableScan(name_parts=parts):
                 return self.table_variables.get(parts, _spark_table(parts)), []
+            case ir.InlineRows():
+                return self.inline_rows(plan, depth=3), []
             case ir.Named():
                 return self.named_variable(plan), []
             case ir.RenameColumns(source=source, names=names):
@@ -867,7 +934,7 @@ def _walk(plan: ir.Relation) -> Iterator[ir.Relation]:
     def walk(node: ir.Relation) -> Iterator[ir.Relation]:
         yield node
         match node:
-            case ir.TableScan():
+            case ir.TableScan() | ir.InlineRows():
                 return
             case ir.Named(source=source):
                 if node not in seen:

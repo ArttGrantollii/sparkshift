@@ -399,6 +399,23 @@ class TableScan:
 
 
 @dataclass(frozen=True)
+class InlineRows:
+    """Rows written in the program, as SAS data lines are: ``columns`` are
+    (name, Spark type) pairs, the types "double", "string", and "date", and
+    each row has a value per column: a float, a str, a datetime.date, or
+    None for a missing value."""
+
+    columns: tuple[tuple[str, str], ...]
+    rows: tuple[tuple[object, ...], ...]
+
+    def __post_init__(self) -> None:
+        if not self.columns:
+            raise ValueError("InlineRows needs at least one column")
+        if any(len(row) != len(self.columns) for row in self.rows):
+            raise ValueError("every InlineRows row needs a value per column")
+
+
+@dataclass(frozen=True)
 class Named:
     """A relation the query gives a name, as a CTE (``WITH name AS (...)``) or
     a subquery in FROM (``(SELECT ...) AS name``) does. It is computed once
@@ -627,6 +644,7 @@ class Limit:
 # Any IR node that produces a DataFrame.
 Relation: TypeAlias = (
     TableScan
+    | InlineRows
     | Named
     | RenameColumns
     | RenameByName

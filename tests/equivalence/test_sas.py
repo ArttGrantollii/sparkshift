@@ -23,6 +23,8 @@ import pytest
 from compare import Snapshot
 from harness import assert_sas_result
 
+import sparkshift
+
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
 
@@ -43,6 +45,45 @@ class Sorted:
     keys: str
     result: Snapshot
 
+
+WHOLE_PROGRAM = """
+data customers_raw;
+    length customer_id 8 name $30 country $20 email $60;
+    format signup_date date9.;
+    input customer_id name $ country $ age signup_date :date9. email $;
+    datalines;
+101 John USA 25 01JAN2024 john@test.com
+102 Sarah UK 32 15FEB2024 sarah@test.com
+103 Michael USA . 20MAR2024 michael@test.com
+104 Emma Germany 17 05APR2024 emma@test.com
+105 David France 45 12MAY2024 david@test.com
+106 Lisa USA 29 15JUN2024 lisa@test.com
+107 James UK 16 01JUL2024 james@test.com
+108 Anna Germany 35 10AUG2024 anna@test.com
+;
+run;
+data customers_clean;
+    set customers_raw;
+    name = propcase(name);
+    country = upcase(country);
+    if missing(age) then age = 0;
+    if age >= 18 then customer_status = "ADULT";
+    else customer_status = "MINOR";
+    if age >= 30 then age_group = "30_PLUS";
+    else age_group = "UNDER_30";
+    signup_year = year(signup_date);
+    signup_month = month(signup_date);
+    if country = "USA" or country = "UK" then
+        region = "ANGLO";
+    else region = "EUROPE";
+    format signup_date date9.;
+run;
+proc sort data=customers_clean;
+    by country customer_id;
+run;
+proc print data=customers_clean;
+run;
+"""
 
 SAS_SCENARIOS = {
     # SAS GROUP BY without a summary is a sort, not deduplication. Its explicit
@@ -1092,6 +1133,173 @@ SAS_SCENARIOS = {
             (5, -1.25),
         ),
     ),
+    # List input: values separated by blanks, a period for a missing value,
+    # text 8 long by default or as wide as its $w. informat, and w.d dividing
+    # a number without a decimal point by 10 to the power d.
+    "data lines with list input": (
+        "data items;\n"
+        "  input id name $ price :8.2 sold :yymmdd10. code :$3.;\n"
+        "  datalines;\n"
+        "1 Christopher 1250 2024-03-05 ABCD\n"
+        "2 . 9.5 . XY\n"
+        "3   Ann  .  2024-12-31 .\n"
+        ";\n"
+        "run;",
+        _result(
+            "id double, name string, price double, sold date, code string",
+            (1.0, "Christop", 12.5, date(2024, 3, 5), "ABC"),
+            (2.0, None, 9.5, None, "XY"),
+            (3.0, "Ann", None, date(2024, 12, 31), None),
+        ),
+    ),
+    # A short line continues on the next (FLOWOVER); values left on a line
+    # are not read; an observation the data end in is not written (LOST
+    # CARD).
+    "data lines: FLOWOVER and LOST CARD": (
+        "data pairs; input id score; datalines;\n1\n10\n2 20 3\n30\n4\n5\n;\nrun;",
+        _result("id double, score double", (1.0, 10.0), (2.0, 20.0), (30.0, 4.0)),
+    ),
+    # LENGTH before INPUT places the variable first and sets its length; the
+    # statements after INPUT run on each observation; a later step reads
+    # the data set.
+    "data lines, statements after INPUT, and a later step": (
+        "data visits;\n"
+        "  length visitor $ 12;\n"
+        "  input visitor day :mmddyy10. count;\n"
+        "  total = count * 2;\n"
+        "  if count > 1;\n"
+        "  keep visitor day total;\n"
+        "  datalines;\n"
+        "Ann 01/31/2024 2\n"
+        "Bob 02/29/2024 1\n"
+        "Christopher_Long 12/01/2023 3\n"
+        ";\n"
+        "run;\n"
+        "data months; set visits; month = month(day); run;",
+        _result(
+            "visitor string, day date, total double, month int",
+            ("Ann", date(2024, 1, 31), 4.0, 1),
+            ("Christopher_", date(2023, 12, 1), 6.0, 12),
+        ),
+    ),
+    # A whole program: data lines, a step that cleans them (its new text
+    # variables take the length of their first value, so "UNDER_30" is
+    # stored as "UNDER_3" and "EUROPE" as "EUROP"), PROC SORT, PROC PRINT.
+    "a program from data lines to PROC PRINT": (
+        WHOLE_PROGRAM,
+        Sorted(
+            "country, customer_id",
+            _result(
+                "customer_id double, name string, country string, email string, "
+                "signup_date date, age double, customer_status string, "
+                "age_group string, signup_year int, signup_month int, region string",
+                (
+                    105.0,
+                    "David",
+                    "FRANCE",
+                    "david@test.com",
+                    date(2024, 5, 12),
+                    45.0,
+                    "ADULT",
+                    "30_PLUS",
+                    2024,
+                    5,
+                    "EUROP",
+                ),
+                (
+                    104.0,
+                    "Emma",
+                    "GERMANY",
+                    "emma@test.com",
+                    date(2024, 4, 5),
+                    17.0,
+                    "MINOR",
+                    "UNDER_3",
+                    2024,
+                    4,
+                    "EUROP",
+                ),
+                (
+                    108.0,
+                    "Anna",
+                    "GERMANY",
+                    "anna@test.com",
+                    date(2024, 8, 10),
+                    35.0,
+                    "ADULT",
+                    "30_PLUS",
+                    2024,
+                    8,
+                    "EUROP",
+                ),
+                (
+                    102.0,
+                    "Sarah",
+                    "UK",
+                    "sarah@test.com",
+                    date(2024, 2, 15),
+                    32.0,
+                    "ADULT",
+                    "30_PLUS",
+                    2024,
+                    2,
+                    "ANGLO",
+                ),
+                (
+                    107.0,
+                    "James",
+                    "UK",
+                    "james@test.com",
+                    date(2024, 7, 1),
+                    16.0,
+                    "MINOR",
+                    "UNDER_3",
+                    2024,
+                    7,
+                    "ANGLO",
+                ),
+                (
+                    101.0,
+                    "John",
+                    "USA",
+                    "john@test.com",
+                    date(2024, 1, 1),
+                    25.0,
+                    "ADULT",
+                    "UNDER_3",
+                    2024,
+                    1,
+                    "ANGLO",
+                ),
+                (
+                    103.0,
+                    "Michael",
+                    "USA",
+                    "michael@test.com",
+                    date(2024, 3, 20),
+                    0.0,
+                    "MINOR",
+                    "UNDER_3",
+                    2024,
+                    3,
+                    "ANGLO",
+                ),
+                (
+                    106.0,
+                    "Lisa",
+                    "USA",
+                    "lisa@test.com",
+                    date(2024, 6, 15),
+                    29.0,
+                    "ADULT",
+                    "UNDER_3",
+                    2024,
+                    6,
+                    "ANGLO",
+                ),
+            ),
+        ),
+    ),
 }
 
 
@@ -1106,3 +1314,12 @@ def test_sas_scenario(
         assert_sas_result(spark_tables, program, expected.result, keys)
     else:
         assert_sas_result(spark_tables, program, expected)
+
+
+def test_the_whole_program_warns_only_of_its_truncations() -> None:
+    warnings = sparkshift.convert(WHOLE_PROGRAM, dialect="sas").warnings
+
+    assert [(w.message, w.sql) for w in warnings] == [
+        ("text truncated to the length of age_group", 'age_group = "UNDER_30"'),
+        ("text truncated to the length of region", 'region = "EUROPE"'),
+    ]

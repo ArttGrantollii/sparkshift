@@ -216,9 +216,31 @@ class LengthStatement:
 @dataclass(frozen=True)
 class FormatStatement:
     """FORMAT a b date9. c;: the variables it names. A format changes how
-    SAS displays a value, never the value."""
+    SAS displays a value, never the value; but a variable that first appears
+    here takes its type from the format: text for a $ format."""
 
     names: tuple[str, ...]
+    span: Span
+    # The names given a $ format, lower case.
+    text_names: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class InputField:
+    """A variable INPUT reads with list input: ``text`` with $, and its
+    informat after a colon (modified list input), such as "DATE9.", in upper
+    case."""
+
+    name: str
+    text: bool
+    informat: str | None
+
+
+@dataclass(frozen=True)
+class InputStatement:
+    """INPUT with list input; without fields when the parser rejected it."""
+
+    fields: tuple[InputField, ...]
     span: Span
 
 
@@ -280,6 +302,7 @@ Statement = (
     | RenameStatement
     | LengthStatement
     | FormatStatement
+    | InputStatement
     | DatalinesStatement
     | Assignment
     | SubsettingIf
@@ -1373,6 +1396,8 @@ class _Parser:
             return LengthStatement(self.lengths(tokens), span)
         if first.is_keyword("FORMAT"):
             return self.format_statement(statement, span)
+        if first.is_keyword("INPUT"):
+            return self.input_statement(statement, span)
         if first.is_keyword(*_DATALINES_KEYWORDS) and len(statement) == 1:
             return self.datalines(first, span)
         if first.is_keyword("ELSE"):
@@ -1489,6 +1514,9 @@ class _Parser:
         """FORMAT variables format. ...: the variables are the names that are
         not part of a format, such as date9., $20., 8.2, or dollar10.2."""
         names: list[str] = []
+        # The names the next format applies to, and those given a $ format.
+        waiting: list[str] = []
+        text_names: set[str] = set()
         tokens = _Tokens(statement[1:], self)
         while not tokens.at_end():
             token = tokens.take()
@@ -1505,15 +1533,78 @@ class _Parser:
                 )
             ):
                 self.skip_format(tokens)
+                if token.is_symbol("$"):
+                    text_names |= {name.lower() for name in waiting}
+                waiting = []
             elif token.kind is Kind.NAME:
                 if tokens.peek().is_symbol("-"):
                     self.unsupported("variable list in a FORMAT statement", statement)
                     return None
                 names.append(token.text)
+                waiting.append(token.text)
             else:
                 self.unsupported("FORMAT statement", statement)
                 return None
-        return FormatStatement(tuple(names), span)
+        return FormatStatement(tuple(names), span, frozenset(text_names))
+
+    def input_statement(self, statement: list[Token], span: Span) -> InputStatement:
+        """INPUT with list input: names, each with $ for text or a colon and
+        an informat (name :date9.). Column input (name 1-10), formatted
+        input (name date9., without the colon), pointers, and line controls
+        read by position, which is not supported: such an INPUT statement,
+        reported, has no fields."""
+        fields: list[InputField] = []
+        tokens = _Tokens(statement[1:], self)
+        while not tokens.at_end():
+            token = tokens.take()
+            if token.kind is not Kind.NAME:
+                self.unsupported(
+                    f"{token.text} in an INPUT statement",
+                    statement,
+                    "SparkShift supports list input: names, each with $ for text "
+                    "or a colon and an informat, such as signup :date9.",
+                )
+                return InputStatement((), span)
+            if tokens.peek().is_symbol("-"):
+                self.unsupported("variable list in an INPUT statement", statement)
+                return InputStatement((), span)
+            text = tokens.peek().is_symbol("$")
+            if text:
+                tokens.take()
+            informat = None
+            following = tokens.peek()
+            if following.is_symbol(":"):
+                tokens.take()
+                start = tokens.index
+                tokens.take()
+                self.skip_format(tokens)
+                informat = "".join(
+                    t.text for t in tokens.tokens[start : tokens.index]
+                ).upper()
+            elif following.kind is Kind.NUMBER or (
+                # An informat without the colon, such as date9. or best12.
+                following.kind is Kind.NAME
+                and tokens.peek(1).is_symbol(".")
+                and tokens.peek(1).start == following.end
+            ):
+                self.unsupported(
+                    f"column or formatted input of {token.text}",
+                    statement,
+                    "It reads fixed columns; SparkShift supports list input. Put a "
+                    "colon before an informat, as in signup :date9.",
+                )
+                return InputStatement((), span)
+            elif following.is_symbol("&", "~", "@", "/", "#", "+", "("):
+                self.unsupported(
+                    f"{following.text} in an INPUT statement",
+                    statement,
+                    "SparkShift supports list input without modifiers or pointers.",
+                )
+                return InputStatement((), span)
+            fields.append(InputField(token.text, text, informat))
+        if not fields:
+            raise self.error("INPUT without variables", statement[0])
+        return InputStatement(tuple(fields), span)
 
     def skip_format(self, tokens: "_Tokens") -> None:
         """The rest of a format name: tokens joined to it up to its period

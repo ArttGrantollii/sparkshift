@@ -18,7 +18,16 @@ SQLGLOT_FRONTEND = frozenset({"parsing", "translate"})
 # and IR are shared by every frontend; the SAS frontend has its own parser
 # (see ADR 0005).
 SQLGLOT_FREE = frozenset(
-    {"ir", "emit", "diagnostics", "errors", "sas_lexer", "sas_parser", "sas_translate"}
+    {
+        "ir",
+        "emit",
+        "diagnostics",
+        "errors",
+        "sas_lexer",
+        "sas_parser",
+        "sas_datalines",
+        "sas_translate",
+    }
 )
 
 

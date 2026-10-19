@@ -23,8 +23,12 @@ documentation, are listed in docs/sas.md. In short:
 
 SparkShift never sees the input's columns. Where the result depends on them,
 it uses what the program shows: a variable read before it is assigned is an
-input column, and with KEEP= on the SET data set, the input's columns are
-known. Otherwise it rejects the construct rather than guess.
+input column, and with KEEP= on the SET data set, or for a data set the
+program reads from its data lines, the input's columns are known. Otherwise
+it rejects the construct rather than guess.
+
+Data lines (INPUT with DATALINES) are read at conversion time, with SAS's
+rules for list input (see sas_datalines): their rows are written in the code.
 
 Like the SQL translator, it works from an allowlist and reports every
 unsupported construct at once.
@@ -34,7 +38,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from decimal import Decimal
 
-from sparkshift import ir
+from sparkshift import ir, sas_datalines
 from sparkshift.diagnostics import Diagnostic
 from sparkshift.errors import UnsupportedSQLError
 from sparkshift.sas_parser import (
@@ -53,6 +57,7 @@ from sparkshift.sas_parser import (
     FormatStatement,
     IfThen,
     In,
+    InputStatement,
     IsMissing,
     KeepOption,
     KeepStatement,
@@ -265,6 +270,20 @@ class _Value:
     blank_if_longer: bool = False
 
 
+@dataclass(frozen=True)
+class _Column:
+    """A column of a data set whose columns are known: its name as first
+    written, its kind ("number" or "text"), and a text column's length."""
+
+    name: str
+    kind: str
+    length: int | None = None
+
+
+# A data set's known columns, in order, by lower-case name.
+_Schema = dict[str, _Column]
+
+
 @dataclass
 class _Variable:
     """What SparkShift knows about a variable at a point in a DATA step."""
@@ -308,10 +327,16 @@ class _SasTranslator:
         self.aggregating = False
         # What the last PROC PRINT shows.
         self.result: ir.Relation | None = None
+        # The columns of the data sets whose columns are known, by lower-case
+        # name: each column's kind and text length, by lower-case name.
+        self.schemas: dict[str, _Schema] = {}
+        # Where a step's input variables come from, for messages.
+        self.input_name = "the SET data set"
 
     def translation(self) -> SasTranslation:
         for step in self.program.steps:
             self.variables, self.input_columns = {}, None
+            self.input_name = "the SET data set"
             if isinstance(step, DataStep):
                 self.data_step(step)
             elif isinstance(step, ProcSort):
@@ -340,12 +365,9 @@ class _SasTranslator:
         wheres = [s for s in statements if isinstance(s, WhereStatement)]
         datalines = [s for s in statements if isinstance(s, DatalinesStatement)]
         if not sets and datalines:
-            self.unsupported(
-                "inline data (INPUT with DATALINES)",
-                datalines[0].span,
-                "Data lines are not supported yet.",
-            )
-        elif not sets:
+            self.inline_step(step, output)
+            return
+        if not sets:
             self.unsupported(
                 "DATA step without a SET statement",
                 step.span,
@@ -353,6 +375,14 @@ class _SasTranslator:
             )
         for extra in sets[1:]:
             self.unsupported("second SET statement", extra.span)
+        reads = [s for s in statements if isinstance(s, InputStatement)]
+        for extra in reads if sets else []:
+            self.unsupported(
+                "INPUT and SET in one DATA step",
+                extra.span,
+                "Reading data lines and a data set in one step is not supported; "
+                "read the data lines in a step of their own.",
+            )
         for extra in wheres[1:]:
             self.unsupported(
                 "second WHERE statement",
@@ -379,7 +409,7 @@ class _SasTranslator:
 
         source = sets[0].datasets[0]
         relation, filtered = self.input_dataset(source)
-        self.input_columns = _input_columns(source)
+        self.read_columns(source)
         self.declared_early = _declared_early(statements, self.input_columns or set())
         if self.input_columns is None and self.declared_early & self.step_assigned:
             lengths = [s for s in statements if isinstance(s, LengthStatement)]
@@ -404,8 +434,22 @@ class _SasTranslator:
 
         # Program statements, in order.
         relation = self.execute(step.statements, relation, None)
+        # A step without a usable output data set has an issue already.
+        assert output is not None
+        relation = self.step_output(statements, relation, output, step.span)
+        if len(self.issues) > issues_before:
+            return
+        self.create(output.member, relation)
 
-        # The DROP and KEEP statements, then the RENAME statement.
+    def step_output(
+        self,
+        statements: list[Statement],
+        relation: ir.Relation,
+        output: Dataset,
+        span: Span,
+    ) -> ir.Relation:
+        """The step's rows as written: after the DROP and KEEP statements,
+        then the RENAME statement, then the output data set's options."""
         keeps = [n for s in statements if isinstance(s, KeepStatement) for n in s.names]
         drops = [n for s in statements if isinstance(s, DropStatement) for n in s.names]
         renames = [
@@ -420,16 +464,285 @@ class _SasTranslator:
         if drops:
             relation = ir.DropColumns(relation, _unique(drops))
         if renames:
-            relation = self.rename(relation, renames, step.span)
+            relation = self.rename(relation, renames, span)
+        return self.dataset_options(relation, output, output_side=True)[0]
 
-        # A step without a usable output data set has an issue already.
-        assert output is not None
-        relation = self.dataset_options(relation, output, output_side=True)[0]
+    def inline_step(self, step: DataStep, output: Dataset | None) -> None:
+        """A DATA step that reads data lines with INPUT: the rows are read
+        now and written in the code; the statements after INPUT run on them
+        as on the rows of a SET data set whose columns are known."""
+        issues_before = len(self.issues)
+        statements = list(step.statements)
+        for statement in _all_statements(step.statements):
+            nested = statement not in statements
+            if nested and isinstance(statement, InputStatement | DatalinesStatement):
+                what = "INPUT" if isinstance(statement, InputStatement) else "DATALINES"
+                self.unsupported(
+                    f"{what} inside IF or DO",
+                    statement.span,
+                    "SparkShift supports one INPUT statement, at the top level of "
+                    "the step, which reads each observation.",
+                )
+            elif isinstance(statement, WhereStatement):
+                self.unsupported(
+                    "WHERE statement without SET",
+                    statement.span,
+                    "WHERE selects rows of the data set SET reads; use a subsetting "
+                    "IF after INPUT.",
+                )
+        last = next(
+            i for i, s in enumerate(statements) if isinstance(s, DatalinesStatement)
+        )
+        datalines = statements[last]
+        assert isinstance(datalines, DatalinesStatement)
+        for extra in statements[last + 1 :]:
+            self.unsupported(
+                "statement after DATALINES",
+                extra.span,
+                "DATALINES is the last statement of a DATA step; the data lines "
+                "follow it.",
+            )
+        reads = [s for s in statements if isinstance(s, InputStatement)]
+        if not reads:
+            self.unsupported(
+                "DATALINES without INPUT",
+                datalines.span,
+                "Add an INPUT statement that names the variables of each line.",
+            )
+            self.check_statements(step)
+            return
+        for extra in reads[1:]:
+            self.unsupported(
+                "second INPUT statement",
+                extra.span,
+                "SparkShift supports one INPUT statement, which reads each "
+                "observation.",
+            )
+        reading = reads[0]
+        first = statements.index(reading)
+        for early in statements[:first]:
+            if not isinstance(early, LengthStatement | FormatStatement):
+                self.unsupported(
+                    "statement before INPUT",
+                    early.span,
+                    "SAS runs it before reading each line; put it after INPUT.",
+                )
+        columns, fields = self.input_fields(statements[:first], reading)
+        if not fields:
+            return  # Every field has an issue.
+        rows, notes, problems = sas_datalines.read(
+            datalines.text, fields, datalines.line
+        )
+        for note in notes:
+            self.warnings.append(_line_diagnostic(note))
+        for problem in problems:
+            self.issues.append(_line_diagnostic(problem))
+        positions = {field.name.lower(): i for i, field in enumerate(fields)}
+        types = []
+        for key, column in columns.items():
+            kind = fields[positions[key]].kind if key in positions else column.kind
+            types.append({"text": "string", "date": "date"}.get(kind, "double"))
+        relation: ir.Relation = ir.InlineRows(
+            tuple(zip((c.name for c in columns.values()), types, strict=True)),
+            tuple(
+                tuple(row[positions[k]] if k in positions else None for k in columns)
+                for row in rows
+            ),
+        )
+
+        # The statements after INPUT, with the variables INPUT reads.
+        self.input_name = "INPUT"
+        self.input_columns = set(columns)
+        for key, column in columns.items():
+            self.variables[key] = _Variable(column.kind, column.length, exists=True)
+        after = tuple(statements[first + 1 : last])
+        every = list(_all_statements(after))
+        self.step_assigned = set().union(*(_assigned(s) for s in after))
+        self.declared_early = _declared_early(every, self.input_columns)
+        relation = self.execute(after, relation, None)
+        if output is None:
+            return
+        relation = self.step_output(every, relation, output, step.span)
         if len(self.issues) > issues_before:
             return
-        named = ir.Named(output.member.lower(), relation)
-        self.created[output.member.lower()] = named
+        # The columns are known when the statements after INPUT only set
+        # formats, and no option changes them.
+        unchanged = not output.options and all(
+            isinstance(s, FormatStatement) for s in after
+        )
+        self.create(output.member, relation, columns if unchanged else None)
+
+    def input_fields(
+        self, early: list[Statement], reading: InputStatement
+    ) -> tuple["_Schema", list[sas_datalines.Field]]:
+        """The step's columns, in SAS's order (where each first appears: in a
+        LENGTH or FORMAT statement before INPUT, or in INPUT), and how INPUT
+        reads each value.
+
+        A text variable's length is that of its LENGTH statement, else the
+        width of its $w. informat, else 8. A variable that first appears in a
+        FORMAT statement is a number; a $ format there, which gives text its
+        length, is not supported."""
+        columns: _Schema = {}
+        by_length: set[str] = set()
+        for statement in early:
+            if isinstance(statement, LengthStatement):
+                entries = list(statement.entries)
+            elif isinstance(statement, FormatStatement):
+                entries = [
+                    (name, name.lower() in statement.text_names, None)
+                    for name in statement.names
+                ]
+            else:
+                continue
+            for name, is_text, size in entries:
+                key = name.lower()
+                kind = "text" if is_text else "number"
+                prior = columns.get(key)
+                length = isinstance(statement, LengthStatement)
+                if length and not is_text and size != 8:
+                    self.unsupported(
+                        f"numeric LENGTH {size}",
+                        statement.span,
+                        "SAS would keep fewer bytes and lose precision; SparkShift "
+                        "keeps full precision, so only LENGTH 8 is supported.",
+                    )
+                elif prior is not None and prior.kind != kind:
+                    self.unsupported(
+                        f"{name} declared as text and as a number",
+                        statement.span,
+                        "SAS stops with an error; give the variable one type.",
+                    )
+                elif not length and is_text and prior is None:
+                    self.unsupported(
+                        f"$ format of {name} before a LENGTH statement for it",
+                        statement.span,
+                        "SAS would make the format's width the variable's length; "
+                        f"add LENGTH {name} $ n; before the FORMAT statement.",
+                    )
+                elif length and key in by_length:
+                    self.warn(
+                        f"LENGTH of {name} ignored",
+                        statement.span,
+                        "SAS sets a variable's length where it first appears, in "
+                        "the first LENGTH statement.",
+                    )
+                elif prior is None:
+                    columns[key] = _Column(name, kind, size if is_text else None)
+                    if length:
+                        by_length.add(key)
+
+        fields: list[sas_datalines.Field] = []
+        for field in reading.fields:
+            key = field.name.lower()
+            if any(f.name.lower() == key for f in fields):
+                self.unsupported(
+                    f"{field.name} read twice by INPUT",
+                    reading.span,
+                    "SAS keeps the second value; read each variable once.",
+                )
+                continue
+            informat = None
+            if field.informat is not None:
+                informat = sas_datalines.informat_kind(field.informat)
+                if informat is None:
+                    self.unsupported(
+                        f"informat {field.informat}",
+                        reading.span,
+                        "SparkShift reads list input with the $w., w.d, BESTw., "
+                        "DATEw., YYMMDDw., MMDDYYw., and DDMMYYw. informats.",
+                    )
+                    continue
+            prior = columns.get(key)
+            as_text = field.text or (informat is not None and informat[0] == "text")
+            if prior is not None and prior.kind == "number" and as_text:
+                self.unsupported(
+                    f"INPUT of the number {field.name} as text",
+                    reading.span,
+                    "A statement before INPUT made it a number, so SAS stops with "
+                    "an error. Remove the $, or declare it as text.",
+                )
+                continue
+            is_text = as_text or (prior is not None and prior.kind == "text")
+            if is_text and informat is not None and informat[0] != "text":
+                self.unsupported(
+                    f"informat {field.informat} for the text variable {field.name}",
+                    reading.span,
+                    "SAS stops with an error; read it as a number, or use a $w. "
+                    "informat.",
+                )
+                continue
+            if is_text:
+                size = (
+                    (prior.length if prior is not None else None)
+                    or (informat[1] if informat is not None else None)
+                    or sas_datalines.DEFAULT_TEXT_LENGTH
+                )
+                columns[key] = _Column(
+                    prior.name if prior else field.name, "text", size
+                )
+                fields.append(sas_datalines.Field(field.name, "text", size))
+            else:
+                is_date = informat is not None and informat[0] == "date"
+                columns[key] = _Column(prior.name if prior else field.name, "number")
+                fields.append(
+                    sas_datalines.Field(
+                        field.name,
+                        "date" if is_date else "number",
+                        None,
+                        field.informat,
+                    )
+                )
+        return columns, fields
+
+    def create(
+        self, name: str, relation: ir.Relation, schema: "_Schema | None" = None
+    ) -> None:
+        """Record a data set the program creates, and its columns when they
+        are known."""
+        named = ir.Named(name.lower(), relation)
+        self.created[name.lower()] = named
         self.outputs.append(named)
+        if schema is None:
+            self.schemas.pop(name.lower(), None)
+        else:
+            self.schemas[name.lower()] = schema
+
+    def read_columns(self, dataset: Dataset) -> None:
+        """What SparkShift knows of the columns of a data set read: their
+        names, from KEEP= or because the program read the data set's data
+        lines, and then also their types and lengths."""
+        self.input_columns = _input_columns(dataset)
+        schema = self.known_columns(dataset)
+        if schema is None:
+            return
+        self.input_columns = set(schema)
+        for key, column in schema.items():
+            self.variables[key] = _Variable(column.kind, column.length, exists=True)
+
+    def known_columns(self, dataset: Dataset) -> "_Schema | None":
+        """The columns of a data set the program created with known columns,
+        after the data set's KEEP=, DROP=, and RENAME= options."""
+        temporary = dataset.library is None or dataset.library.upper() == "WORK"
+        schema = self.schemas.get(dataset.member.lower()) if temporary else None
+        if schema is None:
+            return None
+        for option in dataset.options:
+            if isinstance(option, KeepOption | DropOption):
+                names = {name.lower() for name in option.names}
+                if not names <= set(schema):
+                    return None
+                keep = isinstance(option, KeepOption)
+                schema = {k: c for k, c in schema.items() if (k in names) == keep}
+        for option in dataset.options:
+            if isinstance(option, RenameOption):
+                for old, new in option.pairs:
+                    column = schema.get(old.lower())
+                    if column is None:
+                        return None
+                    schema = {k: c for k, c in schema.items() if k != old.lower()}
+                    schema[new.lower()] = _Column(new, column.kind, column.length)
+        return schema
 
     def proc_sort(self, step: ProcSort) -> None:
         """PROC SORT: the input, filtered, without duplicate BY values with
@@ -480,9 +793,11 @@ class _SasTranslator:
             relation = self.dataset_options(relation, step.out, output_side=True)[0]
         if len(self.issues) > issues_before:
             return
-        named = ir.Named(target.member.lower(), relation)
-        self.created[target.member.lower()] = named
-        self.outputs.append(named)
+        # Sorting keeps the columns, when no option changes them.
+        schema = None
+        if not source.options and (step.out is None or not step.out.options):
+            schema = self.known_columns(source)
+        self.create(target.member, relation, schema)
 
     def proc_print(self, step: ProcPrint) -> None:
         """PROC PRINT creates no data set: what it shows (the VAR variables
@@ -639,9 +954,7 @@ class _SasTranslator:
         summary = self.dataset_options(summary, output.out, output_side=True)[0]
         if len(self.issues) > issues_before:
             return
-        named = ir.Named(output.out.member.lower(), summary)
-        self.created[output.out.member.lower()] = named
-        self.outputs.append(named)
+        self.create(output.out.member, summary)
 
     def proc_freq(self, step: ProcFreq) -> None:
         """PROC FREQ: one data set for each TABLES statement with OUT=, with
@@ -720,9 +1033,7 @@ class _SasTranslator:
         result = self.dataset_options(result, tables.out, output_side=True)[0]
         if len(self.issues) > issues_before:
             return
-        named = ir.Named(tables.out.member.lower(), result)
-        self.created[tables.out.member.lower()] = named
-        self.outputs.append(named)
+        self.create(tables.out.member, result)
 
     def proc_sql(self, step: ProcSql) -> None:
         """PROC SQL: each CREATE TABLE ... AS SELECT creates a data set.
@@ -749,9 +1060,7 @@ class _SasTranslator:
         relation = self.dataset_options(relation, target, output_side=True)[0]
         if len(self.issues) > issues_before:
             return
-        named = ir.Named(target.member.lower(), relation)
-        self.created[target.member.lower()] = named
-        self.outputs.append(named)
+        self.create(target.member, relation)
 
     def sql_query(self, query: SqlQuery) -> ir.Relation | None:
         qualified = bool(query.joins) or _qualifies(query)
@@ -1057,7 +1366,7 @@ class _SasTranslator:
         """The rows a procedure reads: its DATA= data set, after its options
         and the WHERE statement."""
         relation, filtered = self.input_dataset(source)
-        self.input_columns = _input_columns(source)
+        self.read_columns(source)
         for extra in wheres[1:]:
             self.unsupported(
                 "second WHERE statement",
@@ -1230,8 +1539,8 @@ class _SasTranslator:
             case FormatStatement():
                 self.format(statement)
                 return relation
-        # SET, WHERE, KEEP, DROP, RENAME, and DATALINES apply to the whole
-        # step.
+        # SET, INPUT, WHERE, KEEP, DROP, RENAME, and DATALINES apply to the
+        # whole step.
         return relation
 
     def format(self, statement: FormatStatement) -> None:
@@ -1478,20 +1787,20 @@ class _SasTranslator:
         for name, is_text, size in statement.entries:
             variable = self.variables.get(name.lower())
             new = self.is_new(name)
+            if self.input_columns is not None and name.lower() in self.input_columns:
+                self.warn(
+                    f"LENGTH of {name} ignored",
+                    statement.span,
+                    f"{name} comes from {self.input_name}, which sets its length; "
+                    "SAS ignores a later LENGTH statement for it.",
+                )
+                continue
             if variable is not None and (variable.exists or variable.assigned):
                 self.warn(
                     f"LENGTH of {name} ignored",
                     statement.span,
                     "SAS sets a variable's length where it first appears; put "
                     "LENGTH before the variable's first use.",
-                )
-                continue
-            if new is False:
-                self.warn(
-                    f"LENGTH of {name} ignored",
-                    statement.span,
-                    f"{name} comes from the SET data set, which sets its length; "
-                    "SAS ignores a later LENGTH statement for it.",
                 )
                 continue
             if not is_text and size != 8:
@@ -2259,6 +2568,11 @@ def _declared_early(statements: list[Statement], inputs: set[str]) -> set[str]:
         ):
             early.add(name)
     return early
+
+
+def _line_diagnostic(note: sas_datalines.Note) -> Diagnostic:
+    """A note on the data lines, with the line it is on."""
+    return Diagnostic(note.message, f"line {note.line}: {note.text}", note.hint)
 
 
 def _input_columns(dataset: Dataset) -> set[str] | None:

@@ -38,7 +38,7 @@ flowchart LR
 | Frontend | `translate.py` | Syntax tree → IR. Works from an allowlist: anything it does not explicitly handle is reported as unsupported, and all issues are collected before failing |
 | Middle | `ir.py` | SparkShift's own description of DataFrame operations ([ADR 0003](adr/0003-introduce-a-small-ir.md)) |
 | Backend | `emit.py` | IR → readable PySpark source |
-| SAS frontend | `sas_lexer.py`, `sas_parser.py`, `sas_translate.py` | SAS program → tokens → a small syntax tree → IR, one named relation per data set (DATA steps and PROC SORT, MEANS/SUMMARY, FREQ, and SQL), following SAS's documented rules ([ADR 0005](adr/0005-sas-has-its-own-front-end.md), [ADR 0006](adr/0006-proc-sql-follows-sas-rules.md), [sas.md](sas.md)) |
+| SAS frontend | `sas_lexer.py`, `sas_parser.py`, `sas_datalines.py`, `sas_translate.py` | SAS program → tokens → a small syntax tree → IR, one named relation per data set (DATA steps, with data lines read at conversion time, and PROC SORT, MEANS/SUMMARY, FREQ, and SQL), following SAS's documented rules ([ADR 0005](adr/0005-sas-has-its-own-front-end.md), [ADR 0006](adr/0006-proc-sql-follows-sas-rules.md), [sas.md](sas.md)) |
 | Entry point | `api.py` | `convert(sql, dialect)` runs the stages in order; with `dialect="sas"`, the SAS frontend's |
 | Notebooks | `notebook.py` | Generated code as a Databricks source-format notebook: a Markdown description, one cell per section, and `display(result)` ([ADR 0007](adr/0007-databricks-notebooks.md)) |
 | Analysis | `report.py` | Calls `convert` for many files and summarizes the outcomes: pure functions and data, with text, Markdown, and JSON formats; it reads no files |
