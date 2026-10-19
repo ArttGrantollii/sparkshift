@@ -34,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   widgets as its parameters; `--overwrite` updates a job of the same name. It
   is created only if every file converts and uploads. `sparkshift.jobs` also
   writes a notebook that creates the same job when run in a workspace.
+- The playground's **Deploy** tab imports a converted folder's notebooks and
+  that Create job notebook into a Databricks workspace, with a personal
+  access token kept only in the page's memory and sent only to the
+  workspace. The page may connect to Databricks workspaces and no other site.
 
 ### Fixed
 

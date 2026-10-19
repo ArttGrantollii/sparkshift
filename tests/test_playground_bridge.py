@@ -134,6 +134,75 @@ def test_about(bridge: ModuleType) -> None:
     }
 
 
+def test_a_notebook_for_deploying_starts_at_the_given_locations(
+    bridge: ModuleType,
+) -> None:
+    sql = "SELECT a FROM t"
+    locations = ("workspace", "raw", "main", "claims")
+
+    result = json.loads(bridge.notebook_for_page(sql, "", "load.sql", *locations))
+
+    assert result["code"] == sparkshift.to_notebook(
+        sparkshift.convert(sql),
+        source="load.sql",
+        catalog="workspace",
+        schema="raw",
+        output_catalog="main",
+        output_schema="claims",
+    )
+
+
+FOLDER = "/Workspace/Users/me@example.com/claims"
+
+
+def test_the_job_notebook_is_the_one_upload_would_create(bridge: ModuleType) -> None:
+    from sparkshift.jobs import create_job_notebook, job_settings
+
+    notebooks = [f"{FOLDER}/load", f"{FOLDER}/legacy/report"]
+    locations = ("workspace", "raw", "", "claims")
+
+    result = json.loads(
+        bridge.job_for_page("", FOLDER, json.dumps(notebooks), *locations)
+    )
+
+    settings = job_settings(
+        "sparkshift claims",
+        FOLDER,
+        notebooks,
+        catalog="workspace",
+        schema="raw",
+        output_schema="claims",
+    )
+    assert result == {
+        "ok": True,
+        "name": "sparkshift claims",
+        "notebook": create_job_notebook(settings),
+    }
+    named = json.loads(bridge.job_for_page(" nightly ", FOLDER, "[]", "", "", "", ""))
+    assert named["name"] == "nightly"
+
+
+@pytest.mark.parametrize(
+    ("folder", "notebooks"),
+    [
+        ("relative/folder", ["relative/folder/a"]),
+        ("/Workspace/../Shared", ["/Workspace/../Shared/a"]),
+        (FOLDER, ["/Workspace/Shared/elsewhere"]),
+        (FOLDER, [f"{FOLDER}/../escape"]),
+        (FOLDER, [f"{FOLDER}//a"]),
+    ],
+)
+def test_a_job_needs_notebooks_inside_an_absolute_folder(
+    bridge: ModuleType, folder: str, notebooks: list[str]
+) -> None:
+    result = json.loads(
+        bridge.job_for_page("", folder, json.dumps(notebooks), "", "", "", "")
+    )
+
+    assert result["ok"] is False
+    assert "absolute path" in result["error"]
+
+
 def test_a_notebook_is_titled_after_its_source_file(bridge: ModuleType) -> None:
     sql = "SELECT a FROM t"
 

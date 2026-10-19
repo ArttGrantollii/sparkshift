@@ -6,10 +6,11 @@
     <!-- Scripts come only from this site and Pyodide's pinned CDN release.
          Module worker imports use worker-src too, so the pinned Pyodide CDN
          is allowed there. 'wasm-unsafe-eval' permits WebAssembly compilation.
-         Fonts are served from this site (default-src 'self'). -->
+         Fonts are served from this site (default-src 'self'). Deploying may
+         connect to Databricks workspaces, and to nothing else. -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net 'wasm-unsafe-eval'; worker-src 'self' https://cdn.jsdelivr.net; connect-src 'self' https://cdn.jsdelivr.net; style-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'"
+      content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net 'wasm-unsafe-eval'; worker-src 'self' https://cdn.jsdelivr.net; connect-src 'self' https://cdn.jsdelivr.net https://*.cloud.databricks.com https://*.azuredatabricks.net https://*.gcp.databricks.com; style-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'"
     />
     <title>SparkShift playground: SQL and SAS to PySpark</title>
     <meta
@@ -32,6 +33,7 @@
         <div class="segmented" role="tablist" aria-label="Convert">
           <button id="tab-file" type="button" role="tab" aria-selected="true" aria-controls="view-file">File</button>
           <button id="tab-folder" type="button" role="tab" aria-selected="false" aria-controls="view-folder" tabindex="-1">Folder</button>
+          <button id="tab-deploy" type="button" role="tab" aria-selected="false" aria-controls="view-deploy" tabindex="-1">Deploy</button>
         </div>
         <a class="link" href="https://github.com/ArttGrantollii/sparkshift">GitHub</a>
         <button id="theme" class="icon-button" type="button" aria-label="Switch to light theme">
@@ -41,23 +43,25 @@
 
       <main class="workspace">
         <div class="toolbar">
-          <label class="field">
-            <span class="visually-hidden">Dialect</span>
-            <select id="dialect" class="select" disabled>
-              <option value="">Generic SQL</option>
-            </select>
-          </label>
-          <span class="arrow" aria-hidden="true">→</span>
-          <div class="segmented" role="radiogroup" aria-label="Output">
-            <button id="output-code" type="button" role="radio" aria-checked="true">PySpark</button>
-            <button id="output-notebook" type="button" role="radio" aria-checked="false">Notebook</button>
+          <div class="toolbar-group" id="convert-controls">
+            <label class="field">
+              <span class="visually-hidden">Dialect</span>
+              <select id="dialect" class="select" disabled>
+                <option value="">Generic SQL</option>
+              </select>
+            </label>
+            <span class="arrow" aria-hidden="true">→</span>
+            <div class="segmented" role="radiogroup" aria-label="Output">
+              <button id="output-code" type="button" role="radio" aria-checked="true">PySpark</button>
+              <button id="output-notebook" type="button" role="radio" aria-checked="false">Notebook</button>
+            </div>
+            <label class="field" id="example-field">
+              <span class="visually-hidden">Example</span>
+              <select id="example" class="select" disabled>
+                <option value="">Load an example…</option>
+              </select>
+            </label>
           </div>
-          <label class="field" id="example-field">
-            <span class="visually-hidden">Example</span>
-            <select id="example" class="select" disabled>
-              <option value="">Load an example…</option>
-            </select>
-          </label>
           <span class="spacer"></span>
           <button id="cancel" class="button" type="button" hidden>Cancel conversion</button>
           <button id="retry" class="button" type="button" hidden>Retry loading Python</button>
@@ -146,6 +150,80 @@
             <div id="file-warnings" class="panel warn" hidden></div>
             <div id="file-errors" class="panel bad" hidden></div>
           </div>
+        </div>
+
+        <div id="view-deploy" class="view deploy" role="tabpanel" aria-labelledby="tab-deploy" hidden>
+          <form class="card" id="deploy-form" novalidate>
+            <div class="card-head">
+              <h2>Deploy to Databricks</h2>
+              <p class="muted">
+                Imports the folder's notebooks into your workspace, and a
+                <b>Create job</b> notebook that creates a job running them in order.
+              </p>
+            </div>
+
+            <h3>Workspace</h3>
+            <div class="form-field">
+              <label for="deploy-host">Workspace URL</label>
+              <input id="deploy-host" class="input" type="url" placeholder="https://dbc-1a2b3c4d-5e6f.cloud.databricks.com" autocomplete="off" spellcheck="false" aria-describedby="deploy-host-hint" />
+              <span class="hint" id="deploy-host-hint">The address of your workspace, as in your browser's address bar.</span>
+            </div>
+            <div class="form-field">
+              <label for="deploy-token">Personal access token</label>
+              <input id="deploy-token" class="input" type="password" autocomplete="off" spellcheck="false" aria-describedby="deploy-token-hint" />
+              <span class="hint" id="deploy-token-hint">
+                Kept in this tab's memory only and sent only to the workspace
+                above: never saved, logged, or put in a link. It is cleared after
+                a deployment. Use a short-lived token.
+              </span>
+            </div>
+
+            <h3>Where</h3>
+            <div class="form-field">
+              <label for="deploy-folder">Workspace folder</label>
+              <input id="deploy-folder" class="input" type="text" placeholder="/Workspace/Users/you@example.com/sparkshift" autocomplete="off" spellcheck="false" aria-describedby="deploy-folder-hint" />
+              <span class="hint" id="deploy-folder-hint">Created if it does not exist. The notebooks keep their relative paths.</span>
+            </div>
+            <div class="form-row">
+              <div class="form-field">
+                <label for="deploy-read">Read tables from</label>
+                <input id="deploy-read" class="input" type="text" placeholder="catalog.schema" autocomplete="off" spellcheck="false" aria-describedby="deploy-read-hint" />
+                <span class="hint" id="deploy-read-hint">Empty: the current catalog and schema.</span>
+              </div>
+              <div class="form-field">
+                <label for="deploy-write">Write results to</label>
+                <input id="deploy-write" class="input" type="text" placeholder="catalog.schema" autocomplete="off" spellcheck="false" aria-describedby="deploy-write-hint" />
+                <span class="hint" id="deploy-write-hint">Tables of the same names are replaced. Empty: nothing is written.</span>
+              </div>
+            </div>
+            <div class="form-field">
+              <label for="deploy-job">Job name</label>
+              <input id="deploy-job" class="input" type="text" autocomplete="off" spellcheck="false" aria-describedby="deploy-job-hint" />
+              <span class="hint" id="deploy-job-hint">Empty: sparkshift and the folder's name. A job of the same name is updated.</span>
+            </div>
+            <label class="check">
+              <input id="deploy-overwrite" type="checkbox" />
+              Replace notebooks that already exist
+            </label>
+            <div class="form-actions">
+              <button id="deploy" class="button primary" type="submit" disabled>Deploy</button>
+              <span class="muted">Serverless compute, environment version 4</span>
+            </div>
+          </form>
+
+          <section class="card" aria-labelledby="deploy-plan-title">
+            <h3 id="deploy-plan-title">What will be deployed</h3>
+            <p id="deploy-note" class="muted"></p>
+            <ol id="deploy-plan" class="plan"></ol>
+            <div id="deploy-next" class="next" hidden>
+              <p><b>Deployed.</b> To create the job:</p>
+              <ol>
+                <li>Open <a id="deploy-link" href="#" target="_blank" rel="noopener noreferrer">Create job</a> in your workspace.</li>
+                <li>Click <b>Run all</b>. It creates the job <b id="deploy-job-name"></b>, or updates the one of that name.</li>
+                <li>Find the job under <b>Jobs &amp; Pipelines</b> and run it, or give it a schedule.</li>
+              </ol>
+            </div>
+          </section>
         </div>
 
         <div class="statusbar" id="statusbar" data-state="busy">

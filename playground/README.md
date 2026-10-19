@@ -48,6 +48,34 @@ deadline as a single file. A file that reaches the deadline is reported, Python
 reloads, and the next file converts; **Cancel conversion** stops the whole
 batch. The demo converts at most **200 files** at a time.
 
+## Deploying to Databricks
+
+The **Deploy** tab imports a converted folder into a Databricks workspace:
+each file as a notebook, written with the read and write locations of the
+form (as `sparkshift upload --catalog --schema --output-catalog
+--output-schema` would), and a **Create job** notebook. Run that notebook
+once in the workspace (**Run all**): it creates a job that runs the notebooks
+in order on serverless compute, or updates the job of the same name. The
+page cannot create the job itself, because Databricks does not let web pages
+from other sites call its Jobs API; the workspace import API is allowed. See
+[ADR 0012](../docs/adr/0012-create-jobs-from-one-description.md).
+
+- **The token** is read from its field when you deploy, sent only in the
+  `Authorization` header of requests to the workspace you typed, and the
+  field is cleared after a deployment. It is never stored, logged, or put in
+  a link, and requests carry no cookies or referrer. Use a short-lived
+  personal access token.
+- **Only Databricks workspaces** can be reached: the URL must be a workspace
+  address on `cloud.databricks.com`, `azuredatabricks.net`, or
+  `gcp.databricks.com`, and the page's Content-Security-Policy allows
+  connections to those hosts only (besides this site and Pyodide's CDN).
+- **A job needs every file**: if any file of the folder does not convert,
+  nothing is deployed, as with `upload --job`.
+- Python writes every notebook before anything is sent; then the folders are
+  created and the notebooks imported one by one, and the first error stops
+  the deployment with an explanation. An existing notebook is replaced only
+  when **Replace notebooks that already exist** is ticked.
+
 ## Warnings, errors and input limits
 
 Successful conversions show the same warnings as the Python API alongside the
@@ -90,6 +118,7 @@ revision so late replies cannot replace the current query's output. See
 | `app.js` | Owns UI state, renders results and handles cancellation/recovery |
 | `highlight.js` | Highlights code and numbers its lines without changing its text |
 | `files.js` | Collects chosen or dropped files and reads them as the command line does |
+| `deploy.js` | Checks workspace URLs and calls the workspace API with the visitor's token |
 | `worker-client.js` | Matches request IDs, bounds loading/conversion time, and terminates workers |
 | `worker.js` | Loads Pyodide and the wheels and invokes the Python bridge off the UI thread |
 | `bridge.py` | Runs inside Pyodide: converts SQL and returns JSON with the code or the issues; plans folders and packs their zip |
@@ -125,7 +154,10 @@ Pages after CI passes on `main`, from the exact commit CI tested.
   must be remembered. A chosen folder must give a zip identical to what the
   command line writes, including files with Windows line endings or that are
   not UTF-8; colliding outputs, dropped folders, a file past the deadline and
-  cancelling a folder are covered too. The page
+  cancelling a folder are covered too. Deploying is tested against a fake
+  workspace: every request, notebook and header is checked, as are refused
+  tokens, existing notebooks, unreachable or non-Databricks hosts, and that
+  the page may connect to no other site. The page
   must contact no other sites, fit a phone screen, and pass an axe-core
   accessibility audit (WCAG 2.1 AA) in light and dark mode, with and without
   warnings. Fault injection covers Python failures and malformed JSON; tests

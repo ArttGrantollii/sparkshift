@@ -2,6 +2,9 @@
 import { ConversionWorker, STARTUP_TIMEOUT_MS, CONVERSION_TIMEOUT_MS } from "./worker-client.js";
 import { highlightLines, lineCount } from "./highlight.js";
 import { filesFromDrop, filesFromInput, readSource } from "./files.js";
+import {
+  DeployError, base64, catalogAndSchema, isWorkspaceFolder, post, workspaceOrigin,
+} from "./deploy.js";
 
 const DIALECT_NAMES = {
   "": "Generic SQL",
@@ -70,6 +73,27 @@ const elements = Object.fromEntries(
     "file-code",
     "file-warnings",
     "file-errors",
+    "tab-deploy",
+    "view-deploy",
+    "convert-controls",
+    "deploy-form",
+    "deploy-host",
+    "deploy-host-hint",
+    "deploy-token",
+    "deploy-folder",
+    "deploy-folder-hint",
+    "deploy-read",
+    "deploy-read-hint",
+    "deploy-write",
+    "deploy-write-hint",
+    "deploy-job",
+    "deploy-overwrite",
+    "deploy",
+    "deploy-note",
+    "deploy-plan",
+    "deploy-next",
+    "deploy-link",
+    "deploy-job-name",
   ].map((id) => [id, document.getElementById(id)]),
 );
 
@@ -83,7 +107,9 @@ let maxSourceBytes = null;
 let notebook = false;
 let mode = "file";
 // The last status of each view, shown again when the visitor returns to it.
-const savedStatus = { file: null, folder: null };
+const savedStatus = { file: null, folder: null, deploy: null };
+// True while notebooks are being sent to a workspace.
+let deploying = false;
 
 // The folder view: the files chosen, the plan for converting them (from
 // Python, with the command line's rules), one result per planned file, and
@@ -122,6 +148,7 @@ function updateControls() {
   elements["choose-folder"].disabled = !ready || working();
   elements["choose-files"].disabled = !ready || working();
   elements["download-zip"].disabled = working() || archive === null;
+  renderDeploy();
 }
 
 async function start(first = false, recoveryStatus = "Ready to convert again.") {
@@ -565,6 +592,9 @@ function clearFolder() {
   results = [];
   selected = -1;
   archive = null;
+  // Another folder: the last deployment's steps no longer apply.
+  stepStates = [];
+  elements["deploy-next"].hidden = true;
   elements.files.replaceChildren();
   elements["folder-errors"].replaceChildren();
   elements["folder-errors"].hidden = true;
@@ -745,14 +775,16 @@ function showSelected() {
 
 // --- Views, output kind and theme -------------------------------------------
 
-const MODES = ["file", "folder"];
+const MODES = ["file", "folder", "deploy"];
 const FIRST_STATUS = {
   file: "Ready to convert.",
   folder: "Choose a folder or files to convert them all at once.",
+  deploy: "Convert a folder, then deploy its notebooks to a Databricks workspace.",
 };
 
 function chooseMode(next) {
-  if (mode === next) return;
+  // A deployment in progress keeps its view.
+  if (mode === next || deploying) return;
   const previous = mode;
   mode = next;
   if (working()) {
@@ -766,9 +798,14 @@ function chooseMode(next) {
     elements[`view-${name}`].hidden = name !== next;
   }
   const folder = next === "folder";
+  const deploy = next === "deploy";
+  // Deploying needs no conversion controls: it uses the folder's results.
+  elements["convert-controls"].hidden = deploy;
+  elements.convert.hidden = deploy;
   elements["example-field"].hidden = folder;
-  elements.download.hidden = folder;
-  elements.share.hidden = folder;
+  elements.copy.hidden = deploy;
+  elements.download.hidden = folder || deploy;
+  elements.share.hidden = folder || deploy;
   elements["download-zip"].hidden = !folder;
   elements.copy.disabled = folder ? results[selected]?.code === undefined : elements.output.hidden;
   updateControls();
@@ -829,6 +866,218 @@ function toggleTheme() {
     // Storage can be blocked; the choice then lasts until the page closes.
   }
   showThemeButton();
+}
+
+// --- Deploying ----------------------------------------------------------------
+//
+// The folder's notebooks, with the form's widget values, and a Create job
+// notebook are imported into a workspace with the visitor's token. Python
+// writes them all first, so a notebook that no longer converts stops the
+// deployment before anything is sent. The token is read from its field when
+// needed, sent only to the workspace typed, and the field is cleared after a
+// deployment.
+
+const DEFAULT_HINTS = {};
+// Each step's state and message in the last deployment, shown until the
+// form or the folder changes.
+let stepStates = [];
+
+// The folder's files to deploy, or why there are none: a job needs every
+// file, as with sparkshift upload --job.
+function deployment() {
+  if (!plan) {
+    return { reason: "Convert a folder first, in the Folder tab: its notebooks are what is deployed." };
+  }
+  if (batch || results.some(({ state }) => state === "pending" || state === "busy")) {
+    return { reason: "Convert the folder first: its results are not up to date." };
+  }
+  const failed = plan.files.filter((_, position) => results[position].state === "bad");
+  if (failed.length) {
+    const names = failed.map(({ name }) => name).join(", ");
+    return {
+      reason: `${fileCount(failed.length)} of the folder ${failed.length === 1 ? "does" : "do"} ` +
+        `not convert (${names}). A job needs every file: fix ${failed.length === 1 ? "it" : "them"}, ` +
+        "or choose only the files that convert.",
+    };
+  }
+  return { files: plan.files.map((entry, position) => ({ entry, result: results[position] })) };
+}
+
+// The form's values, and a message for each field that is wrong.
+function deployForm() {
+  const host = elements["deploy-host"].value.trim();
+  const folder = elements["deploy-folder"].value.trim().replace(/(.)\/+$/, "$1");
+  const read = catalogAndSchema(elements["deploy-read"].value);
+  const write = catalogAndSchema(elements["deploy-write"].value);
+  const problems = {
+    "deploy-host": host && !workspaceOrigin(host)
+      ? "Not a Databricks workspace URL, such as https://dbc-1234.cloud.databricks.com." : "",
+    "deploy-folder": folder && !isWorkspaceFolder(folder)
+      ? "Use an absolute path, such as /Workspace/Users/you@example.com/sparkshift." : "",
+    "deploy-read": read ? "" : "Use catalog.schema, or only a schema.",
+    "deploy-write": write ? "" : "Use catalog.schema, or only a schema.",
+  };
+  return {
+    origin: host ? workspaceOrigin(host) : null,
+    folder: folder && isWorkspaceFolder(folder) ? folder : null,
+    locations: [...(read ?? ["", ""]), ...(write ?? ["", ""])],
+    name: elements["deploy-job"].value,
+    overwrite: elements["deploy-overwrite"].checked,
+    problems,
+    valid: Object.values(problems).every((problem) => !problem),
+  };
+}
+
+function renderDeploy() {
+  if (deploying) return;
+  const { files, reason } = deployment();
+  const form = deployForm();
+  for (const [id, problem] of Object.entries(form.problems)) {
+    const hint = elements[`${id}-hint`];
+    DEFAULT_HINTS[id] ??= hint.textContent;
+    hint.textContent = problem || DEFAULT_HINTS[id];
+    hint.classList.toggle("error", Boolean(problem));
+    elements[id].setAttribute("aria-invalid", String(Boolean(problem)));
+  }
+  const warned = files?.filter(({ result }) => result.state === "warn").length ?? 0;
+  elements["deploy-note"].textContent = reason ?? (warned
+    ? `${fileCount(warned)} with warnings: review them in the Folder tab before running the job.`
+    : "");
+  elements["deploy-note"].hidden = !elements["deploy-note"].textContent;
+  const steps = files ? [
+    ["Check the workspace", form.folder ?? "the folder"],
+    ...files.map(({ entry }) => [`Import ${entry.name.replace(/\.(sql|sas)$/i, "")}`, entry.name]),
+    ["Import Create job", "creates or updates the job"],
+  ] : [];
+  elements["deploy-plan"].replaceChildren(...steps.map(([title, detail]) => planStep(title, detail)));
+  stepStates.forEach(([state, message], index) => markStep(index, state, message, false));
+  elements.deploy.textContent = files ? `Deploy ${files.length} notebook${files.length === 1 ? "" : "s"}` : "Deploy";
+  elements.deploy.disabled = !files || !form.valid || !form.origin || !form.folder ||
+    !elements["deploy-token"].value || !ready || working();
+}
+
+function planStep(title, detail) {
+  const item = document.createElement("li");
+  const state = document.createElement("span");
+  state.className = "step-state";
+  state.setAttribute("aria-hidden", "true");
+  const text = document.createElement("span");
+  const name = document.createElement("span");
+  name.className = "step-title";
+  name.textContent = title;
+  const more = document.createElement("span");
+  more.className = "step-detail";
+  more.textContent = detail;
+  // The state in words, for screen readers; the circle shows it.
+  const said = document.createElement("span");
+  said.className = "visually-hidden step-said";
+  text.append(name, " ", more, said);
+  item.append(state, text);
+  return item;
+}
+
+const STEP_SAID = { busy: " (in progress)", ok: " (done)", bad: " (failed)" };
+
+// ``remember``: keep the state, to show again when the plan is redrawn.
+function markStep(index, state, message, remember = true) {
+  if (remember) stepStates[index] = [state, message];
+  const item = elements["deploy-plan"].children[index];
+  if (!item) return;
+  item.dataset.state = state;
+  item.querySelector(".step-said").textContent = STEP_SAID[state];
+  if (message) item.querySelector(".step-detail").textContent = message;
+}
+
+async function deploy(event) {
+  event.preventDefault();
+  const { files } = deployment();
+  const form = deployForm();
+  const token = elements["deploy-token"].value;
+  if (!files || !form.valid || !form.origin || !form.folder || !token || !ready || working()) return;
+  deploying = true;
+  stepStates = [];
+  elements.deploy.disabled = true;
+  elements["deploy-next"].hidden = true;
+  updateControls();
+  for (const name of MODES) elements[`tab-${name}`].disabled = name !== "deploy";
+  const { origin, folder, locations } = form;
+  const paths = files.map(({ entry }) => `${folder}/${entry.output.replace(/\.py$/, "")}`);
+  let step = 0;
+  try {
+    setStatus("Preparing the notebooks…", "busy");
+    const sources = [];
+    for (const { entry, result } of files) {
+      const converted = await runtime.request("convert", {
+        sql: result.sql,
+        dialect: entry.dialect,
+        notebook: true,
+        source: entry.name.split("/").pop(),
+        locations,
+      }, CONVERSION_TIMEOUT_MS);
+      if (!converted.ok) throw new DeployError(`${entry.name} no longer converts: ${converted.error}`);
+      sources.push(converted.code);
+    }
+    const job = await runtime.request("job", {
+      name: form.name,
+      folder,
+      notebooks: paths,
+      locations,
+    }, CONVERSION_TIMEOUT_MS);
+    if (!job.ok) throw new DeployError(job.error);
+
+    const total = paths.length + 2;
+    const progress = () => setStatus(`Deploying: step ${step + 1} of ${total}…`, "busy");
+    progress();
+    markStep(step, "busy");
+    await post(origin, token, "/api/2.0/workspace/mkdirs", { path: folder });
+    markStep(step, "ok");
+    const folders = new Set([folder]);
+    const imports = [...paths.map((path, index) => [path, sources[index]]), [`${folder}/Create job`, job.notebook]];
+    for (const [path, source] of imports) {
+      step += 1;
+      progress();
+      markStep(step, "busy");
+      const parent = path.slice(0, path.lastIndexOf("/"));
+      if (!folders.has(parent)) {
+        await post(origin, token, "/api/2.0/workspace/mkdirs", { path: parent });
+        folders.add(parent);
+      }
+      try {
+        await post(origin, token, "/api/2.0/workspace/import", {
+          path,
+          format: "SOURCE",
+          language: "PYTHON",
+          content: base64(source),
+          overwrite: form.overwrite,
+        });
+      } catch (error) {
+        if (error.code === "RESOURCE_ALREADY_EXISTS") {
+          throw new DeployError(`A notebook already exists at ${path}. Tick “Replace notebooks ` +
+            "that already exist” to replace it.");
+        }
+        throw error;
+      }
+      markStep(step, "ok");
+    }
+    elements["deploy-token"].value = "";
+    elements["deploy-link"].href = `${origin}/#workspace${encodeURI(`${folder}/Create job`)}`;
+    elements["deploy-job-name"].textContent = job.name;
+    elements["deploy-next"].hidden = false;
+    setStatus(`Deployed ${fileCount(paths.length).replace("file", "notebook")} and Create job to ${origin}.`, "ok");
+  } catch (error) {
+    const message = error instanceof DeployError
+      ? error.message
+      : "Preparing the notebooks failed unexpectedly. Try again.";
+    markStep(step, "bad", message);
+    setStatus(`Deployment stopped: ${message}`, "bad");
+    if (!(error instanceof DeployError) && runtime?.closed) {
+      void start(false, "Deployment stopped. Ready to try again.");
+    }
+  } finally {
+    deploying = false;
+    for (const name of MODES) elements[`tab-${name}`].disabled = false;
+    updateControls();
+  }
 }
 
 function save(blob, name) {
@@ -899,6 +1148,14 @@ for (const name of MODES) {
     elements[`tab-${target}`].focus();
   });
 }
+
+elements["deploy-form"].addEventListener("submit", deploy);
+elements["deploy-form"].addEventListener("input", () => {
+  // A changed form is another deployment: the last one's steps are history.
+  stepStates = [];
+  elements["deploy-next"].hidden = true;
+  renderDeploy();
+});
 
 elements["choose-folder"].addEventListener("click", () => elements["pick-folder"].click());
 elements["choose-files"].addEventListener("click", () => elements["pick-files"].click());

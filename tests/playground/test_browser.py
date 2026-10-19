@@ -671,6 +671,339 @@ def test_views_keep_their_own_status_and_tabs_follow_the_keyboard(
     assert page.text_content("#status") == folder_status
 
 
+# --- Deploying ---------------------------------------------------------------------
+
+MOCK_ORIGIN = "https://dbc-mock.cloud.databricks.com"
+MOCK_TOKEN = "dapi-mock-0123456789abcdef"
+DEPLOY_FOLDER = "/Workspace/Users/me@example.com/claims"
+DEPLOY_SOURCES = {
+    "load.sql": "SELECT order_id, amount FROM orders WHERE amount > 100\n",
+    "legacy/report.sas": "data big; set orders; where amount > 100; run;\n",
+}
+
+
+class FakeDatabricks:
+    """A workspace's REST API, as a route: records each request and answers
+    with the CORS headers Databricks sends; ``answers`` overrides a path."""
+
+    def __init__(self) -> None:
+        self.requests: list[dict] = []
+        self.answers: dict[str, tuple[int, dict]] = {}
+
+    def __call__(self, route: Any) -> None:
+        cors = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "authorization, content-type",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        }
+        request = route.request
+        if request.method == "OPTIONS":
+            route.fulfill(status=204, headers=cors)
+            return
+        path = urlsplit(request.url).path
+        self.requests.append(
+            {
+                "path": path,
+                "authorization": request.headers.get("authorization"),
+                "body": request.post_data_json,
+            }
+        )
+        status, answer = self.answers.get(path, (200, {}))
+        route.fulfill(status=status, headers=cors, json=answer)
+
+
+@pytest.fixture(scope="module")
+def deploy_page(
+    browser: Any, site_url: str, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[tuple[Any, FakeDatabricks]]:
+    """A page with a converted folder, in its Deploy view, and a fake
+    workspace at MOCK_ORIGIN."""
+    root = tmp_path_factory.mktemp("deploy") / "claims"
+    for name, text in DEPLOY_SOURCES.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(text, encoding="utf-8")
+    workspace = FakeDatabricks()
+    page = open_page(browser, site_url)
+    page.context.route(f"{MOCK_ORIGIN}/**", workspace)
+    page.click("#tab-folder")
+    choose(page, str(root))
+    page.click("#tab-deploy")
+    yield page, workspace
+    page.context.close()
+
+
+def fill_deploy_form(page: Any, **values: str) -> None:
+    fields = {
+        "host": MOCK_ORIGIN,
+        "token": MOCK_TOKEN,
+        "folder": DEPLOY_FOLDER,
+        "read": "workspace.raw",
+        "write": "workspace.claims",
+        "job": "",
+    }
+    fields.update(values)
+    for name, value in fields.items():
+        page.fill(f"#deploy-{name}", value)
+
+
+def deploy_and_wait(page: Any) -> None:
+    page.click("#deploy")
+    page.wait_for_selector(
+        "#statusbar:not([data-state='busy'])", timeout=READY_TIMEOUT_MS
+    )
+
+
+def imported(workspace: FakeDatabricks) -> dict[str, tuple[str, bool]]:
+    import base64
+
+    return {
+        request["body"]["path"]: (
+            base64.b64decode(request["body"]["content"]).decode("utf-8"),
+            request["body"]["overwrite"],
+        )
+        for request in workspace.requests
+        if request["path"] == "/api/2.0/workspace/import"
+    }
+
+
+def test_deploying_imports_every_notebook_and_the_create_job_notebook(
+    deploy_page: tuple[Any, FakeDatabricks],
+) -> None:
+    from sparkshift.jobs import create_job_notebook, job_settings
+
+    page, workspace = deploy_page
+    workspace.requests.clear()
+    workspace.answers.clear()
+    fill_deploy_form(page)
+    assert page.text_content("#deploy") == "Deploy 2 notebooks"
+
+    deploy_and_wait(page)
+
+    assert page.text_content("#status") == (
+        f"Deployed 2 notebooks and Create job to {MOCK_ORIGIN}."
+    )
+    report = f"{DEPLOY_FOLDER}/legacy/report"
+    load = f"{DEPLOY_FOLDER}/load"
+    assert [(r["path"], r["body"]["path"]) for r in workspace.requests] == [
+        ("/api/2.0/workspace/mkdirs", DEPLOY_FOLDER),
+        ("/api/2.0/workspace/mkdirs", f"{DEPLOY_FOLDER}/legacy"),
+        ("/api/2.0/workspace/import", report),
+        ("/api/2.0/workspace/import", load),
+        ("/api/2.0/workspace/import", f"{DEPLOY_FOLDER}/Create job"),
+    ]
+    # The token goes in the header of each request to the workspace, and
+    # nowhere else.
+    assert {r["authorization"] for r in workspace.requests} == {f"Bearer {MOCK_TOKEN}"}
+    locations = {
+        "catalog": "workspace",
+        "schema": "raw",
+        "output_catalog": "workspace",
+        "output_schema": "claims",
+    }
+    expected = {
+        report: sparkshift.to_notebook(
+            sparkshift.convert(DEPLOY_SOURCES["legacy/report.sas"], dialect="sas"),
+            source="report.sas",
+            dialect="sas",
+            **locations,
+        ),
+        load: sparkshift.to_notebook(
+            sparkshift.convert(DEPLOY_SOURCES["load.sql"]),
+            source="load.sql",
+            **locations,
+        ),
+        f"{DEPLOY_FOLDER}/Create job": create_job_notebook(
+            job_settings(
+                "sparkshift claims", DEPLOY_FOLDER, [report, load], **locations
+            )
+        ),
+    }
+    assert imported(workspace) == {
+        path: (source, False) for path, source in expected.items()
+    }
+    # After a deployment the token is forgotten, and it was never stored.
+    assert page.input_value("#deploy-token") == ""
+    stored = page.evaluate(
+        "() => JSON.stringify([{...localStorage}, {...sessionStorage}, location.href])"
+    )
+    assert MOCK_TOKEN not in stored
+    assert page.is_visible("#deploy-next")
+    # Every step shows that it is done, in words for screen readers too.
+    steps = page.locator("#deploy-plan li")
+    assert steps.count() == 4
+    for index in range(4):
+        assert steps.nth(index).get_attribute("data-state") == "ok"
+        assert steps.nth(index).text_content().endswith(" (done)")
+    assert page.text_content("#deploy-job-name") == "sparkshift claims"
+    assert page.get_attribute("#deploy-link", "href") == (
+        f"{MOCK_ORIGIN}/#workspace{DEPLOY_FOLDER}/Create%20job"
+    )
+
+
+def test_a_refused_token_stops_before_any_import(
+    deploy_page: tuple[Any, FakeDatabricks],
+) -> None:
+    page, workspace = deploy_page
+    workspace.requests.clear()
+    workspace.answers = {"/api/2.0/workspace/mkdirs": (403, {"message": "denied"})}
+    fill_deploy_form(page)
+
+    deploy_and_wait(page)
+
+    assert "refused the token" in page.text_content("#status")
+    assert page.get_attribute("#statusbar", "data-state") == "bad"
+    first = page.locator("#deploy-plan li").first
+    assert first.get_attribute("data-state") == "bad"
+    assert "refused the token" in first.text_content()
+    assert [r["path"] for r in workspace.requests] == ["/api/2.0/workspace/mkdirs"]
+    assert MOCK_TOKEN not in page.text_content("body")
+
+
+def test_an_existing_notebook_is_replaced_only_when_asked(
+    deploy_page: tuple[Any, FakeDatabricks],
+) -> None:
+    page, workspace = deploy_page
+    workspace.requests.clear()
+    workspace.answers = {
+        "/api/2.0/workspace/import": (
+            400,
+            {"error_code": "RESOURCE_ALREADY_EXISTS", "message": "exists"},
+        )
+    }
+    fill_deploy_form(page)
+
+    deploy_and_wait(page)
+
+    assert "Replace notebooks that already exist" in page.text_content("#status")
+    assert len(imported(workspace)) == 1
+    workspace.answers.clear()
+    workspace.requests.clear()
+    page.check("#deploy-overwrite")
+    fill_deploy_form(page)
+
+    deploy_and_wait(page)
+
+    assert page.text_content("#status").startswith("Deployed 2 notebooks")
+    assert {overwrite for _, overwrite in imported(workspace).values()} == {True}
+    page.uncheck("#deploy-overwrite")
+
+
+@pytest.mark.parametrize(
+    ("host", "valid"),
+    [
+        ("https://example.com", False),
+        ("http://dbc-mock.cloud.databricks.com", False),
+        ("https://dbc-mock.cloud.databricks.com.evil.com", False),
+        ("https://dbc-mock.cloud.databricks.com:8443", False),
+        ("https://dbc-mock.cloud.databricks.com/?o=1234#workspace", True),
+        ("https://adb-1.2.azuredatabricks.net", True),
+        ("https://1234.5.gcp.databricks.com/", True),
+    ],
+)
+def test_only_databricks_workspaces_are_accepted(
+    deploy_page: tuple[Any, FakeDatabricks], host: str, valid: bool
+) -> None:
+    page, _ = deploy_page
+    fill_deploy_form(page, host=host)
+
+    assert page.is_enabled("#deploy") is valid
+    assert (page.get_attribute("#deploy-host", "aria-invalid") == "true") is not valid
+
+
+def test_the_page_may_connect_to_no_other_site(
+    deploy_page: tuple[Any, FakeDatabricks],
+) -> None:
+    page, _ = deploy_page
+    # The other site would answer, CORS included: only the page's security
+    # policy can stop the request, before it leaves the browser.
+    reached: list[str] = []
+
+    def other_site(route: Any) -> None:
+        reached.append(route.request.url)
+        route.fulfill(headers={"Access-Control-Allow-Origin": "*"}, body="ok")
+
+    page.context.route("https://example.com/**", other_site)
+    try:
+        outcome = page.evaluate(
+            """() => new Promise((resolve) => {
+                let violation = null;
+                document.addEventListener("securitypolicyviolation", (event) => {
+                    violation = event.effectiveDirective;
+                }, { once: true });
+                fetch("https://example.com/").then(
+                    () => resolve("sent"),
+                    () => setTimeout(() => resolve(`blocked by ${violation}`), 50),
+                );
+            })"""
+        )
+    finally:
+        page.context.unroute("https://example.com/**")
+
+    assert outcome == "blocked by connect-src"
+    assert reached == []
+
+
+def test_an_unreachable_workspace_is_explained(
+    deploy_page: tuple[Any, FakeDatabricks],
+) -> None:
+    page, _ = deploy_page
+    page.context.route(f"{MOCK_ORIGIN}/**", lambda route: route.abort())
+    try:
+        fill_deploy_form(page)
+        deploy_and_wait(page)
+        assert f"Could not reach {MOCK_ORIGIN}" in page.text_content("#status")
+    finally:
+        page.context.unroute(f"{MOCK_ORIGIN}/**")
+        page.context.route(f"{MOCK_ORIGIN}/**", deploy_page[1])
+
+
+def test_deploying_needs_every_file_of_the_folder(folder_view: Any) -> None:
+    page = folder_view
+    choose(page, str(COVERAGE))
+
+    page.click("#tab-deploy")
+    fill_deploy_form(page)
+
+    assert "do not convert" in page.text_content("#deploy-note")
+    assert "A job needs every file" in page.text_content("#deploy-note")
+    assert page.is_disabled("#deploy")
+    assert page.locator("#deploy-plan li").count() == 0
+
+
+@pytest.mark.parametrize("color_scheme", ["light", "dark"])
+def test_deploy_view_has_no_accessibility_violations(
+    browser: Any, site_url: str, color_scheme: str, tmp_path: Path
+) -> None:
+    from axe_playwright_python.sync_playwright import Axe
+
+    (tmp_path / "claims").mkdir()
+    (tmp_path / "claims" / "load.sql").write_text("SELECT a FROM t", encoding="utf-8")
+    page = open_page(browser, site_url, bypass_csp=True, color_scheme=color_scheme)
+    page.click("#tab-folder")
+    choose(page, str(tmp_path / "claims"))
+    page.click("#tab-deploy")
+    fill_deploy_form(page, host="https://not-databricks.example.com")
+    assert page.locator("#deploy-plan li").count() == 3
+
+    results = Axe().run(
+        page, options={"runOnly": ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"]}
+    )
+
+    assert results.violations_count == 0, results.generate_report()
+    page.context.close()
+
+
+def test_deploy_view_fits_a_phone_screen(browser: Any, site_url: str) -> None:
+    page = open_page(browser, site_url, viewport={"width": 375, "height": 812})
+    page.click("#tab-deploy")
+    fill_deploy_form(page)
+
+    scroll_width = page.evaluate("document.documentElement.scrollWidth")
+
+    assert scroll_width <= 375
+    page.context.close()
+
+
 # --- The page itself ------------------------------------------------------------
 
 

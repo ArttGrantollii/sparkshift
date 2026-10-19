@@ -22,6 +22,12 @@ Security fixes are made for the latest release.
   [online playground](https://arttgrantollii.github.io/sparkshift/) runs
   SparkShift in your browser; your SQL is not sent to any server. A shared
   link keeps the query after the `#`, which browsers do not send to servers.
+  Only when you deploy does the page send anything: the converted notebooks,
+  to the Databricks workspace you name, with the token you type. The token
+  stays in the page's memory, goes only to that workspace, is cleared after a
+  deployment, and is never stored or put in a link; the page's
+  Content-Security-Policy lets it connect to Databricks workspaces and no
+  other site.
 - **No telemetry.** SparkShift collects and sends no usage data.
 - **Databricks credentials stay with the Databricks SDK.** `sparkshift
   upload` reads credentials only from the SDK's own sources: environment

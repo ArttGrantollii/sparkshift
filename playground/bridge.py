@@ -6,7 +6,9 @@ prints, so the playground and the CLI always agree.
 
 For many files, ``plan_for_page`` chooses the files and their output paths
 with the command line's rules, the page converts them one at a time, and
-``zip_for_page`` packs the results.
+``zip_for_page`` packs the results. To deploy them, ``notebook_for_page``
+writes each notebook with its widgets' values and ``job_for_page`` the
+notebook that creates their job, as ``sparkshift upload --job`` would.
 """
 
 import base64
@@ -18,6 +20,7 @@ from pathlib import PurePosixPath
 import sparkshift
 from sparkshift.batch import colliding, dialect_of, source_suffixes
 from sparkshift.dialects import DIALECT_CHOICES
+from sparkshift.jobs import create_job_notebook, default_job_name, job_settings
 
 # Playground policies, not limits imposed by the library or CLI.
 MAX_SOURCE_BYTES = 50_000
@@ -38,11 +41,74 @@ def convert_for_page(sql: str, dialect: str) -> str:
     return _convert(sql, dialect, notebook=False)
 
 
-def notebook_for_page(sql: str, dialect: str, source: str | None = None) -> str:
+def notebook_for_page(
+    sql: str,
+    dialect: str,
+    source: str | None = None,
+    catalog: str = "",
+    schema: str = "",
+    output_catalog: str = "",
+    output_schema: str = "",
+) -> str:
     """As ``convert_for_page``, with the code written as a Databricks
     notebook, exactly as ``sparkshift convert --notebook`` writes it;
-    ``source`` is the name of the file it came from, for the title."""
-    return _convert(sql, dialect, notebook=True, source=source)
+    ``source`` is the name of the file it came from, for the title, and the
+    other values are the initial values of its widgets."""
+    locations = {
+        "catalog": catalog,
+        "schema": schema,
+        "output_catalog": output_catalog,
+        "output_schema": output_schema,
+    }
+    return _convert(sql, dialect, notebook=True, source=source, locations=locations)
+
+
+def job_for_page(
+    name: str,
+    folder: str,
+    notebooks: str,
+    catalog: str,
+    schema: str,
+    output_catalog: str,
+    output_schema: str,
+) -> str:
+    """The notebook that creates the job running ``notebooks`` (a JSON list
+    of workspace paths under ``folder``) in order, as ``sparkshift upload
+    --job`` would create it; ``name`` empty for the default name. Return JSON
+    ``{"ok": true, "name": ..., "notebook": ...}``, or ``{"ok": false,
+    "error": ..., "issues": []}``."""
+    paths = json.loads(notebooks)
+    inside = folder + "/"
+    if not (
+        folder.startswith("/")
+        and _is_relative_path(folder[1:])
+        and all(
+            isinstance(path, str)
+            and path.startswith(inside)
+            and _is_relative_path(path[len(inside) :])
+            for path in paths
+        )
+    ):
+        return _failure(
+            "The workspace folder must be an absolute path, such as "
+            "/Workspace/Users/you@example.com/sparkshift."
+        )
+    settings = job_settings(
+        name.strip() or default_job_name(folder),
+        folder,
+        paths,
+        catalog=catalog,
+        schema=schema,
+        output_catalog=output_catalog,
+        output_schema=output_schema,
+    )
+    return json.dumps(
+        {
+            "ok": True,
+            "name": settings["name"],
+            "notebook": create_job_notebook(settings),
+        }
+    )
 
 
 def plan_for_page(paths: str, dialect: str, notebook: bool) -> str:
@@ -146,7 +212,12 @@ def _failure(error: str, **details: object) -> str:
 
 
 def _convert(
-    sql: str, dialect: str, *, notebook: bool, source: str | None = None
+    sql: str,
+    dialect: str,
+    *,
+    notebook: bool,
+    source: str | None = None,
+    locations: dict[str, str] | None = None,
 ) -> str:
     if len(sql.encode("utf-8")) > MAX_SOURCE_BYTES:
         return json.dumps(
@@ -178,7 +249,9 @@ def _convert(
             }
         )
     code = (
-        sparkshift.to_notebook(result, source=source, dialect=dialect or None)
+        sparkshift.to_notebook(
+            result, source=source, dialect=dialect or None, **(locations or {})
+        )
         if notebook
         else result.code
     )

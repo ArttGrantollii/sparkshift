@@ -745,6 +745,200 @@ kbd {
   gap: 8px;
 }
 
+/* Deploy view: the form beside what will be deployed */
+
+.toolbar-group {
+  display: contents;
+}
+
+.deploy {
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+  align-items: start;
+}
+
+.card {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.card-head {
+  display: grid;
+  gap: 4px;
+}
+
+.card h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.card h3 {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.muted {
+  margin: 0;
+  color: var(--muted);
+}
+
+.form-field {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+}
+
+.form-field label {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.hint.error {
+  color: var(--bad);
+}
+
+.input {
+  width: 100%;
+  padding: 9px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--bg);
+  font: 12.5px var(--font-code);
+}
+
+.input:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.input[aria-invalid="true"] {
+  border-color: var(--bad);
+}
+
+.form-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  font-size: 12.5px;
+}
+
+.plan {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.plan li {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.plan li:last-child {
+  border-bottom: 0;
+}
+
+.step-detail {
+  color: var(--muted);
+  font: 12px var(--font-code);
+}
+
+.plan li[data-state="bad"] .step-detail {
+  color: var(--bad);
+  font-family: var(--font-ui);
+}
+
+.step-state {
+  width: 16px;
+  height: 16px;
+  border: 1.5px solid var(--line-strong);
+  border-radius: 50%;
+}
+
+.plan li[data-state="ok"] .step-state {
+  border-color: var(--ok);
+  background: var(--ok);
+}
+
+.plan li[data-state="busy"] .step-state {
+  border-color: var(--accent);
+  border-top-color: transparent;
+  animation: spin 0.8s linear infinite;
+}
+
+.plan li[data-state="bad"] .step-state {
+  border-color: var(--bad);
+  background: var(--bad);
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.next {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--raised);
+}
+
+.next p {
+  margin: 0;
+}
+
+.next ol {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 20px;
+}
+
+.next a {
+  color: var(--fg);
+  font-weight: 500;
+}
+
 /* Status bar */
 
 .statusbar {
@@ -821,7 +1015,9 @@ footer code,
 
 @media (max-width: 900px) {
   .panes,
-  .folder {
+  .folder,
+  .deploy,
+  .form-row {
     grid-template-columns: minmax(0, 1fr);
   }
 

@@ -51,6 +51,10 @@ page cannot create a job; anything in the workspace can.
   empty parameter defaults is accepted.
 - The playground still needs a click in the workspace to create the job; it
   cannot do it alone without a server, which it does not have
-  ([ADR 0004](0004-run-the-playground-in-the-browser.md)).
+  ([ADR 0004](0004-run-the-playground-in-the-browser.md)). Its **Deploy**
+  tab imports the notebooks and the Create job notebook with the workspace
+  import API, which Databricks allows from other sites, using a token the
+  visitor types; the token stays in the page's memory and the page may
+  connect to Databricks workspaces and no other site.
 - Tasks in a chain run one after another even when they are independent,
   as SQL queries usually are: slower, but never in the wrong order.
