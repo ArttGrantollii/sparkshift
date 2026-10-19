@@ -6,10 +6,12 @@ import pytest
 
 from sparkshift.errors import SASParseError
 from sparkshift.sas_parser import (
+    DatalinesStatement,
     Dataset,
     DataStep,
     DropOption,
     DropStatement,
+    FormatStatement,
     KeepOption,
     KeepStatement,
     Program,
@@ -99,10 +101,10 @@ def test_steps_end_at_run_the_next_step_or_the_end(source: str) -> None:
 
 
 def test_a_data_step_ends_at_a_proc_step() -> None:
-    program = parse_sas("data a; set b; proc print data=a; run;")
+    program = parse_sas("data a; set b; proc contents data=a; run;")
 
     assert len(program.steps[0].statements) == 1
-    assert issues(program) == ["PROC PRINT step"]
+    assert issues(program) == ["PROC CONTENTS step"]
 
 
 def test_proc_steps_are_reported_and_skipped() -> None:
@@ -117,9 +119,9 @@ def test_proc_steps_are_reported_and_skipped() -> None:
 
 
 def test_a_proc_step_may_end_at_the_next_step_or_the_end() -> None:
-    program = parse_sas("proc print data=a; data c; set b; proc print data=c;")
+    program = parse_sas("proc contents data=a; data c; set b; proc contents data=c;")
 
-    assert issues(program) == ["PROC PRINT step", "PROC PRINT step"]
+    assert issues(program) == ["PROC CONTENTS step", "PROC CONTENTS step"]
     assert len(program.steps) == 1
 
 
@@ -1035,3 +1037,89 @@ def test_invalid_proc_sql(query: str, message: str) -> None:
 
 def test_a_qualified_name_needs_no_spaces() -> None:
     assert where("a.b = 1")[0] == binary("=", ("Qualified", "a", "b"), number(1))
+
+
+# --- FORMAT, data lines, and PROC PRINT ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("statement", "names"),
+    [
+        ("format d date9.", ("d",)),
+        (
+            "format a b date9. c $20. e 8.2 f comma10.2 g",
+            ("a", "b", "c", "e", "f", "g"),
+        ),
+        ("format x best12. y $char20. z yymmdd10.", ("x", "y", "z")),
+        ("format d", ("d",)),  # removes d's format
+        ("FORMAT D DATE.", ("D",)),
+    ],
+)
+def test_a_format_statement_names_its_variables(statement: str, names: tuple) -> None:
+    program = parse_sas(f"data a; set b; {statement}; run;")
+
+    assert program.issues == ()
+    assert program.steps[0].statements[1] == FormatStatement(
+        names, program.steps[0].statements[1].span
+    )
+
+
+def test_a_variable_list_in_a_format_statement_is_reported() -> None:
+    program = parse_sas("data a; set b; format x1-x3 8.2; run;")
+
+    assert issues(program) == ["variable list in a FORMAT statement"]
+
+
+def test_data_lines_are_data_not_statements() -> None:
+    program = parse_sas(
+        "data a;\n  input x y;\n  datalines;\n101 John USA\n102 Sarah UK\n;\nrun;"
+    )
+
+    statement = program.steps[0].statements[-1]
+    assert isinstance(statement, DatalinesStatement)
+    assert statement.text == "101 John USA\n102 Sarah UK\n"
+    assert statement.line == 4
+    # The rows are not reported as statements (101 statement, ...).
+    assert issues(program) == ["INPUT statement"]
+
+
+def test_data_lines_outside_a_data_step_are_one_issue() -> None:
+    program = parse_sas("datalines;\n101 John\n;\ndata a; set b; run;")
+
+    assert issues(program) == ["DATALINES statement"]
+
+
+def test_proc_print() -> None:
+    program = parse_sas(
+        "proc print data=sales.a(keep=x y) noobs label obs='Row' width=full; "
+        "var y x; var z; where x > 1; run;"
+    )
+
+    assert program.issues == ()
+    assert shape(program.steps) == (
+        (
+            "ProcPrint",
+            ("Dataset", "sales", "a", (("KeepOption", ("x", "y")),)),
+            ("y", "x", "z"),
+            (("WhereStatement", binary(">", name("x"), number(1))),),
+        ),
+    )
+
+
+def test_proc_print_without_data() -> None:
+    program = parse_sas("proc print; run;")
+
+    assert shape(program.steps) == (("ProcPrint", None, (), ()),)
+
+
+def test_proc_print_options_and_statements_that_change_rows_are_reported() -> None:
+    program = parse_sas(
+        "proc print data=a sumlabel style=minimal; id x; by y; sum z; run;"
+    )
+
+    assert issues(program) == [
+        "PROC PRINT option STYLE=",
+        "ID statement in PROC PRINT",
+        "BY statement in PROC PRINT",
+        "SUM statement in PROC PRINT",
+    ]

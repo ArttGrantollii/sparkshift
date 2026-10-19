@@ -1155,7 +1155,7 @@ def test_every_text_argument_is_reported() -> None:
 
 def test_a_date_function_says_dates_come_later() -> None:
     with pytest.raises(UnsupportedSQLError) as caught:
-        translate("data a; set t; y = year(d); run;")
+        translate("data a; set t; y = intck('month', d, e); run;")
 
     [issue] = caught.value.issues
     assert issue.hint == "Date functions are not supported yet."
@@ -1949,3 +1949,150 @@ def test_a_column_inside_an_expression_must_be_grouped() -> None:
 )
 def test_sql_constructs_in_a_data_step(program: str, message: str) -> None:
     assert issues(program) == [message]
+
+
+# --- FORMAT, PROC PRINT, dates, and PROPCASE --------------------------------------
+
+
+@pytest.mark.parametrize(
+    "program",
+    [
+        # The variable is read before the FORMAT statement.
+        "data a; set t; y = year(d); format d date9.; run;",
+        # It is an input column, by KEEP=.
+        "data a; set t(keep=d); format d date9.; run;",
+        # It is assigned before the FORMAT statement.
+        "data a; set t; e = 1; format e 8.2; run;",
+    ],
+)
+def test_a_format_changes_no_value(program: str) -> None:
+    without_format = program.replace("format d date9.;", "").replace(
+        "format e 8.2;", ""
+    )
+
+    assert translate(program).datasets == translate(without_format).datasets
+
+
+@pytest.mark.parametrize(
+    ("program", "message"),
+    [
+        (
+            "data a; set t; format e 8.2; e = 1; run;",
+            "FORMAT of e before its first assignment",
+        ),
+        ("data a; set t; format d date9.; run;", "FORMAT of d, which may not exist"),
+        (
+            "data a; set t(keep=x); format d date9.; run;",
+            "FORMAT of d, which may not exist",
+        ),
+    ],
+)
+def test_a_format_that_could_create_a_variable(program: str, message: str) -> None:
+    assert issues(program) == [message]
+
+
+def test_proc_print_is_the_result() -> None:
+    translation = translate(
+        "data a; set t; run; data b; set a; run; "
+        "proc print data=a; var y; where x > 1; run;"
+    )
+
+    # The printed data set, though another was created after it.
+    a, _ = translation.datasets
+    assert translation.result == ir.Project(
+        ir.Filter(a, condition("x > 1")), (Column(("y",)),)
+    )
+    assert translation.warnings == ()
+
+
+def test_proc_print_without_data_prints_the_data_set_created_last() -> None:
+    translation = translate("data a; set t; run; data b; set t; run; proc print; run;")
+
+    assert translation.result == translation.datasets[-1]
+
+
+def test_only_the_last_proc_print_is_the_result() -> None:
+    translation = translate(
+        "data a; set t; run; proc print data=a; run; proc print data=t; run;"
+    )
+
+    assert translation.result == TableScan(("t",))
+    [warning] = translation.warnings
+    assert warning.message == "several PROC PRINT steps"
+
+
+def test_proc_print_of_nothing_created() -> None:
+    assert issues("proc print; run;") == ["PROC PRINT without DATA="]
+
+
+@pytest.mark.parametrize(
+    ("function", "spark"),
+    [
+        ("year", "year"),
+        ("month", "month"),
+        ("day", "dayofmonth"),
+        ("qtr", "quarter"),
+        ("weekday", "dayofweek"),
+    ],
+)
+def test_parts_of_a_date(function: str, spark: str) -> None:
+    [dataset] = translate(f"data a; set t; y = {function}(d); run;").datasets
+
+    assert dataset.source == ir.WithColumn(
+        TableScan(("t",)), "y", FunctionCall(spark, (Column(("d",)),))
+    )
+
+
+def test_a_part_of_a_missing_date_is_missing() -> None:
+    [dataset] = translate("data a; set t; y = year(.); run;").datasets
+
+    assert dataset.source == ir.WithColumn(TableScan(("t",)), "y", Literal(None))
+
+
+@pytest.mark.parametrize(
+    ("expression", "message"),
+    [
+        ("year('2024-01-01')", "text in YEAR"),
+        ("month(23000)", "MONTH of a number"),
+        ("qtr(d, e)", "QTR with 2 arguments"),
+    ],
+)
+def test_unsupported_dates(expression: str, message: str) -> None:
+    assert issues(f"data a; set t; y = {expression}; run;") == [message]
+
+
+def test_propcase_capitalizes_after_each_delimiter() -> None:
+    [dataset] = translate("data a; set t; y = propcase(name); run;").datasets
+
+    spaced = FunctionCall(
+        "regexp_replace", (Column(("name",)), Literal("([-/(.\t])"), Literal("$1 "))
+    )
+    assert dataset.source == ir.WithColumn(
+        TableScan(("t",)),
+        "y",
+        FunctionCall(
+            "regexp_replace",
+            (
+                FunctionCall("initcap", (spaced,)),
+                Literal("([-/(.\t]) "),
+                Literal("$1"),
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("expression", "message"),
+    [
+        ("propcase(name, ' -')", "PROPCASE with delimiters"),
+        ("propcase(1)", "number in PROPCASE"),
+    ],
+)
+def test_unsupported_propcase(expression: str, message: str) -> None:
+    assert issues(f"data a; set t; y = {expression}; run;") == [message]
+
+
+def test_inline_data_is_one_issue() -> None:
+    program = "data a;\n input x;\n datalines;\n1\n2\n;\nrun;"
+
+    assert issues(program) == ["INPUT statement", "inline data (INPUT with DATALINES)"]

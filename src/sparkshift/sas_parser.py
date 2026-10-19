@@ -214,6 +214,26 @@ class LengthStatement:
 
 
 @dataclass(frozen=True)
+class FormatStatement:
+    """FORMAT a b date9. c;: the variables it names. A format changes how
+    SAS displays a value, never the value."""
+
+    names: tuple[str, ...]
+    span: Span
+
+
+@dataclass(frozen=True)
+class DatalinesStatement:
+    """DATALINES (or CARDS, LINES, and their 4 forms), with the data lines
+    that follow it, as text."""
+
+    text: str
+    span: Span
+    # The line of the first data line, for messages.
+    line: int
+
+
+@dataclass(frozen=True)
 class Assignment:
     name: str
     value: Expression
@@ -259,6 +279,8 @@ Statement = (
     | DropStatement
     | RenameStatement
     | LengthStatement
+    | FormatStatement
+    | DatalinesStatement
     | Assignment
     | SubsettingIf
     | Delete
@@ -407,7 +429,18 @@ class ProcSql:
     span: Span
 
 
-Step = DataStep | ProcSort | ProcMeans | ProcFreq | ProcSql
+@dataclass(frozen=True)
+class ProcPrint:
+    """PROC PRINT: shows a data set (its VAR variables, in that order, when
+    there is a VAR statement) and creates none."""
+
+    data: Dataset | None
+    variables: tuple[str, ...]
+    wheres: tuple[WhereStatement, ...]
+    span: Span
+
+
+Step = DataStep | ProcSort | ProcMeans | ProcFreq | ProcSql | ProcPrint
 
 
 @dataclass(frozen=True)
@@ -585,6 +618,36 @@ _SQL_CLAUSE_WORDS = (
     "WHERE",
 )
 _OTHER_JOINS = ("RIGHT", "FULL", "CROSS", "NATURAL")
+# PROC PRINT options that change only the printout. (OBS= here labels the
+# observation column; it does not limit the rows.)
+_PRINT_OPTIONS_WITHOUT_EFFECT = frozenset(
+    {
+        "BLANKLINE",
+        "CONTENTS",
+        "DOUBLE",
+        "GRANDTOTAL_LABEL",
+        "HEADING",
+        "LABEL",
+        "N",
+        "NOOBS",
+        "NOSUMLABEL",
+        "OBS",
+        "ROUND",
+        "ROWS",
+        "SPLIT",
+        "SUMLABEL",
+        "UNIFORM",
+        "WIDTH",
+    }
+)
+_DATALINES_KEYWORDS = (
+    "DATALINES",
+    "CARDS",
+    "LINES",
+    "DATALINES4",
+    "CARDS4",
+    "LINES4",
+)
 # PROC FREQ and TABLES options that change only the printed output.
 _FREQ_OPTIONS_WITHOUT_EFFECT = frozenset({"COMPRESS", "NLEVELS", "NOPRINT", "PAGE"})
 _TABLES_OPTIONS_WITHOUT_EFFECT = frozenset(
@@ -641,6 +704,10 @@ class _Parser:
                     steps.append(step)
             elif first.is_keyword(*_STEP_ENDS):
                 self.index += 1  # a RUN with no step to end does nothing
+            elif first.kind is Kind.DATA:
+                # Data lines after a DATALINES statement outside a DATA step,
+                # which is reported: they are data, not statements.
+                self.index += 1
             else:
                 self.unsupported(self.statement_name(statement), statement)
                 self.index += 1
@@ -691,8 +758,53 @@ class _Parser:
             return self.proc_freq(header, body, span)
         if header[1].is_keyword("SQL"):
             return self.proc_sql(header, body, span)
+        if header[1].is_keyword("PRINT"):
+            return self.proc_print(header, body, span)
         self.unsupported(f"PROC {header[1].text.upper()} step", header)
         return None
+
+    def proc_print(
+        self, header: list[Token], body: list[list[Token]], span: Span
+    ) -> ProcPrint:
+        tokens = _Tokens(header[2:], self)
+        data = None
+        while not tokens.at_end():
+            option = tokens.take_name("a PROC PRINT option")
+            keyword = option.text.upper()
+            has_value = tokens.peek().is_symbol("=")
+            if keyword == "DATA" and has_value:
+                tokens.take()
+                data = self.dataset(tokens)
+                continue
+            if has_value:
+                tokens.take()
+                tokens.skip_option_value()
+            if keyword not in _PRINT_OPTIONS_WITHOUT_EFFECT:
+                name = f"{keyword}=" if has_value else keyword
+                self.unsupported(
+                    f"PROC PRINT option {name}",
+                    [option],
+                    "SparkShift supports DATA= and the options that change only "
+                    "the printout, such as NOOBS and LABEL.",
+                )
+        variables: list[str] = []
+        wheres: list[WhereStatement] = []
+        for statement in body:
+            first = statement[0]
+            rest = _Tokens(statement[1:], self)
+            if first.is_keyword("VAR"):
+                variables += self.names(rest, "VAR")
+            elif first.is_keyword("WHERE"):
+                condition = self.expression(rest)
+                rest.expect_end()
+                wheres.append(
+                    WhereStatement(condition, self.span(first, statement[-1]))
+                )
+            else:
+                self.unsupported(
+                    f"{first.text.upper()} statement in PROC PRINT", statement
+                )
+        return ProcPrint(data, tuple(variables), tuple(wheres), span)
 
     def proc_means(
         self, header: list[Token], body: list[list[Token]], span: Span
@@ -1259,6 +1371,10 @@ class _Parser:
             return Delete(span)
         if first.is_keyword("LENGTH"):
             return LengthStatement(self.lengths(tokens), span)
+        if first.is_keyword("FORMAT"):
+            return self.format_statement(statement, span)
+        if first.is_keyword(*_DATALINES_KEYWORDS) and len(statement) == 1:
+            return self.datalines(first, span)
         if first.is_keyword("ELSE"):
             raise self.error("ELSE without a matching IF", first)
         if first.is_keyword("END") and len(statement) == 1:
@@ -1366,6 +1482,62 @@ class _Parser:
         if pending or not entries:
             raise self.error("LENGTH without a length", tokens.previous())
         return tuple(entries)
+
+    def format_statement(
+        self, statement: list[Token], span: Span
+    ) -> FormatStatement | None:
+        """FORMAT variables format. ...: the variables are the names that are
+        not part of a format, such as date9., $20., 8.2, or dollar10.2."""
+        names: list[str] = []
+        tokens = _Tokens(statement[1:], self)
+        while not tokens.at_end():
+            token = tokens.take()
+            if (
+                token.is_symbol("$")
+                or token.kind is Kind.NUMBER
+                or (
+                    token.kind is Kind.NAME
+                    and tokens.adjacent(token)
+                    and (
+                        tokens.peek().is_symbol(".")
+                        or tokens.peek().text.startswith(".")
+                    )
+                )
+            ):
+                self.skip_format(tokens)
+            elif token.kind is Kind.NAME:
+                if tokens.peek().is_symbol("-"):
+                    self.unsupported("variable list in a FORMAT statement", statement)
+                    return None
+                names.append(token.text)
+            else:
+                self.unsupported("FORMAT statement", statement)
+                return None
+        return FormatStatement(tuple(names), span)
+
+    def skip_format(self, tokens: "_Tokens") -> None:
+        """The rest of a format name: tokens joined to it up to its period
+        and decimals, as in $char20., date9., or comma10.2."""
+        while not tokens.at_end() and tokens.adjacent(tokens.previous()):
+            token = tokens.peek()
+            if (
+                (token.kind is Kind.NAME and not tokens.previous().text.endswith("."))
+                or token.is_symbol(".")
+                or token.kind is Kind.NUMBER
+            ):
+                tokens.take()
+            else:
+                break
+
+    def datalines(self, keyword: Token, span: Span) -> DatalinesStatement:
+        """DATALINES; and the DATA token of the lines after it."""
+        following = self.statements[self.index : self.index + 1]
+        lines = following[0] if following else []
+        if len(lines) == 1 and lines[0].kind is Kind.DATA:
+            self.index += 1
+            data = lines[0]
+            return DatalinesStatement(data.value, span, data.line)
+        return DatalinesStatement("", span, keyword.line + 1)
 
     def statement_name(self, statement: list[Token]) -> str:
         first = statement[0]

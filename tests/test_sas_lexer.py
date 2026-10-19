@@ -160,3 +160,72 @@ def test_keyword_and_symbol_checks() -> None:
     assert token.is_keyword("WHERE")
     assert not token.is_keyword("SET")
     assert not token.is_symbol("Where")
+
+
+# --- Data lines ------------------------------------------------------------------
+
+
+def data_tokens(source: str) -> list[Token]:
+    return [token for token in tokenize(source) if token.kind is Kind.DATA]
+
+
+def test_data_lines_are_one_token_of_text() -> None:
+    source = (
+        "data a;\n  input x $ y;\n  datalines;\n"
+        "O'Neil 1 'quoted' @home\n"
+        "  two   2\n"
+        ";\nrun;"
+    )
+
+    [data] = data_tokens(source)
+
+    # Quotes, @, and spacing are data, kept as written.
+    assert data.value == "O'Neil 1 'quoted' @home\n  two   2\n"
+    assert data.line == 4
+    # The code goes on after the line with the semicolon.
+    assert [t.text for t in tokenize(source)][-4:] == [";", "run", ";", ""]
+
+
+@pytest.mark.parametrize("keyword", ["datalines", "CARDS", "Lines"])
+def test_every_name_of_datalines(keyword: str) -> None:
+    [data] = data_tokens(f"data a; input x; {keyword};\n1\n2\n;\nrun;")
+
+    assert data.value == "1\n2\n"
+
+
+def test_datalines4_allows_semicolons_in_the_data() -> None:
+    [data] = data_tokens("data a; input x $; datalines4;\na;b\nc\n;;;;\nrun;")
+
+    assert data.value == "a;b\nc\n"
+
+
+def test_no_data_lines() -> None:
+    [data] = data_tokens("data a; input x; datalines;\n;\nrun;")
+
+    assert data.value == ""
+
+
+def test_a_name_called_datalines_elsewhere_is_a_name() -> None:
+    assert data_tokens("data a; set datalines; run;") == []
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        (
+            "data a; input x; datalines;\n1\n2\n",
+            "Data lines without a line with a semicolon",
+        ),
+        (
+            "data a; input x; datalines4;\n1;\n",
+            "Data lines without a line starting with ;;;;",
+        ),
+        (
+            "data a; input x; datalines; 1 2\n;\n",
+            "Data lines start on the line after DATALINES",
+        ),
+    ],
+)
+def test_data_lines_that_do_not_end(source: str, message: str) -> None:
+    with pytest.raises(SASParseError, match=message):
+        tokenize(source)

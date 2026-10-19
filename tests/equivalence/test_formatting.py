@@ -140,19 +140,25 @@ def test_generated_lines_fit_the_line_length(dialect: str | None, sql: str) -> N
 SAS_PROGRAMS = [program for program, _ in test_sas.SAS_SCENARIOS.values()]
 
 
+def sas_code(program: str, line_length: int = 88) -> str:
+    translation = translate_sas(parse_sas(program), program)
+    return emit_datasets(
+        translation.datasets, result=translation.result, line_length=line_length
+    )
+
+
 @pytest.mark.parametrize("program", SAS_PROGRAMS)
 def test_sas_wrapping_keeps_the_syntax_tree(program: str) -> None:
-    datasets = translate_sas(parse_sas(program), program).datasets
-    one_line = ast.dump(ast.parse(emit_datasets(datasets, line_length=10**6)))
+    one_line = ast.dump(ast.parse(sas_code(program, line_length=10**6)))
 
     for line_length in (88, 30):
-        code = emit_datasets(datasets, line_length=line_length)
+        code = sas_code(program, line_length=line_length)
         assert ast.dump(ast.parse(code)) == one_line
 
 
 @pytest.mark.parametrize("program", SAS_PROGRAMS)
 def test_sas_lines_fit_the_line_length(program: str) -> None:
-    code = emit_datasets(translate_sas(parse_sas(program), program).datasets)
+    code = sas_code(program)
 
     assert [line for line in code.splitlines() if len(line) > 88] == []
 

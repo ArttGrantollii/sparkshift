@@ -27,7 +27,9 @@ def convert(sql: str, dialect: str | None = None) -> ConversionResult:
     """
     if is_sas(dialect):
         translation = translate_sas(parse_sas(sql), sql)
-        code, variables = emit_datasets_and_variables(translation.datasets)
+        code, variables = emit_datasets_and_variables(
+            translation.datasets, result=translation.result
+        )
         return ConversionResult(
             code=code,
             warnings=translation.warnings,

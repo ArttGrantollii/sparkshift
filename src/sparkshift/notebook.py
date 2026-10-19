@@ -65,24 +65,28 @@ def to_notebook(
     is written while ``output_schema`` is empty, and an empty
     ``output_catalog`` means the current catalog.
     """
-    tables = _tables(result, source)
+    tables = _tables(result, source, dialect)
     cells = [markdown_cell(_description(result, source, dialect, tables))]
     cells.append(_location_cell(catalog, schema, output_catalog, output_schema))
     cells += _code_cells(result.code)
-    cells.append(_write_cell(result.code, tables))
+    if tables:
+        cells.append(_write_cell(result.code, tables))
     cells.append("display(result)")
     body = f"\n\n{CELL_SEPARATOR}\n\n".join(cells)
     return f"{HEADER}\n{body}\n"
 
 
-def _tables(result: ConversionResult, source: str | None) -> list[tuple[str, str]]:
+def _tables(
+    result: ConversionResult, source: str | None, dialect: str | None
+) -> list[tuple[str, str]]:
     """The variable and table name of each result the notebook can write.
 
     A SAS program's data sets keep their names; a program that creates a
-    data set twice writes the second, as SAS replaces the first. A SQL
-    query's result is named after its file, or ``result`` without one.
+    data set twice writes the second, as SAS replaces the first, and one
+    that only prints creates none. A SQL query's result is named after its
+    file, or ``result`` without one.
     """
-    if not result.datasets:
+    if not result.datasets and not is_sas(dialect):
         return [("result", _table_name(source))]
     seen: set[str] = set()
     last: list[tuple[str, str]] = []
@@ -128,7 +132,9 @@ def _description(
         f"Set the `output_schema` widget to save {_written(result, tables)} in "
         "that schema, in the catalog in the `output_catalog` widget or the "
         "current one. Tables of the same name are replaced. Leave "
-        "`output_schema` empty to only display the result.",
+        "`output_schema` empty to only display the result."
+        if tables
+        else "The program creates no data set, so the notebook writes no table.",
     ]
     if result.warnings:
         lines += ["", "**Review before running:**", ""]

@@ -176,7 +176,8 @@ def test_warnings_are_listed_for_review() -> None:
         "# MAGIC Needs a PySpark 4 client: on serverless compute, use environment "
         "version 4 or later.",
         "# MAGIC",
-        writing("the result as the table `job`"),
+        # A SAS program that only prints creates no data set to write.
+        "# MAGIC The program creates no data set, so the notebook writes no table.",
         "# MAGIC",
         "# MAGIC **Review before running:**",
         "# MAGIC",
@@ -223,6 +224,17 @@ def test_without_a_source() -> None:
     ]
 
 
+def test_a_sas_program_that_only_prints_writes_no_table() -> None:
+    result = sparkshift.convert("proc print data=customers; run;", dialect="sas")
+
+    notebook = to_notebook(result, source="report.sas", dialect="sas")
+
+    assert result.datasets == ()
+    assert "save_table" not in notebook
+    assert cells(notebook)[-1] == "display(result)"
+    assert "writes no table" in cells(notebook)[0]
+
+
 def test_multiline_sas_warning_remains_notebook_metadata() -> None:
     result = sparkshift.convert(
         "proc sort data=customers out=unique_customers nodupkey;\n"
@@ -248,7 +260,7 @@ def test_metadata_cannot_create_executable_code_or_notebook_cells(
         ["metadata", "# COMMAND ----------", "raise RuntimeError('injected')"]
     )
     values = {"message": "warning", "sql": "fragment", "hint": "guidance"}
-    options = {"source": "query.sql", "dialect": "sas"}
+    options = {"source": "query.sql", "dialect": "tsql"}
     if field in values:
         values[field] = payload
     else:

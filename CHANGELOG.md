@@ -34,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty.
 - `ConversionResult.datasets` lists the data sets a SAS program creates, as
   `DataSet(name, variable)`.
+- SAS: `PROC PRINT` (with `VAR`, `WHERE`, and its printout options), whose
+  data set becomes the result; the `FORMAT` statement, which changes no
+  value; `YEAR`, `MONTH`, `DAY`, `QTR`, and `WEEKDAY`; and `PROPCASE`, exact
+  for its default delimiters (blank, `/`, `-`, `(`, `.`, tab). Data lines after
+  `DATALINES` (or `CARDS`) are read as data, so they no longer appear as
+  statements in the list of unsupported constructs.
 - `sparkshift upload --job [NAME]` also creates a Databricks job that runs the
   uploaded notebooks in order on serverless compute, with the notebooks'
   widgets as its parameters; `--overwrite` updates a job of the same name. It

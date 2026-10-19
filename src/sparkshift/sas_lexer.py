@@ -9,6 +9,11 @@ that starts with ``*``, which runs to the next semicolon. Names are not
 case-sensitive in SAS; tokens keep their spelling, and the parser compares
 keywords ignoring case. Macro syntax (``&name``, ``%let``) becomes MACRO
 tokens: the macro language runs before the program and is not supported.
+
+Data lines are not code: after a DATALINES (or CARDS, or LINES) statement,
+the lines that follow, up to the line with a semicolon, become one DATA
+token, whose value is their text. With DATALINES4 (CARDS4, LINES4), they end
+at a line that starts with four semicolons, so a line may contain one.
 """
 
 import re
@@ -25,6 +30,8 @@ class Kind(Enum):
     STRING = "string"
     SYMBOL = "symbol"
     MACRO = "macro"
+    # The lines after a DATALINES statement.
+    DATA = "data"
     END = "end"
 
 
@@ -60,6 +67,10 @@ _SYMBOLS = (
 )  # fmt: skip
 
 
+_DATALINES = ("DATALINES", "CARDS", "LINES")
+_DATALINES4 = ("DATALINES4", "CARDS4", "LINES4")
+
+
 def tokenize(source: str) -> list[Token]:
     """Return the program's tokens, ending with an END token."""
     return _Lexer(source).tokens()
@@ -75,6 +86,7 @@ class _Lexer:
 
     def tokens(self) -> list[Token]:
         found = []
+        statement: list[Token] = []
         while True:
             self.skip_blanks_and_comments()
             if self.position >= len(self.source):
@@ -83,6 +95,46 @@ class _Lexer:
             token = self.next_token()
             self.statement_start = token.is_symbol(";")
             found.append(token)
+            if not token.is_symbol(";"):
+                statement.append(token)
+                continue
+            if len(statement) == 1 and statement[0].is_keyword(
+                *_DATALINES, *_DATALINES4
+            ):
+                found.append(self.data_lines(statement[0]))
+            statement = []
+
+    def data_lines(self, keyword: Token) -> Token:
+        """The lines after a DATALINES statement, as one DATA token: from the
+        next line to the line that ends them, which is lexed as code (its
+        semicolon is a null statement)."""
+        source = self.source
+        line_end = source.find("\n", self.position)
+        if source[self.position : len(source) if line_end < 0 else line_end].strip():
+            self.fail(
+                f"Data lines start on the line after {keyword.text.upper()};",
+                self.position,
+            )
+        start = len(source) if line_end < 0 else line_end + 1
+        four = keyword.is_keyword(*_DATALINES4)
+        position = start
+        while position < len(source):
+            end = source.find("\n", position)
+            end = len(source) if end < 0 else end
+            line = source[position:end]
+            if line.startswith(";;;;") if four else ";" in line:
+                self.position = position
+                return Token(
+                    Kind.DATA,
+                    source[start:position],
+                    start,
+                    position,
+                    *self.line_and_column(start),
+                    value=source[start:position],
+                )
+            position = end + 1
+        ending = "a line starting with ;;;;" if four else "a line with a semicolon"
+        self.fail(f"Data lines without {ending} to end them", start)
 
     def skip_blanks_and_comments(self) -> None:
         source = self.source

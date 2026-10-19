@@ -15,6 +15,7 @@ blanks, product 4's trailing blanks only.
 """
 
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -1015,6 +1016,80 @@ SAS_SCENARIOS = {
                 (4, 999.99),
                 (99, 10.0),
             ),
+        ),
+    ),
+    # Parts of a date (SAS function reference: YEAR, MONTH, DAY, QTR, WEEKDAY);
+    # WEEKDAY counts from Sunday, 1. A missing date gives missing parts.
+    # 2023-01-15 and 2023-03-05 are Sundays, 2023-02-20 a Monday, 2023-05-10 a
+    # Wednesday, 2023-06-01 a Thursday, and 2023-07-04 a Tuesday.
+    "YEAR, MONTH, DAY, QTR, and WEEKDAY of a date": (
+        "data parts; set customers(keep=customer_id signup_date); "
+        "y = year(signup_date); m = month(signup_date); d = day(signup_date); "
+        "q = qtr(signup_date); w = weekday(signup_date); "
+        "drop signup_date; run;",
+        _result(
+            "customer_id int, y int, m int, d int, q int, w int",
+            (1, 2023, 1, 15, 1, 1),
+            (2, 2023, 2, 20, 1, 2),
+            (3, 2023, 3, 5, 1, 1),
+            (4, None, None, None, None, None),
+            (5, 2023, 5, 10, 2, 4),
+            (6, 2023, 6, 1, 2, 5),
+            (7, 2023, 7, 4, 3, 3),
+            (7, 2023, 7, 4, 3, 3),
+        ),
+    ),
+    # PROPCASE lowers every letter, then capitalizes the first letter of each
+    # word, after a blank, forward slash, hyphen, open parenthesis, period, or
+    # tab (SAS function reference: PROPCASE). An apostrophe is not one.
+    "PROPCASE capitalizes after each of its delimiters": (
+        "data proper; set customers(keep=customer_id name); "
+        "proper = propcase(name); "
+        'special = propcase("mARY-jane o\'NEIL (ann) dr.who/ x\tY  z"); '
+        "drop name; run;",
+        _result(
+            "customer_id int, proper string, special string",
+            (1, "Alice", "Mary-Jane O'neil (Ann) Dr.Who/ X\tY  Z"),
+            (2, "Bob", "Mary-Jane O'neil (Ann) Dr.Who/ X\tY  Z"),
+            (3, "José", "Mary-Jane O'neil (Ann) Dr.Who/ X\tY  Z"),
+            (4, "Zoë", "Mary-Jane O'neil (Ann) Dr.Who/ X\tY  Z"),
+            (5, "", "Mary-Jane O'neil (Ann) Dr.Who/ X\tY  Z"),
+            (6, None, "Mary-Jane O'neil (Ann) Dr.Who/ X\tY  Z"),
+            (7, "Grace", "Mary-Jane O'neil (Ann) Dr.Who/ X\tY  Z"),
+            (7, "Grace", "Mary-Jane O'neil (Ann) Dr.Who/ X\tY  Z"),
+        ),
+    ),
+    # A format changes how SAS displays values, not the values.
+    "FORMAT leaves values unchanged": (
+        "data shown; set customers(keep=customer_id signup_date); "
+        "format signup_date date9.; where customer_id < 3; run;",
+        _result(
+            "customer_id int, signup_date date",
+            (1, date(2023, 1, 15)),
+            (2, date(2023, 2, 20)),
+        ),
+    ),
+    # PROC PRINT shows its VAR variables, in that order, for the rows of its
+    # WHERE statement, and creates no data set: what it shows is the result.
+    "PROC PRINT with VAR and WHERE is the result": (
+        "proc print data=customers noobs label; var name customer_id; "
+        "where score > 4; run;",
+        _result(
+            "name string, customer_id int",
+            ("Alice", 1),
+            ("Grace", 7),
+            ("Grace", 7),
+        ),
+    ),
+    "the last PROC PRINT is the result, after the data set created last": (
+        "data low; set customers(keep=customer_id score); where score < 1; run; "
+        "data high; set customers(keep=customer_id score); where score > 4; run; "
+        "proc print data=low; run;",
+        _result(
+            "customer_id int, score double",
+            (3, None),
+            (4, 0.0),
+            (5, -1.25),
         ),
     ),
 }

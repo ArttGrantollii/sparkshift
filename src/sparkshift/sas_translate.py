@@ -43,12 +43,14 @@ from sparkshift.sas_parser import (
     Binary,
     Block,
     Call,
+    DatalinesStatement,
     Dataset,
     DataStep,
     Delete,
     DropOption,
     DropStatement,
     Expression,
+    FormatStatement,
     IfThen,
     In,
     IsMissing,
@@ -61,6 +63,7 @@ from sparkshift.sas_parser import (
     OutputStatement,
     ProcFreq,
     ProcMeans,
+    ProcPrint,
     ProcSort,
     ProcSql,
     Program,
@@ -125,6 +128,12 @@ _FUNCTIONS: dict[str, tuple[int, int | None]] = {
     "CATX": (2, None),
     "COALESCEC": (1, None),
     "MISSING": (1, 1),
+    "PROPCASE": (1, 2),
+    "YEAR": (1, 1),
+    "MONTH": (1, 1),
+    "DAY": (1, 1),
+    "QTR": (1, 1),
+    "WEEKDAY": (1, 1),
 }
 _STATISTICS = frozenset({"SUM", "MEAN", "MIN", "MAX", "N", "NMISS", "COALESCE"})
 _ROUNDING = frozenset({"ROUND", "INT", "CEIL", "FLOOR", "ABS", "MOD"})
@@ -142,21 +151,30 @@ _DATE_FUNCTIONS = frozenset(
         "DATE",
         "DATEPART",
         "DATETIME",
-        "DAY",
         "DHMS",
         "HMS",
         "INTCK",
         "INTNX",
         "MDY",
-        "MONTH",
-        "QTR",
         "TIMEPART",
         "TODAY",
-        "WEEKDAY",
-        "YEAR",
         "YRDIF",
     }
 )
+# Parts of a date, and the Spark function that gives each. WEEKDAY counts
+# from Sunday, 1, to Saturday, 7, as dayofweek does.
+_DATE_PARTS = {
+    "YEAR": "year",
+    "MONTH": "month",
+    "DAY": "dayofmonth",
+    "QTR": "quarter",
+    "WEEKDAY": "dayofweek",
+}
+# PROPCASE's default delimiters, as a Java regular expression character
+# class: blank, forward slash, hyphen, open parenthesis, period, and tab.
+# Spark's initcap starts a word only after a blank, so a blank is added
+# after each of the others, and removed again after initcap.
+_PROPCASE_DELIMITERS = "[-/(.\t]"
 # The statistics an OUTPUT statement of PROC MEANS can store.
 _STATISTICS_COMPUTED = frozenset(
     {"N", "NMISS", "SUM", "MEAN", "MIN", "MAX", "RANGE", "STD", "VAR"}
@@ -213,6 +231,9 @@ class SasTranslation:
 
     datasets: tuple[ir.Named, ...]
     warnings: tuple[Diagnostic, ...]
+    # What the last PROC PRINT shows, the program's result; without PROC
+    # PRINT, the result is the data set created last.
+    result: ir.Relation | None = None
 
 
 def translate_sas(program: Program, source: str) -> SasTranslation:
@@ -285,6 +306,8 @@ class _SasTranslator:
         # summary function with one argument summarizes rows, as in SQL.
         self.sql = False
         self.aggregating = False
+        # What the last PROC PRINT shows.
+        self.result: ir.Relation | None = None
 
     def translation(self) -> SasTranslation:
         for step in self.program.steps:
@@ -297,11 +320,13 @@ class _SasTranslator:
                 self.proc_means(step)
             elif isinstance(step, ProcFreq):
                 self.proc_freq(step)
+            elif isinstance(step, ProcPrint):
+                self.proc_print(step)
             else:
                 self.proc_sql(step)
         if self.issues:
             raise UnsupportedSQLError(self.issues)
-        return SasTranslation(tuple(self.outputs), tuple(self.warnings))
+        return SasTranslation(tuple(self.outputs), tuple(self.warnings), self.result)
 
     # --- Steps ---------------------------------------------------------------
 
@@ -313,7 +338,14 @@ class _SasTranslator:
         self.declared_early = set()
         sets = [s for s in statements if isinstance(s, SetStatement)]
         wheres = [s for s in statements if isinstance(s, WhereStatement)]
-        if not sets:
+        datalines = [s for s in statements if isinstance(s, DatalinesStatement)]
+        if not sets and datalines:
+            self.unsupported(
+                "inline data (INPUT with DATALINES)",
+                datalines[0].span,
+                "Data lines are not supported yet.",
+            )
+        elif not sets:
             self.unsupported(
                 "DATA step without a SET statement",
                 step.span,
@@ -451,6 +483,28 @@ class _SasTranslator:
         named = ir.Named(target.member.lower(), relation)
         self.created[target.member.lower()] = named
         self.outputs.append(named)
+
+    def proc_print(self, step: ProcPrint) -> None:
+        """PROC PRINT creates no data set: what it shows (the VAR variables
+        in their order, the rows of its WHERE statement) is the program's
+        result, which a notebook displays. The last PROC PRINT's is."""
+        source = self.procedure_input(step.data, "PRINT", step.span)
+        if source is None:
+            return
+        relation = self.procedure_rows(source, step.wheres, "PRINT")
+        if step.variables:
+            columns = tuple(
+                ir.Column((name,)) for name in _unique(list(step.variables))
+            )
+            relation = ir.Project(relation, columns)
+        if self.result is not None:
+            self.warn(
+                "several PROC PRINT steps",
+                step.span,
+                "The result, which a notebook displays, is what the last one "
+                "shows; display the others' data sets yourself.",
+            )
+        self.result = relation
 
     def proc_means(self, step: ProcMeans) -> None:
         """PROC MEANS or SUMMARY: one data set for each OUTPUT statement, with
@@ -1173,8 +1227,39 @@ class _SasTranslator:
                 return self.if_then(statement, relation, guard)
             case LengthStatement():
                 return self.length(statement, relation)
-        # SET, WHERE, KEEP, DROP, and RENAME apply to the whole step.
+            case FormatStatement():
+                self.format(statement)
+                return relation
+        # SET, WHERE, KEEP, DROP, RENAME, and DATALINES apply to the whole
+        # step.
         return relation
+
+    def format(self, statement: FormatStatement) -> None:
+        """A format changes how SAS displays a value, not the value, so the
+        code has nothing to do; but naming a variable that does not exist yet
+        would create it, at that place."""
+        for name in statement.names:
+            variable = self.variables.get(name.lower())
+            if variable is not None and (variable.exists or variable.assigned):
+                continue
+            if self.is_new(name) is False:
+                continue
+            if name.lower() in self.step_assigned:
+                self.unsupported(
+                    f"FORMAT of {name} before its first assignment",
+                    statement.span,
+                    "SAS would create the variable there, which can change the "
+                    "order of the columns; put the FORMAT statement after the "
+                    "assignment. A format does not change values.",
+                )
+            else:
+                self.unsupported(
+                    f"FORMAT of {name}, which may not exist",
+                    statement.span,
+                    f"If {name} is not an input variable, SAS creates it as a "
+                    "missing number. List the input's columns with KEEP= on SET, "
+                    "or remove it from the FORMAT statement.",
+                )
 
     def assignment(
         self, statement: Assignment, relation: ir.Relation, guard: ir.Expression | None
@@ -1564,7 +1649,72 @@ class _SasTranslator:
             return (
                 None if missing is None else _Value("number", ir.Cast(missing, "int"))
             )
+        if name in _DATE_PARTS:
+            return self.date_part(name, call)
+        if name == "PROPCASE":
+            return self.propcase(call)
         return self.text_function(name, call)
+
+    def date_part(self, name: str, call: Call) -> _Value | None:
+        """YEAR, MONTH, DAY, QTR, and WEEKDAY of a date: missing for a missing
+        date. The column must be a Spark date (or timestamp), as SAS dates
+        are once moved to Spark; a SAS day count in a number column is not
+        converted."""
+        argument = call.arguments[0]
+        value = self.value(argument)
+        if value is None:
+            return None
+        if value.kind == "text":
+            self.unsupported(
+                f"text in {name}",
+                argument.span,
+                "SAS would read it as a number; use a date variable.",
+            )
+            return None
+        if value.expression is None:
+            return _Value("number", None, constant=True)
+        if value.constant:
+            self.unsupported(
+                f"{name} of a number",
+                argument.span,
+                "In SAS a date is a count of days since 1 January 1960; Spark needs "
+                "a date. Use a date variable.",
+            )
+            return None
+        part = ir.FunctionCall(_DATE_PARTS[name], (value.expression,))
+        return _Value("number", part)
+
+    def propcase(self, call: Call) -> _Value | None:
+        """PROPCASE: lower case, with a capital letter at the start of each
+        word, after a blank, forward slash, hyphen, open parenthesis, period,
+        or tab. initcap capitalizes after blanks only, so a blank is added
+        after the other delimiters for it, then removed."""
+        if len(call.arguments) == 2:
+            self.unsupported(
+                "PROPCASE with delimiters",
+                call.span,
+                "SparkShift supports PROPCASE's default delimiters only.",
+            )
+            return None
+        values = self.texts("PROPCASE", call.arguments)
+        if values is None:
+            return None
+        text = values[0]
+        assert text.expression is not None
+        spaced = ir.FunctionCall(
+            "regexp_replace",
+            (
+                text.expression,
+                ir.Literal(f"({_PROPCASE_DELIMITERS})"),
+                ir.Literal("$1 "),
+            ),
+        )
+        capitalized = ir.FunctionCall("initcap", (spaced,))
+        result = ir.FunctionCall(
+            "regexp_replace",
+            (capitalized, ir.Literal(f"({_PROPCASE_DELIMITERS}) "), ir.Literal("$1")),
+        )
+        return _Value("text", result, length=text.length)
 
     def numbers(
         self, name: str, arguments: tuple[Expression, ...]

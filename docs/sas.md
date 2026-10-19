@@ -41,7 +41,9 @@ Procedure User's Guide*.
 | Subsetting `IF condition;` and `DELETE` | |
 | `LENGTH name $ n;` | Before a variable's first use; numbers only with length 8. A variable never assigned needs `KEEP=` on `SET`. See [Where new variables go](#where-new-variables-go) |
 | Conditions | Comparisons (`=`, `^=`, `<`, `<=`, `>`, `>=` and `EQ`, `NE`, `LT`, `LE`, `GT`, `GE`); `AND`, `OR`, `NOT (...)`; `IN`, `NOT IN`; `BETWEEN ... AND`; `IS [NOT] MISSING` and `IS [NOT] NULL`; a number on its own. A comparison or condition used as a value is 1 or 0 |
-| Functions | `SUM`, `MEAN`, `MIN`, `MAX`, `N`, `NMISS`, `COALESCE`; `ROUND`, `INT`, `CEIL`, `FLOOR`, `ABS`, `MOD`; `UPCASE`, `LOWCASE`, `STRIP`, `TRIM`, `SUBSTR`, `LENGTH`; `CATS`, `CATX`, `COALESCEC`; `MISSING`. See [Functions](#functions) |
+| Functions | `SUM`, `MEAN`, `MIN`, `MAX`, `N`, `NMISS`, `COALESCE`; `ROUND`, `INT`, `CEIL`, `FLOOR`, `ABS`, `MOD`; `UPCASE`, `LOWCASE`, `PROPCASE`, `STRIP`, `TRIM`, `SUBSTR`, `LENGTH`; `CATS`, `CATX`, `COALESCEC`; `MISSING`; `YEAR`, `MONTH`, `DAY`, `QTR`, `WEEKDAY`. See [Functions](#functions) |
+| `FORMAT` statement | Accepted: a format changes how SAS displays a value, never the value. The variables it names must exist at that point. See [FORMAT](#format) |
+| `PROC PRINT` | `DATA=`, `VAR`, `WHERE`, and the options that only change the printout (`NOOBS`, `LABEL`, ...). What the last PROC PRINT shows is the result. See [PROC PRINT](#proc-print) |
 | `PROC SORT` | `DATA=`, `OUT=` (with data set options), `NODUPKEY`, `BY` with `DESCENDING`, and `WHERE`. Options that do not change the result (`EQUALS`, `FORCE`, `TAGSORT`, `SORTSIZE=`, ...) are accepted. See [PROC SORT](#proc-sort) |
 | `PROC SQL` | `CREATE TABLE name AS SELECT` with `DISTINCT`, columns and `AS` names, `FROM` a data set (with data set options and an alias), `INNER JOIN` and `LEFT JOIN ... ON`, `WHERE`, `GROUP BY` columns, `HAVING`, `ORDER BY` names or positions with `DESC`, and the summary functions `COUNT(*)`, `COUNT`, `SUM`, `AVG`/`MEAN`, `MIN`, `MAX`, `NMISS`, `RANGE`, `STD`, `VAR` (`COUNT` and `SUM` also with `DISTINCT`). See [PROC SQL](#proc-sql) |
 | `PROC FREQ` | `DATA=`, `BY`, `WHERE`, and `TABLES a` or `TABLES a*b*...` with `/ OUT=`, `MISSING`, and `OUTPCT` (two-way tables). Options that only change printed output are accepted. See [PROC FREQ](#proc-freq) |
@@ -50,7 +52,8 @@ Procedure User's Guide*.
 
 Everything else is rejected with a list of every unsupported construct, for
 example `RETAIN`, `BY` with `FIRST.`/`LAST.`, `OUTPUT`, `MERGE`, arrays, `DO`
-loops, other functions (date functions among them), `**`, `||`, date
+loops, other functions (among them date functions such as `INTCK`, `INTNX`,
+`MDY`, and `TODAY`), `PROPCASE` with its own delimiters, `**`, `||`, date
 constants, variable lists such as `x1-x5` and `OF x1-x5`, macros (`%let`,
 `&name`), global statements such as `LIBNAME` and `OPTIONS`, `DATA _NULL_`,
 writing to a permanent library, PROC SORT's `DUPOUT=`, `NOUNIQUEKEY`, and
@@ -300,6 +303,17 @@ NULLs. The delimiter must be a text constant, used as written. Items must be
 text: SAS writes numbers with the BESTw. format first, which SparkShift does
 not reproduce.
 
+*PROPCASE:* converts the text to lower case, then capitalizes the first
+letter of each word: the letter after a blank, forward slash, hyphen, open
+parenthesis, period, or tab (its default delimiters). Spark's `F.initcap` does
+the same after blanks only (measured on Spark 4.2: `mary-jane` gives
+`Mary-jane`, where SAS gives `Mary-Jane`), so SparkShift adds a blank after
+each of the other delimiters, applies `initcap`, and removes exactly the
+blanks it added:
+`F.regexp_replace(F.initcap(F.regexp_replace(x, "([-/(.\t])", "$1 ")), "([-/(.\t]) ", "$1")`.
+Spacing that was there stays. `PROPCASE` with its own delimiters (a second
+argument) is rejected.
+
 *COALESCEC:* "A character value is considered missing if it has a length of
 zero or if all the characters are blank. If all the values of all the
 arguments are missing, the COALESCEC function returns a string with a length
@@ -309,10 +323,21 @@ of zero."
 blanks or has a length of zero"; 0 otherwise. In a condition it becomes the
 same test as `IS MISSING`.
 
+**Dates.** `YEAR`, `MONTH`, `DAY`, `QTR`, and `WEEKDAY` return a part of a
+date, and a missing value for a missing date. They become `F.year`,
+`F.month`, `F.dayofmonth`, `F.quarter`, and `F.dayofweek`; `WEEKDAY` counts
+from Sunday, 1, to Saturday, 7, as `dayofweek` does. In SAS a date is a number
+of days since 1 January 1960; in Spark it is a date column, as SAS dates are
+once their data moves to Spark, and the code expects one. A column that still
+holds SAS day counts makes Spark fail with an error rather than give wrong
+parts (measured on Spark 4.2: "The first parameter requires the DATE type").
+A constant number as the date is rejected, and so is text.
+
 **Lengths of function results.** A new text variable gets its length from the
 first value assigned to it (see [Text length](#text-length)). For a function,
 that is the length SAS gives its result:
 
+- `PROPCASE`: the length of its argument, as for `UPCASE`.
 - `UPCASE`, `LOWCASE`, `STRIP`, `TRIM`, and `SUBSTR`: "that variable is given
   the length of the argument" (the first argument for `SUBSTR`). That length
   is known when the argument is a constant or a variable the step assigns.
@@ -322,6 +347,35 @@ that is the length SAS gives its result:
   `length label $ 6;`, `label = catx(' ', name, country);` is
   `F.when(F.length(<the CATX>) > F.lit(6), F.lit("")).otherwise(<the CATX>)`.
 - `COALESCEC`: SparkShift treats the length as unknown.
+
+### FORMAT
+
+A format controls how SAS displays a value (`date9.` shows a date as
+`01JAN2024`); the stored value does not change, so the generated code has
+nothing to do, and Spark shows dates its own way (`2024-01-01`). But a FORMAT
+statement that names a variable the step has not created yet would create it
+there, which changes the order of the columns, or creates a missing number if
+the variable never gets a value. So every variable it names must exist at that
+point: read or assigned before the statement, or an input column known from
+`KEEP=` on `SET`. Otherwise the statement is rejected; move it after the
+assignment.
+
+### PROC PRINT
+
+PROC PRINT shows a data set and creates none. What it shows (its `VAR`
+variables, in that order, for the rows of its `WHERE` statement) becomes the
+program's `result`, which a notebook displays, even when other data sets were
+created after it; with several PROC PRINT steps, the last one's is the result,
+with a warning. Its options that only change the printout are accepted: in
+PROC PRINT, `OBS=` is the label of the observation column, not a number of
+rows. `ID`, `BY`, and `SUM`, which change what is shown, are rejected.
+
+### Data lines
+
+The lines after a `DATALINES` (or `CARDS`, `LINES`) statement are data, not
+SAS code: they are read as text up to the line with a semicolon, or, after
+`DATALINES4`, up to a line starting with `;;;;`. So their values, quotes and
+all, never appear as statements in a list of unsupported constructs.
 
 ### PROC SORT
 

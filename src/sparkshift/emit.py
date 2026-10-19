@@ -41,6 +41,7 @@ _PLAIN_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _PLAIN_VALUE_PARAMETERS = {
     "round": frozenset({1}),
     "substring": frozenset({1, 2}),
+    "regexp_replace": frozenset({1, 2}),
     "concat_ws": frozenset({0}),
     "log": frozenset({0}),
     "date_trunc": frozenset({0}),
@@ -100,22 +101,33 @@ def emit(plan: ir.Relation, *, line_length: int = _MAX_LINE_LENGTH) -> str:
 
 
 def emit_datasets(
-    datasets: Sequence[ir.Named], *, line_length: int = _MAX_LINE_LENGTH
+    datasets: Sequence[ir.Named],
+    *,
+    result: ir.Relation | None = None,
+    line_length: int = _MAX_LINE_LENGTH,
 ) -> str:
     """Return PySpark code that assigns each data set to its own variable, in
     order, whether or not a later one uses it, and the last one to ``result``,
-    as a SAS program creates its data sets one step at a time."""
-    return emit_datasets_and_variables(datasets, line_length=line_length)[0]
+    as a SAS program creates its data sets one step at a time; or, with
+    ``result``, that relation (what the program prints)."""
+    return emit_datasets_and_variables(
+        datasets, result=result, line_length=line_length
+    )[0]
 
 
 def emit_datasets_and_variables(
-    datasets: Sequence[ir.Named], *, line_length: int = _MAX_LINE_LENGTH
+    datasets: Sequence[ir.Named],
+    *,
+    result: ir.Relation | None = None,
+    line_length: int = _MAX_LINE_LENGTH,
 ) -> tuple[str, dict[ir.Named, str]]:
-    """As ``emit_datasets``, with the variable that holds each data set."""
-    if not datasets:
+    """As ``emit_datasets``, with the variable that holds each data set.
+    With ``result``, that relation (what a SAS program prints) is assigned
+    to ``result`` instead of the last data set."""
+    if not datasets and result is None:
         raise ValueError("emit_datasets needs at least one data set")
     emitter = _Emitter(line_length)
-    code = emitter.datasets(datasets)
+    code = emitter.datasets(datasets, result)
     return code, {dataset: emitter.named_variables[dataset] for dataset in datasets}
 
 
@@ -147,13 +159,18 @@ class _Emitter:
     def program(self, plan: ir.Relation) -> str:
         return self.assemble([plan], lambda: self.relation(plan))
 
-    def datasets(self, outputs: Sequence[ir.Named]) -> str:
+    def datasets(
+        self, outputs: Sequence[ir.Named], result: ir.Relation | None = None
+    ) -> str:
         def last_dataset() -> str:
             for output in outputs:
                 self.named_variable(output)
+            if result is not None:
+                return self.relation(result)
             return self.named_variable(outputs[-1])
 
-        return self.assemble(outputs, last_dataset)
+        roots = [*outputs, result] if result is not None else list(outputs)
+        return self.assemble(roots, last_dataset)
 
     def assemble(self, roots: Sequence[ir.Relation], result: Callable[[], str]) -> str:
         """The whole program: imports, shared variables, the declarations
