@@ -138,7 +138,9 @@ blocker's hint, an example file, and every file's status. The JSON has a
 `.sas` file in a directory, into notebooks and imports them into a Databricks
 workspace folder. It takes `--dialect`, `--catalog`, `--schema`,
 `--output-catalog`, `--output-schema`, and `--strict` as `convert` does,
-plus `--profile`, `--overwrite`, and
+plus `--job [NAME]` (also create a job that runs the notebooks in order; see
+[databricks.md](databricks.md#a-job-that-runs-the-notebooks)), `--profile`,
+`--overwrite`, and
 `--dry-run`. It needs `pip install 'sparkshift[databricks]'`, except with
 `--dry-run`. See [databricks.md](databricks.md#uploading-to-a-workspace).
 
@@ -147,5 +149,5 @@ plus `--profile`, `--overwrite`, and
 | Status | `convert` | `report` | `upload` |
 |---|---|---|---|
 | 0 | Every input was converted | The report was produced, whatever it finds | Every input was converted and uploaded |
-| 1 | Some input could not be converted, or `--strict` rejected its warnings | `--fail-under` was given and fewer files convert | Some input could not be converted or uploaded |
+| 1 | Some input could not be converted, or `--strict` rejected its warnings | `--fail-under` was given and fewer files convert | Some input could not be converted or uploaded, or the `--job` could not be created |
 | 2 | Usage error, such as a missing file, an unknown dialect, or colliding output paths | Usage error | Usage error, or no connection to Databricks |

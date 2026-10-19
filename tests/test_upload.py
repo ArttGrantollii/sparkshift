@@ -10,6 +10,7 @@ import pytest
 import sparkshift
 from sparkshift import databricks
 from sparkshift.cli import EXIT_CONVERTED, EXIT_NOT_CONVERTED, EXIT_USAGE, main
+from sparkshift.jobs import job_settings
 from sparkshift.notebook import to_notebook
 
 FOLDER = "/Workspace/Users/me@example.com/migrated"
@@ -23,6 +24,7 @@ class FakeWorkspace:
         self.existing = set(existing)
         self.folders: list[str] = []
         self.notebooks: dict[str, tuple[str, bool]] = {}
+        self.jobs = {}
 
     def mkdirs(self, path: str) -> None:
         self.folders.append(path)
@@ -33,6 +35,30 @@ class FakeWorkspace:
                 "a notebook already exists there; pass --overwrite to replace it"
             )
         self.notebooks[path] = (source, overwrite)
+
+    # Jobs: ``jobs`` maps IDs to settings; ``job_error`` fails every call.
+    jobs: dict[int, dict]
+    job_error: str | None = None
+
+    def jobs_named(self, name: str) -> list[int]:
+        self.fail_if_asked()
+        return [
+            job_id for job_id, settings in self.jobs.items() if settings["name"] == name
+        ]
+
+    def create_job(self, settings: dict) -> int:
+        self.fail_if_asked()
+        job_id = 100 + len(self.jobs)
+        self.jobs[job_id] = settings
+        return job_id
+
+    def reset_job(self, job_id: int, settings: dict) -> None:
+        self.fail_if_asked()
+        self.jobs[job_id] = settings
+
+    def fail_if_asked(self) -> None:
+        if self.job_error:
+            raise databricks.UploadError(self.job_error)
 
 
 @pytest.fixture
@@ -237,6 +263,161 @@ def test_a_failed_folder_is_retried_for_the_next_notebook(
     # customers.sas fails with the folder; more.sql, in the same folder, retries it.
     assert fake.folders == [FOLDER, f"{FOLDER}/daily", FOLDER]
     assert sorted(fake.notebooks) == [f"{FOLDER}/daily/orders", f"{FOLDER}/more"]
+
+
+# --- Jobs ------------------------------------------------------------------------
+
+
+@pytest.fixture
+def converting(jobs: Path) -> Path:
+    """The jobs directory without the file that does not convert."""
+    (jobs / "broken.sql").unlink()
+    return jobs
+
+
+def test_a_job_runs_the_uploaded_notebooks_in_order(
+    workspace: FakeWorkspace, converting: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    arguments = [str(converting), "--to", FOLDER, "--job"]
+    arguments += ["--schema", "raw", "--output-schema", "claims"]
+
+    assert upload(*arguments) == EXIT_CONVERTED
+
+    assert workspace.jobs == {
+        100: job_settings(
+            "sparkshift migrated",
+            FOLDER,
+            [f"{FOLDER}/customers", f"{FOLDER}/daily/orders"],
+            schema="raw",
+            output_schema="claims",
+        )
+    }
+    assert capsys.readouterr().err.endswith(
+        "created the job 'sparkshift migrated' (ID 100): runs 2 notebooks in order\n"
+    )
+
+
+def test_a_job_can_be_named(workspace: FakeWorkspace, converting: Path) -> None:
+    assert upload(str(converting), "--to", FOLDER, "--job", "nightly claims") == 0
+
+    assert [settings["name"] for settings in workspace.jobs.values()] == [
+        "nightly claims"
+    ]
+
+
+def test_no_job_without_every_file(
+    workspace: FakeWorkspace, jobs: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert upload(str(jobs), "--to", FOLDER, "--job") == EXIT_NOT_CONVERTED
+
+    # The notebooks that convert are uploaded; a job missing a step is not made.
+    assert len(workspace.notebooks) == 2
+    assert workspace.jobs == {}
+    assert "no job created: it needs every file converted and uploaded" in (
+        capsys.readouterr().err
+    )
+
+
+def test_an_existing_job_is_kept_unless_overwrite_is_given(
+    workspace: FakeWorkspace, converting: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace.jobs[7] = {"name": "sparkshift migrated", "tasks": []}
+
+    assert upload(str(converting), "--to", FOLDER, "--job") == EXIT_NOT_CONVERTED
+    assert workspace.jobs[7]["tasks"] == []
+    assert "a job named 'sparkshift migrated' already exists (ID 7); pass " in (
+        capsys.readouterr().err
+    )
+
+    assert upload(str(converting), "--to", FOLDER, "--job", "--overwrite") == 0
+    assert list(workspace.jobs) == [7]
+    assert len(workspace.jobs[7]["tasks"]) == 2
+    assert "updated the job 'sparkshift migrated' (ID 7)" in capsys.readouterr().err
+
+
+def test_no_guess_between_jobs_of_the_same_name(
+    workspace: FakeWorkspace, converting: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace.jobs.update({1: {"name": "x"}, 2: {"name": "x"}})
+
+    arguments = [str(converting), "--to", FOLDER, "--job", "x", "--overwrite"]
+
+    assert upload(*arguments) == EXIT_NOT_CONVERTED
+    assert workspace.jobs == {1: {"name": "x"}, 2: {"name": "x"}}
+    assert "2 jobs are named 'x'" in capsys.readouterr().err
+
+
+def test_a_job_that_cannot_be_created_is_reported(
+    workspace: FakeWorkspace, converting: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace.job_error = "permission denied"
+
+    assert upload(str(converting), "--to", FOLDER, "--job") == EXIT_NOT_CONVERTED
+    assert (
+        "cannot create the job 'sparkshift migrated': permission denied"
+        in capsys.readouterr().err
+    )
+
+
+def test_dry_run_shows_the_job(
+    monkeypatch: pytest.MonkeyPatch,
+    converting: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(databricks, "connect", mock.Mock(side_effect=AssertionError))
+
+    status = upload(str(converting), "--to", FOLDER, "--job", "--dry-run")
+
+    assert status == EXIT_CONVERTED
+    assert capsys.readouterr().out.splitlines()[-1] == (
+        "job 'sparkshift migrated': customers -> daily_orders"
+    )
+
+
+def test_jobs_are_created_with_the_create_body() -> None:
+    client = mock.Mock()
+    client.api_client.do.return_value = {"job_id": 12}
+    workspace = databricks._SdkWorkspace(client)
+    settings = {"name": "x", "tasks": []}
+
+    assert workspace.create_job(settings) == 12
+    workspace.reset_job(12, settings)
+
+    assert client.api_client.do.call_args_list == [
+        mock.call("POST", "/api/2.2/jobs/create", body=settings),
+        mock.call(
+            "POST", "/api/2.2/jobs/reset", body={"job_id": 12, "new_settings": settings}
+        ),
+    ]
+
+
+def test_jobs_are_matched_by_their_exact_name() -> None:
+    client = mock.Mock()
+    named = [
+        mock.Mock(job_id=1, settings=mock.Mock()),
+        mock.Mock(job_id=2, settings=mock.Mock()),
+    ]
+    named[0].settings.name = "Claims"
+    named[1].settings.name = "claims"
+    client.jobs.list.return_value = named
+
+    assert databricks._SdkWorkspace(client).jobs_named("claims") == [2]
+    client.jobs.list.assert_called_once_with(name="claims")
+
+
+def test_job_errors_never_show_the_token() -> None:
+    from databricks.sdk.errors import DatabricksError
+
+    client = mock.Mock()
+    client.config.token = TOKEN
+    client.api_client.do.side_effect = DatabricksError(f"denied for {TOKEN}")
+    client.jobs.list.side_effect = DatabricksError(f"denied for {TOKEN}")
+    workspace = databricks._SdkWorkspace(client)
+
+    for call in (lambda: workspace.create_job({}), lambda: workspace.jobs_named("x")):
+        with pytest.raises(databricks.UploadError) as caught:
+            call()
+        assert str(caught.value) == "denied for ***"
 
 
 # --- Connecting, and the Databricks SDK ---------------------------------------

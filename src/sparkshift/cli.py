@@ -39,6 +39,7 @@ from sparkshift.batch import colliding, dialect_of, source_suffixes
 from sparkshift.diagnostics import ConversionResult
 from sparkshift.dialects import DIALECT_CHOICES
 from sparkshift.errors import SparkShiftError
+from sparkshift.jobs import default_job_name, job_settings
 from sparkshift.notebook import to_notebook
 from sparkshift.report import Report, assess, to_json, to_markdown, to_text, unreadable
 
@@ -217,6 +218,16 @@ def _parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="convert and list the notebook paths without connecting to Databricks",
+    )
+    upload_command.add_argument(
+        "--job",
+        nargs="?",
+        const="",
+        metavar="NAME",
+        help="also create a job that runs the notebooks in order on serverless "
+        "compute, named NAME (default: sparkshift and the folder's name); with "
+        "--overwrite, a job of that name is updated. The job is created only if "
+        "every file converts and uploads",
     )
     return parser
 
@@ -424,12 +435,28 @@ def _upload(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> i
             )
             notebooks.append((path, notebook_path, notebook))
 
+    settings = None
+    if arguments.job is not None:
+        settings = job_settings(
+            arguments.job or default_job_name(str(folder)),
+            str(folder),
+            [str(notebook_path) for _, notebook_path, _ in notebooks],
+            catalog=arguments.catalog,
+            schema=arguments.schema,
+            output_catalog=arguments.output_catalog,
+            output_schema=arguments.output_schema,
+        )
+
     if arguments.dry_run:
         for path, notebook_path, _ in notebooks:
             print(f"{path} -> {notebook_path}")
-        return _upload_summary(
+        status = _upload_summary(
             parser.prog, "would upload", "converted", len(notebooks), files
         )
+        if settings is not None and status == EXIT_CONVERTED:
+            keys = " -> ".join(task["task_key"] for task in settings["tasks"])
+            print(f"job {settings['name']!r}: {keys}")
+        return status
 
     try:
         workspace = databricks.connect(arguments.profile)
@@ -454,9 +481,58 @@ def _upload(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> i
             continue
         print(f"{parser.prog}: uploaded {path} to {notebook_path}", file=sys.stderr)
         uploaded += 1
-    return _upload_summary(
+    status = _upload_summary(
         parser.prog, "uploaded", "converted or uploaded", uploaded, files
     )
+    if settings is None:
+        return status
+    if status != EXIT_CONVERTED:
+        # A job without one of its steps would quietly compute something else.
+        print(
+            f"{parser.prog}: no job created: it needs every file converted and "
+            "uploaded",
+            file=sys.stderr,
+        )
+        return status
+    return _create_job(parser.prog, workspace, settings, overwrite=arguments.overwrite)
+
+
+def _create_job(
+    prog: str, workspace: databricks.Workspace, settings: dict, *, overwrite: bool
+) -> int:
+    """Create the job, or update the one of the same name with --overwrite."""
+    name = settings["name"]
+    steps = len(settings["tasks"])
+    noun = "notebook" if steps == 1 else "notebooks"
+    try:
+        existing = workspace.jobs_named(name)
+        if len(existing) > 1:
+            print(
+                f"{prog}: no job created: {len(existing)} jobs are named {name!r}; "
+                "delete or rename all but one",
+                file=sys.stderr,
+            )
+            return EXIT_NOT_CONVERTED
+        if existing and not overwrite:
+            print(
+                f"{prog}: no job created: a job named {name!r} already exists "
+                f"(ID {existing[0]}); pass --overwrite to update it",
+                file=sys.stderr,
+            )
+            return EXIT_NOT_CONVERTED
+        if existing:
+            workspace.reset_job(existing[0], settings)
+            done, job_id = "updated", existing[0]
+        else:
+            done, job_id = "created", workspace.create_job(settings)
+    except databricks.UploadError as error:
+        print(f"{prog}: cannot create the job {name!r}: {error}", file=sys.stderr)
+        return EXIT_NOT_CONVERTED
+    print(
+        f"{prog}: {done} the job {name!r} (ID {job_id}): runs {steps} {noun} in order",
+        file=sys.stderr,
+    )
+    return EXIT_CONVERTED
 
 
 def _upload_summary(

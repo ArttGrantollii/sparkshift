@@ -47,6 +47,15 @@ class Workspace(Protocol):
     def import_notebook(self, path: str, source: str, *, overwrite: bool) -> None:
         """Import a source-format Python notebook at ``path``."""
 
+    def jobs_named(self, name: str) -> list[int]:
+        """The IDs of the jobs named ``name``."""
+
+    def create_job(self, settings: dict) -> int:
+        """Create a job from a Jobs API ``create`` body; its ID."""
+
+    def reset_job(self, job_id: int, settings: dict) -> None:
+        """Replace a job's settings with a Jobs API ``create`` body."""
+
 
 def connect(profile: str | None = None) -> Workspace:
     """A workspace, authenticated by the SDK's unified authentication, or the
@@ -96,6 +105,38 @@ class _SdkWorkspace:
             raise NotebookExistsError(
                 "a notebook already exists there; pass --overwrite to replace it"
             ) from None
+        except DatabricksError as error:
+            raise UploadError(self.message(error)) from None
+
+    def jobs_named(self, name: str) -> list[int]:
+        from databricks.sdk.errors import DatabricksError
+
+        try:
+            # The API matches names exactly, ignoring case: keep exact ones.
+            return [
+                job.job_id
+                for job in self.client.jobs.list(name=name)
+                if job.settings is None or job.settings.name == name
+            ]
+        except DatabricksError as error:
+            raise UploadError(self.message(error)) from None
+
+    def create_job(self, settings: dict) -> int:
+        created = self.request("/api/2.2/jobs/create", settings)
+        return int(created["job_id"])
+
+    def reset_job(self, job_id: int, settings: dict) -> None:
+        self.request(
+            "/api/2.2/jobs/reset", {"job_id": job_id, "new_settings": settings}
+        )
+
+    def request(self, path: str, body: dict) -> Any:
+        """POST ``body`` to a REST API path: the same JSON the notebook that
+        creates a job sends (see sparkshift.jobs)."""
+        from databricks.sdk.errors import DatabricksError
+
+        try:
+            return self.client.api_client.do("POST", path, body=body)
         except DatabricksError as error:
             raise UploadError(self.message(error)) from None
 

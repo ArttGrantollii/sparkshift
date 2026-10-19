@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty.
 - `ConversionResult.datasets` lists the data sets a SAS program creates, as
   `DataSet(name, variable)`.
+- `sparkshift upload --job [NAME]` also creates a Databricks job that runs the
+  uploaded notebooks in order on serverless compute, with the notebooks'
+  widgets as its parameters; `--overwrite` updates a job of the same name. It
+  is created only if every file converts and uploads. `sparkshift.jobs` also
+  writes a notebook that creates the same job when run in a workspace.
 
 ### Fixed
 

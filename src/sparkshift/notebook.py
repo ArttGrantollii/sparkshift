@@ -66,7 +66,7 @@ def to_notebook(
     ``output_catalog`` means the current catalog.
     """
     tables = _tables(result, source)
-    cells = [_markdown(_description(result, source, dialect, tables))]
+    cells = [markdown_cell(_description(result, source, dialect, tables))]
     cells.append(_location_cell(catalog, schema, output_catalog, output_schema))
     cells += _code_cells(result.code)
     cells.append(_write_cell(result.code, tables))
@@ -137,7 +137,7 @@ def _description(
 
 
 def _written(result: ConversionResult, tables: list[tuple[str, str]]) -> str:
-    names = ", ".join(_code_span(table) for _, table in tables)
+    names = ", ".join(code_span(table) for _, table in tables)
     if not result.datasets:
         return f"the result as the table {names}"
     if len(tables) == 1:
@@ -218,20 +218,20 @@ def _unused_name(name: str, code: str) -> str:
 
 
 def _warning(warning: Diagnostic) -> str:
-    text = f"- {warning.message}: {_code_span(warning.sql)}"
+    text = f"- {warning.message}: {code_span(warning.sql)}"
     if warning.hint:
         text += f". {warning.hint}"
     return text
 
 
-def _code_span(text: str) -> str:
+def code_span(text: str) -> str:
     """Text as Markdown code, with enough backticks around it."""
     fence = "``" if "`" in text else "`"
     padding = " " if fence == "``" else ""
     return f"{fence}{padding}{text}{padding}{fence}"
 
 
-def _markdown(lines: list[str]) -> str:
+def markdown_cell(lines: list[str]) -> str:
     # Metadata can contain newlines, including notebook cell markers. Prefix
     # every physical line so it cannot become Python or a new notebook cell.
     physical_lines = "\n".join(lines).splitlines()

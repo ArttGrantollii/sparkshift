@@ -91,6 +91,37 @@ sparkshift upload jobs/ --to /Workspace/Users/you@example.com/migrated
 
 See [ADR 0010](adr/0010-upload-notebooks-with-the-databricks-sdk.md).
 
+### A job that runs the notebooks
+
+`--job` also creates a Databricks job that runs the uploaded notebooks one
+after another, in the order of their paths, on serverless compute in
+environment version 4:
+
+```bash
+sparkshift upload claims/ --to /Workspace/Users/you@example.com/claims --job \
+    --schema raw --output-schema claims
+```
+
+- The job is named `sparkshift` and the folder's name (`sparkshift claims`),
+  or `--job NAME`. It appears under **Jobs & Pipelines**, where you can run
+  it or give it a schedule.
+- The notebooks' widgets are the job's parameters, starting at the values of
+  `--catalog`, `--schema`, `--output-catalog`, and `--output-schema`; a run
+  can change them. Runs do not overlap, as they write tables.
+- The job is created only if every file converts and uploads: a job missing
+  one step of a chain would compute something else without saying so.
+- If a job of that name exists, it is kept and reported, unless you pass
+  `--overwrite`, which updates it. If several jobs have the name, none is
+  changed.
+- With `--dry-run`, the order of the job's tasks is printed instead.
+
+The job is described once, in `sparkshift.jobs`. The playground cannot
+create jobs itself, because Databricks does not let web pages from other
+sites call the Jobs API, so it imports a **Create job** notebook with the
+same description: run it once in the workspace and it creates the job, or
+updates the one of the same name. See
+[ADR 0012](adr/0012-create-jobs-from-one-description.md).
+
 ## Running on Databricks
 
 The generated code uses PySpark 4 APIs, such as `Column.outer()` for
