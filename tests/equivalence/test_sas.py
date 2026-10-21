@@ -85,6 +85,95 @@ proc print data=customers_clean;
 run;
 """
 
+# A small table from data lines: amount is missing for id 2, kind for id 4.
+TABLE_T = (
+    "data t; input id kind $ amount; datalines;\n1 A 10\n2 B .\n3 C 5\n4 . 7\n;\nrun; "
+)
+
+ACCOUNTS_PROGRAM = """
+data accounts;
+    input account_id customer_id balance account_type $;
+    datalines;
+1001 101 15000 SAVINGS
+1002 102 25000 CHECKING
+1003 103 8000 SAVINGS
+1004 104 120000 BUSINESS
+1005 105 45000 CHECKING
+;
+run;
+
+data transactions;
+    input transaction_id account_id amount transaction_type $;
+    datalines;
+1 1001 500 DEPOSIT
+2 1001 200 WITHDRAW
+3 1002 1500 DEPOSIT
+4 1002 300 WITHDRAW
+5 1003 700 DEPOSIT
+6 1004 5000 WITHDRAW
+7 1004 10000 DEPOSIT
+8 1005 250 DEPOSIT
+9 1005 100 WITHDRAW
+10 1001 1200 DEPOSIT
+;
+run;
+
+proc sql;
+    create table transaction_summary as
+    select
+        a.account_id,
+        a.customer_id,
+        a.account_type,
+        a.balance,
+        count(t.transaction_id) as transaction_count,
+
+        sum(case
+            when t.transaction_type = "DEPOSIT"
+            then t.amount
+            else 0
+        end) as total_deposits,
+
+        sum(case
+            when t.transaction_type = "WITHDRAW"
+            then t.amount
+            else 0
+        end) as total_withdrawals,
+
+        calculated total_deposits -
+        calculated total_withdrawals as net_change,
+
+        a.balance + calculated net_change as final_balance
+
+    from accounts a
+    left join transactions t
+        on a.account_id = t.account_id
+
+    group by
+        a.account_id,
+        a.customer_id,
+        a.account_type,
+        a.balance
+
+    order by a.account_id;
+quit;
+
+data account_risk;
+    set transaction_summary;
+
+    length risk_level $10;
+
+    if final_balance < 10000 then risk_level = "HIGH";
+    else if final_balance < 30000 then risk_level = "MEDIUM";
+    else risk_level = "LOW";
+
+    if final_balance > 50000 then vip_flag = 1;
+    else vip_flag = 0;
+run;
+
+proc print data=account_risk;
+run;
+"""
+
 SAS_SCENARIOS = {
     # SAS GROUP BY without a summary is a sort, not deduplication. Its explicit
     # ORDER BY rewrite preserves both copies of customer 7.
@@ -1300,6 +1389,112 @@ SAS_SCENARIOS = {
             ),
         ),
     ),
+    # CASE (SAS SQL Procedure User's Guide, "CASE Expression"): the value of
+    # the first true WHEN, else ELSE's, else a missing value; with an operand,
+    # each WHEN value is compared with it for equality. A missing number is
+    # smaller than every number, and missing text equals no constant.
+    "PROC SQL CASE: the first true WHEN, ELSE, and missing without ELSE": (
+        TABLE_T + "proc sql; create table o as select id, "
+        "case when amount > 8 then 'high' when amount > 0 then 'low' "
+        "else 'none' end as level, "
+        "case kind when 'A' then 1 when 'B' then 2 end as code "
+        "from t; quit;",
+        _result(
+            "id double, level string, code int",
+            (1.0, "high", 1),
+            (2.0, "none", 2),
+            (3.0, "low", None),
+            (4.0, "low", None),
+        ),
+    ),
+    # CALCULATED (SAS SQL Procedure User's Guide, "CALCULATED Component"):
+    # a column computed earlier in the SELECT clause, there or in WHERE. A
+    # missing value is not greater than 12.
+    "PROC SQL CALCULATED in SELECT and WHERE": (
+        TABLE_T + "proc sql; create table o as select id, amount * 2 as doubled, "
+        "calculated doubled + 1 as plus from t where calculated doubled > 12; quit;",
+        _result(
+            "id double, doubled double, plus double",
+            (1.0, 20.0, 21.0),
+            (4.0, 14.0, 15.0),
+        ),
+    ),
+    # Summaries skip missing values: the total of 10, 5, and 7 is 22, over
+    # 4 rows; the largest amount, 10, is 10/22 of it.
+    "PROC SQL CALCULATED summaries": (
+        TABLE_T
+        + "proc sql; create table o as select count(*) as n, sum(amount) as total, "
+        "calculated total / calculated n as per_row, "
+        "max(amount) / calculated total as share from t; quit;",
+        _result(
+            "n bigint, total double, per_row double, share double",
+            (4, 22.0, 5.5, 10 / 22),
+        ),
+    ),
+    # A whole program: data lines, PROC SQL with a LEFT JOIN, GROUP BY, CASE
+    # inside SUM, and CALCULATED columns, then a DATA step and PROC PRINT.
+    "a program from data lines through PROC SQL to PROC PRINT": (
+        ACCOUNTS_PROGRAM,
+        _result(
+            "account_id double, customer_id double, account_type string, "
+            "balance double, transaction_count bigint, total_deposits double, "
+            "total_withdrawals double, net_change double, final_balance double, "
+            "risk_level string, vip_flag int",
+            (
+                1001.0,
+                101.0,
+                "SAVINGS",
+                15000.0,
+                3,
+                1700.0,
+                200.0,
+                1500.0,
+                16500.0,
+                "MEDIUM",
+                0,
+            ),
+            (
+                1002.0,
+                102.0,
+                "CHECKING",
+                25000.0,
+                2,
+                1500.0,
+                300.0,
+                1200.0,
+                26200.0,
+                "MEDIUM",
+                0,
+            ),
+            (1003.0, 103.0, "SAVINGS", 8000.0, 1, 700.0, 0.0, 700.0, 8700.0, "HIGH", 0),
+            (
+                1004.0,
+                104.0,
+                "BUSINESS",
+                120000.0,
+                2,
+                10000.0,
+                5000.0,
+                5000.0,
+                125000.0,
+                "LOW",
+                1,
+            ),
+            (
+                1005.0,
+                105.0,
+                "CHECKING",
+                45000.0,
+                2,
+                250.0,
+                100.0,
+                150.0,
+                45150.0,
+                "LOW",
+                0,
+            ),
+        ),
+    ),
 }
 
 
@@ -1323,3 +1518,7 @@ def test_the_whole_program_warns_only_of_its_truncations() -> None:
         ("text truncated to the length of age_group", 'age_group = "UNDER_30"'),
         ("text truncated to the length of region", 'region = "EUROPE"'),
     ]
+
+
+def test_the_accounts_program_converts_without_warnings() -> None:
+    assert sparkshift.convert(ACCOUNTS_PROGRAM, dialect="sas").warnings == ()

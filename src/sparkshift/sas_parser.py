@@ -119,6 +119,27 @@ class Qualified:
     span: Span
 
 
+@dataclass(frozen=True)
+class CaseExpression:
+    """CASE [operand] WHEN ... THEN ... [ELSE ...] END, in PROC SQL: with an
+    operand, each of ``conditions`` is a value it is compared with."""
+
+    operand: "Expression | None"
+    conditions: tuple["Expression", ...]
+    values: tuple["Expression", ...]
+    otherwise: "Expression | None"
+    span: Span
+
+
+@dataclass(frozen=True)
+class Calculated:
+    """CALCULATED name, in PROC SQL: the column the SELECT list computes
+    under that name."""
+
+    name: str
+    span: Span
+
+
 Expression = (
     Name
     | Qualified
@@ -131,6 +152,8 @@ Expression = (
     | Between
     | IsMissing
     | Call
+    | CaseExpression
+    | Calculated
 )
 
 
@@ -1954,12 +1977,16 @@ class _Parser:
                 return Qualified(token.text, column.text, self.span(token, column))
             if token.is_keyword("CALCULATED") and following.kind is Kind.NAME:
                 column = tokens.take()
-                self.unsupported(
-                    "CALCULATED",
-                    [token, column],
-                    "Repeat the expression the column is calculated from.",
+                return Calculated(column.text, self.span(token, column))
+            if token.is_keyword("CASE") and (
+                following.is_keyword("WHEN")
+                or (
+                    # CASE operand WHEN ...; else CASE is a variable's name.
+                    following.kind in (Kind.NAME, Kind.STRING, Kind.NUMBER)
+                    and any(t.is_keyword("WHEN") for t in tokens.rest())
                 )
-                return Name(column.text, self.span(token, column))
+            ):
+                return self.case(token, tokens)
             return Name(token.text, span)
         if token.is_symbol("(") and tokens.peek().is_keyword("SELECT"):
             return self.subquery(token, tokens)
@@ -1969,6 +1996,34 @@ class _Parser:
             return _with_span(inner, self.span(token, closing))
         raise self.error(
             f"Unexpected {token.text or 'end of statement'!r} in an expression", token
+        )
+
+    def case(self, keyword: Token, tokens: "_Tokens") -> Expression:
+        """CASE [operand] WHEN condition THEN value ... [ELSE value] END."""
+        operand = None if tokens.peek().is_keyword("WHEN") else self.expression(tokens)
+        conditions: list[Expression] = []
+        values: list[Expression] = []
+        while tokens.peek().is_keyword("WHEN"):
+            tokens.take()
+            conditions.append(self.expression(tokens))
+            self.expect_keyword(tokens, "THEN")
+            values.append(self.expression(tokens))
+        if not conditions:
+            raise self.error("Expected WHEN in a CASE expression", tokens.peek())
+        otherwise = None
+        if tokens.peek().is_keyword("ELSE"):
+            tokens.take()
+            otherwise = self.expression(tokens)
+        end = tokens.take()
+        if not end.is_keyword("END"):
+            found = end.text or "end of statement"
+            raise self.error(f"Expected END to end the CASE, found {found!r}", end)
+        return CaseExpression(
+            operand,
+            tuple(conditions),
+            tuple(values),
+            otherwise,
+            self.span(keyword, end),
         )
 
     def subquery(self, opening: Token, tokens: "_Tokens") -> Expression:

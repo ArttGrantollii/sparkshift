@@ -1005,7 +1005,6 @@ def test_proc_sql_options_and_statements() -> None:
         ("select a from t, u", ", join"),
         ("select a from t union select b from u", "UNION in a query"),
         ("select a length=8 from t", "column modifier LENGTH="),
-        ("select calculated b from t", "CALCULATED"),
         ("select a from t where a in (select b from u)", "subquery"),
         ("select (select max(b) from u) as m from t", "subquery"),
     ],
@@ -1187,3 +1186,74 @@ def test_proc_print_options_and_statements_that_change_rows_are_reported() -> No
         "BY statement in PROC PRINT",
         "SUM statement in PROC PRINT",
     ]
+
+
+# --- CASE and CALCULATED ---------------------------------------------------------
+
+
+def select_item(source: str) -> object:
+    """The shape of the first SELECT item of a PROC SQL query."""
+    return query_shape(f"select {source} as v from t")[2][0][1]
+
+
+def test_case_with_conditions() -> None:
+    assert select_item("case when x > 1 then 'a' when x > 0 then 'b' else 'c' end") == (
+        "CaseExpression",
+        None,
+        (binary(">", name("x"), number(1)), binary(">", name("x"), number(0))),
+        (("String", "a"), ("String", "b")),
+        ("String", "c"),
+    )
+
+
+def test_case_with_an_operand_and_without_else() -> None:
+    assert select_item("case t.kind when 'A' then 1 when 'B' then 2 end") == (
+        "CaseExpression",
+        ("Qualified", "t", "kind"),
+        (("String", "A"), ("String", "B")),
+        (number(1), number(2)),
+        None,
+    )
+
+
+def test_case_inside_a_function_and_inside_case() -> None:
+    inner = ("CaseExpression", None, (name("y"),), (number(1),), number(0))
+    assert select_item("sum(case when x then case when y then 1 else 0 end end)") == (
+        "Call",
+        "sum",
+        (("CaseExpression", None, (name("x"),), (inner,), None),),
+        False,
+        False,
+    )
+
+
+def test_a_variable_named_case() -> None:
+    assert statements("if case then y = case + 1;") == (
+        (
+            "IfThen",
+            name("case"),
+            assign("y", binary("+", name("case"), number(1))),
+            None,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ("case when x then 1 as v from t", "Expected END to end the CASE"),
+        ("case when x 1 end as v from t", "Expected THEN"),
+    ],
+)
+def test_invalid_case(source: str, message: str) -> None:
+    with pytest.raises(SASParseError, match=message):
+        parse_sas(f"proc sql; create table out as select {source}; quit;")
+
+
+def test_calculated() -> None:
+    assert select_item("calculated total * 2") == (
+        "Binary",
+        "*",
+        ("Calculated", "total"),
+        number(2),
+    )

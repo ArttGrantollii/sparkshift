@@ -34,7 +34,8 @@ Like the SQL translator, it works from an allowlist and reports every
 unsupported construct at once.
 """
 
-from collections.abc import Iterator
+import dataclasses
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -46,7 +47,9 @@ from sparkshift.sas_parser import (
     Between,
     Binary,
     Block,
+    Calculated,
     Call,
+    CaseExpression,
     DatalinesStatement,
     Dataset,
     DataStep,
@@ -332,6 +335,9 @@ class _SasTranslator:
         self.schemas: dict[str, _Schema] = {}
         # Where a step's input variables come from, for messages.
         self.input_name = "the SET data set"
+        # In a PROC SQL query, the known columns of each table, by lower-case
+        # alias (or member name).
+        self.sql_columns: dict[str, _Schema] = {}
 
     def translation(self) -> SasTranslation:
         for step in self.program.steps:
@@ -1064,6 +1070,18 @@ class _SasTranslator:
 
     def sql_query(self, query: SqlQuery) -> ir.Relation | None:
         qualified = bool(query.joins) or _qualifies(query)
+        self.sql_columns = {}
+        for table in (query.table, *(join.table for join in query.joins)):
+            schema = self.known_columns(table.dataset)
+            if schema is not None:
+                key = (table.alias or table.dataset.member).lower()
+                self.sql_columns[key] = schema
+        if not query.joins:
+            # Unqualified names are the one table's columns.
+            self.read_columns(query.table.dataset)
+        calculated = self.calculated_columns(query)
+        if calculated is None:
+            return None
         relation = self.sql_source(query.table, qualified)
         for join in query.joins:
             right = self.sql_source(join.table, True)
@@ -1072,14 +1090,15 @@ class _SasTranslator:
                 kind = ir.JoinKind.LEFT if join.kind == "left" else ir.JoinKind.INNER
                 relation = ir.Join(relation, right, kind, condition)
         if query.where is not None:
-            if _has_summary(query.where):
+            where = _expanded(query.where, calculated)
+            if _has_summary(where):
                 self.unsupported(
                     "summary function in WHERE",
                     query.span,
                     "Filter on a summary function with HAVING.",
                 )
                 return None
-            condition = self.condition(query.where)
+            condition = self.condition(where)
             if condition is not None:
                 relation = ir.Filter(relation, condition)
         selected_summary = any(
@@ -1106,9 +1125,9 @@ class _SasTranslator:
             )
             return None
         if summarized:
-            selected = self.sql_summary(query, relation)
+            selected = self.sql_summary(query, relation, calculated)
         else:
-            selected = self.sql_projection(query, relation)
+            selected = self.sql_projection(query, relation, calculated)
         if selected is None:
             return None
         relation, names = selected
@@ -1121,6 +1140,67 @@ class _SasTranslator:
             relation = ir.Sort(relation, keys)
         return relation
 
+    def calculated_columns(self, query: SqlQuery) -> dict[str, Expression] | None:
+        """The columns the SELECT list computes, by lower-case alias, each
+        with the CALCULATED references in it replaced by what they refer to.
+        CALCULATED may refer to a column calculated earlier in the SELECT
+        list, or, in WHERE, to any of them; None after reporting one that
+        cannot be resolved, or that is elsewhere."""
+        issues_before = len(self.issues)
+        aliases = {item.alias.lower() for item in query.items if item.alias}
+        resolved: dict[str, Expression] = {}
+
+        def resolve(expression: Expression) -> Expression:
+            def replace(node: Expression) -> Expression | None:
+                if not isinstance(node, Calculated):
+                    return None
+                key = node.name.lower()
+                if key in resolved:
+                    return resolved[key]
+                if key in aliases:
+                    self.unsupported(
+                        f"CALCULATED {node.name} before {node.name} is calculated",
+                        node.span,
+                        "CALCULATED refers to a column calculated earlier in the "
+                        "SELECT list.",
+                    )
+                else:
+                    self.unsupported(
+                        f"CALCULATED {node.name}, which the SELECT list does not "
+                        "calculate",
+                        node.span,
+                        "CALCULATED refers to a column named with AS in the same "
+                        "SELECT list.",
+                    )
+                return Missing(node.span)
+
+            return _mapped(expression, replace)
+
+        for item in query.items:
+            if item.expression is None:
+                continue
+            expression = resolve(item.expression)
+            if item.alias is not None:
+                resolved.setdefault(item.alias.lower(), expression)
+        if query.where is not None:
+            resolve(query.where)
+        elsewhere = [
+            *(("ON", join.condition) for join in query.joins),
+            *(("GROUP BY", expression) for expression in query.group_by),
+            *([("HAVING", query.having)] if query.having is not None else []),
+            *(("ORDER BY", order.expression) for order in query.order_by),
+        ]
+        for clause, expression in elsewhere:
+            for node in _calculated(expression):
+                hint = (
+                    "Order by the column's name, without CALCULATED."
+                    if clause == "ORDER BY"
+                    else "SparkShift supports CALCULATED in SELECT and WHERE, as "
+                    "SAS documents it; repeat the expression here."
+                )
+                self.unsupported(f"CALCULATED in {clause}", node.span, hint)
+        return resolved if len(self.issues) == issues_before else None
+
     def sql_source(self, table: SqlTable, qualified: bool) -> ir.Relation:
         """A table of the FROM clause, with its data set options, named by its
         alias (or member name) when columns are qualified."""
@@ -1130,10 +1210,14 @@ class _SasTranslator:
         return relation
 
     def sql_projection(
-        self, query: SqlQuery, relation: ir.Relation
+        self,
+        query: SqlQuery,
+        relation: ir.Relation,
+        calculated: dict[str, Expression],
     ) -> tuple[ir.Relation, list[str] | None] | None:
         """The SELECT list of a query without GROUP BY or summary functions,
-        and the output columns' names (None with *)."""
+        and the output columns' names (None with *). A CALCULATED column is
+        computed again from what it refers to."""
         if len(query.items) == 1 and query.items[0].expression is None:
             return relation, None
         items: list[ir.Expression] = []
@@ -1146,7 +1230,8 @@ class _SasTranslator:
                     "List the columns, or select * alone.",
                 )
                 return None
-            output = self.sql_column(item)
+            expression = _expanded(item.expression, calculated)
+            output = self.sql_column(dataclasses.replace(item, expression=expression))
             if output is None:
                 return None
             expression, name = output
@@ -1177,10 +1262,16 @@ class _SasTranslator:
         return ir.Alias(expression, item.alias), item.alias
 
     def sql_summary(
-        self, query: SqlQuery, relation: ir.Relation
+        self,
+        query: SqlQuery,
+        relation: ir.Relation,
+        calculated: dict[str, Expression],
     ) -> tuple[ir.Relation, list[str]] | None:
         """A query with GROUP BY or summary functions: one row for each group,
-        or for all rows without GROUP BY."""
+        or for all rows without GROUP BY. A column that uses CALCULATED
+        columns and no summary function of its own is computed from the
+        summarized columns, after them; other CALCULATED references are
+        replaced by what they refer to."""
         keys: list[ir.Expression] = []
         key_names: list[str] = []
         for expression in query.group_by:
@@ -1198,6 +1289,8 @@ class _SasTranslator:
         grouped = {name.lower() for name in key_names}
         aggregates: list[ir.Expression] = []
         names: list[str] = []
+        # Columns computed after the summary, from its columns.
+        later: list[SqlItem] = []
         self.aggregating = True
         try:
             for item in query.items:
@@ -1220,7 +1313,19 @@ class _SasTranslator:
                 if isinstance(item.expression, Name | Qualified) and item.alias is None:
                     names.append(item.expression.name)
                     continue
-                output = self.sql_column(item)
+                if _calculated(item.expression) and not _has_summary(item.expression):
+                    if item.alias is None:
+                        self.unsupported(
+                            "computed column without a name",
+                            item.span,
+                            "Name it with AS; SAS would name it _TEMA001.",
+                        )
+                        return None
+                    later.append(item)
+                    names.append(item.alias)
+                    continue
+                expanded = _expanded(item.expression, calculated)
+                output = self.sql_column(dataclasses.replace(item, expression=expanded))
                 if output is None:
                     return None
                 aggregate, name = output
@@ -1247,7 +1352,26 @@ class _SasTranslator:
         result: ir.Relation = ir.Aggregate(relation, tuple(keys), tuple(aggregates))
         if having is not None:
             result = ir.Filter(result, ir.Column((helper,)))
+        for item in later:
+            assert item.expression is not None and item.alias is not None
+            # After the summary, columns are named without their table.
+            unqualified = _mapped(
+                item.expression,
+                lambda node: (
+                    Name(node.name, node.span)
+                    if isinstance(node, Qualified | Calculated)
+                    else None
+                ),
+            )
+            self.variables = {}
+            value = self.value(unqualified)
+            if value is None:
+                return None
+            result = ir.WithColumn(
+                result, item.alias, value.expression or ir.Literal(None)
+            )
         produced = key_names + [a.name for a in aggregates if isinstance(a, ir.Alias)]
+        produced += [item.alias for item in later if item.alias is not None]
         if [n.lower() for n in produced] != [n.lower() for n in names]:
             result = ir.Project(result, tuple(ir.Column((n,)) for n in names))
         return result, names
@@ -1844,7 +1968,22 @@ class _SasTranslator:
                 if not self.sql:
                     self.unsupported("qualified name", expression.span)
                     return None
-                return _Value("unknown", ir.Column((qualifier, name)))
+                column = self.sql_columns.get(qualifier.lower(), {}).get(name.lower())
+                return _Value(
+                    column.kind if column else "unknown",
+                    ir.Column((qualifier, name)),
+                    length=column.length if column else None,
+                )
+            case CaseExpression():
+                return self.case_value(expression)
+            case Calculated():
+                # In PROC SQL, CALCULATED is replaced before translation.
+                self.unsupported(
+                    "CALCULATED outside PROC SQL",
+                    expression.span,
+                    "CALCULATED refers to a column of a PROC SQL SELECT list.",
+                )
+                return None
             case Number(value=number):
                 return _Value("number", ir.Literal(number), constant=True)
             case Unary(op="-", operand=Number(value=number)):
@@ -1893,6 +2032,51 @@ class _SasTranslator:
         if condition is None:
             return None
         return _Value("number", ir.Cast(condition, "int"))
+
+    def case_value(self, node: CaseExpression) -> _Value | None:
+        """CASE in PROC SQL: the value after the first WHEN whose condition
+        is true, else the ELSE value, else a missing value. With an operand,
+        each WHEN value is compared with it for equality, by SAS's rules."""
+        if not self.sql:
+            self.unsupported(
+                "CASE expression in a DATA step",
+                node.span,
+                "Use IF-THEN/ELSE statements.",
+            )
+            return None
+        conditions = [
+            self.condition(when)
+            if node.operand is None
+            else self.comparison("=", node.operand, when, when.span)
+            for when in node.conditions
+        ]
+        results = [self.value(value) for value in node.values]
+        if node.otherwise is not None:
+            results.append(self.value(node.otherwise))
+        if None in conditions or None in results:
+            return None
+        values = [value for value in results if value is not None]
+        kinds = {value.kind for value in values} - {"unknown"}
+        if len(kinds) > 1:
+            self.unsupported(
+                "CASE of text and numbers",
+                node.span,
+                "SAS stops with an error: every THEN and ELSE value must be of "
+                "one type.",
+            )
+            return None
+        branches = tuple(
+            (condition, value.expression or ir.Literal(None))
+            for condition, value in zip(conditions, values, strict=False)
+            if condition is not None
+        )
+        default = values[-1].expression if node.otherwise is not None else None
+        kind = kinds.pop() if kinds else "unknown"
+        lengths = [value.length for value in values]
+        length = None
+        if kind == "text" and None not in lengths:
+            length = max(length for length in lengths if length is not None)
+        return _Value(kind, ir.Case(branches, default), length=length)
 
     def number(self, expression: Expression, span: Span) -> ir.Expression | None:
         """An arithmetic operand: a missing value is NULL, and text is not
@@ -2489,23 +2673,59 @@ def _assigned(statement: Statement | None) -> set[str]:
 def _variables(expression: Expression) -> set[str]:
     """The variables an expression reads, lower case."""
     match expression:
-        case Name(name=name):
+        case Name(name=name) | Qualified(name=name):
             return {name.lower()}
-        case Binary(left=left, right=right):
-            return _variables(left) | _variables(right)
-        case Unary(operand=operand):
-            return _variables(operand)
-        case In(expression=inner, values=values):
-            return _variables(inner).union(*(_variables(v) for v in values))
-        case Between(expression=inner, low=low, high=high):
-            return _variables(inner) | _variables(low) | _variables(high)
-        case IsMissing(expression=inner):
-            return _variables(inner)
-        case Call(arguments=arguments):
-            return set().union(*(_variables(a) for a in arguments))
-        case Qualified(name=name):
-            return {name.lower()}
-    return set()
+    return set().union(*(_variables(child) for child in _children(expression)))
+
+
+def _children(expression: Expression) -> list[Expression]:
+    """The expressions directly inside an expression."""
+    children: list[Expression] = []
+    for field in dataclasses.fields(expression):
+        value = getattr(expression, field.name)
+        for item in value if isinstance(value, tuple) else (value,):
+            if isinstance(item, Expression):
+                children.append(item)
+    return children
+
+
+def _mapped(
+    expression: Expression, change: Callable[[Expression], Expression | None]
+) -> Expression:
+    """The expression with each part for which ``change`` gives a
+    replacement replaced, from the outside in."""
+    replacement = change(expression)
+    if replacement is not None:
+        return replacement
+    updates: dict[str, object] = {}
+    for field in dataclasses.fields(expression):
+        value = getattr(expression, field.name)
+        if isinstance(value, tuple):
+            updates[field.name] = tuple(
+                _mapped(item, change) if isinstance(item, Expression) else item
+                for item in value
+            )
+        elif isinstance(value, Expression):
+            updates[field.name] = _mapped(value, change)
+    return dataclasses.replace(expression, **updates)
+
+
+def _calculated(expression: Expression) -> list[Calculated]:
+    """The CALCULATED references in an expression."""
+    if isinstance(expression, Calculated):
+        return [expression]
+    return [found for child in _children(expression) for found in _calculated(child)]
+
+
+def _expanded(expression: Expression, calculated: dict[str, Expression]) -> Expression:
+    """The expression with each CALCULATED reference replaced by what it
+    refers to (see calculated_columns, which checks they all resolve)."""
+    return _mapped(
+        expression,
+        lambda node: (
+            calculated[node.name.lower()] if isinstance(node, Calculated) else None
+        ),
+    )
 
 
 def _assignment_chain(
@@ -2732,20 +2952,9 @@ def _is_summary(call: Call) -> bool:
 
 
 def _has_summary(expression: Expression) -> bool:
-    match expression:
-        case Call() if _is_summary(expression):
-            return True
-        case Call(arguments=arguments):
-            return any(_has_summary(argument) for argument in arguments)
-        case Binary(left=left, right=right):
-            return _has_summary(left) or _has_summary(right)
-        case Unary(operand=operand) | IsMissing(expression=operand):
-            return _has_summary(operand)
-        case In(expression=inner, values=values):
-            return any(_has_summary(e) for e in (inner, *values))
-        case Between(expression=inner, low=low, high=high):
-            return any(_has_summary(e) for e in (inner, low, high))
-    return False
+    if isinstance(expression, Call) and _is_summary(expression):
+        return True
+    return any(_has_summary(child) for child in _children(expression))
 
 
 def _bare_columns(expression: Expression) -> set[str]:
@@ -2756,17 +2965,7 @@ def _bare_columns(expression: Expression) -> set[str]:
             return {name.lower()}
         case Call() if _is_summary(expression):
             return set()
-        case Call(arguments=arguments):
-            return set().union(*(_bare_columns(a) for a in arguments))
-        case Binary(left=left, right=right):
-            return _bare_columns(left) | _bare_columns(right)
-        case Unary(operand=operand) | IsMissing(expression=operand):
-            return _bare_columns(operand)
-        case In(expression=inner, values=values):
-            return set().union(*(_bare_columns(e) for e in (inner, *values)))
-        case Between(expression=inner, low=low, high=high):
-            return _bare_columns(inner) | _bare_columns(low) | _bare_columns(high)
-    return set()
+    return set().union(*(_bare_columns(child) for child in _children(expression)))
 
 
 def _qualifies(query: SqlQuery) -> bool:
@@ -2781,20 +2980,9 @@ def _qualifies(query: SqlQuery) -> bool:
 
 
 def _has_qualified(expression: Expression) -> bool:
-    match expression:
-        case Qualified():
-            return True
-        case Call(arguments=arguments):
-            return any(_has_qualified(argument) for argument in arguments)
-        case Binary(left=left, right=right):
-            return _has_qualified(left) or _has_qualified(right)
-        case Unary(operand=operand) | IsMissing(expression=operand):
-            return _has_qualified(operand)
-        case In(expression=inner, values=values):
-            return any(_has_qualified(e) for e in (inner, *values))
-        case Between(expression=inner, low=low, high=high):
-            return any(_has_qualified(e) for e in (inner, low, high))
-    return False
+    if isinstance(expression, Qualified):
+        return True
+    return any(_has_qualified(child) for child in _children(expression))
 
 
 def _all(conditions: list[ir.Expression]) -> ir.Expression:

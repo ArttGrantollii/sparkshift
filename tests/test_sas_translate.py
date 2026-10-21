@@ -2335,3 +2335,271 @@ def test_a_statement_after_the_data_lines_is_reported() -> None:
     program = "data a; input x; datalines;\n1\n;\ny = 1; run;"
 
     assert issues(program) == ["statement after DATALINES"]
+
+
+# --- PROC SQL: CASE and CALCULATED ---------------------------------------------
+
+
+def only_item(relation: ir.Relation) -> ir.Expression:
+    assert isinstance(relation, ir.Project)
+    [item] = relation.items
+    assert isinstance(item, ir.Alias)
+    return item.expression
+
+
+def test_case_with_conditions_is_a_case() -> None:
+    relation = sql("select case when x > 1 then 'big' else 'small' end as size from t")
+
+    assert only_item(relation) == ir.Case(
+        ((GREATER_1, Literal("big")),), Literal("small")
+    )
+
+
+def test_case_without_else_is_missing_otherwise() -> None:
+    relation = sql("select case when x > 1 then 1 end as flag from t")
+
+    assert only_item(relation) == ir.Case(((GREATER_1, Literal(1)),), None)
+
+
+def test_case_with_an_operand_compares_by_sas_rules() -> None:
+    relation = sql(
+        "select case name when 'Ann' then 1 when 'Bob  ' then 2 end as n from t"
+    )
+
+    name = Column(("name",))
+    assert only_item(relation) == ir.Case(
+        (
+            (BinaryOp(BinaryOperator.EQUAL, text(name), Literal("Ann")), Literal(1)),
+            (BinaryOp(BinaryOperator.EQUAL, text(name), Literal("Bob")), Literal(2)),
+        ),
+        None,
+    )
+
+
+def test_case_values_may_be_missing() -> None:
+    relation = sql("select case when x > 1 then . else x end as y from t")
+
+    assert only_item(relation) == ir.Case(((GREATER_1, Literal(None)),), X)
+
+
+def test_case_inside_a_summary() -> None:
+    relation = sql(
+        "select g, sum(case when x > 1 then y else 0 end) as s from t group by g"
+    )
+
+    assert isinstance(relation, ir.Aggregate)
+    [total] = relation.aggregates
+    assert isinstance(total, ir.Alias)
+    assert ir.Case(((GREATER_1, Y),), Literal(0)) in ir.children(total.expression)
+
+
+@pytest.mark.parametrize(
+    ("program", "message"),
+    [
+        (
+            "proc sql; create table o as select case when x > 1 then 'a' else 0 end "
+            "as m from t; quit;",
+            "CASE of text and numbers",
+        ),
+        (
+            "proc sql; create table o as select case when x > 1 then 'a' else . end "
+            "as m from t; quit;",
+            "CASE of text and numbers",
+        ),
+        (
+            "data a; set t; y = case when x > 1 then 1 else 0 end; run;",
+            "CASE expression in a DATA step",
+        ),
+        (
+            "proc sql; create table o as select calculated d + 1 as e, x * 2 as d "
+            "from t; quit;",
+            "CALCULATED d before d is calculated",
+        ),
+        (
+            "proc sql; create table o as select calculated e + 1 as e from t; quit;",
+            "CALCULATED e before e is calculated",
+        ),
+        (
+            "proc sql; create table o as select x, calculated nope as e from t; quit;",
+            "CALCULATED nope, which the SELECT list does not calculate",
+        ),
+        (
+            "proc sql; create table o as select x * 2 as d from t "
+            "order by calculated d; quit;",
+            "CALCULATED in ORDER BY",
+        ),
+        (
+            "proc sql; create table o as select g, sum(x) as s from t group by g "
+            "having calculated s > 1; quit;",
+            "CALCULATED in HAVING",
+        ),
+        (
+            "proc sql; create table o as select x * 2 as d, count(*) as n from t "
+            "group by calculated d; quit;",
+            "CALCULATED in GROUP BY",
+        ),
+        (
+            "proc sql; create table o as select a.x * 2 as d from t a "
+            "left join u b on calculated d = b.y; quit;",
+            "CALCULATED in ON",
+        ),
+        (
+            "proc sql; create table o as select g, sum(x) as s from t "
+            "where calculated s > 1 group by g; quit;",
+            "summary function in WHERE",
+        ),
+        (
+            "proc sql; create table o as select g, sum(x) as s, calculated s * 2 "
+            "from t group by g; quit;",
+            "computed column without a name",
+        ),
+        ("data a; set t; y = calculated x; run;", "CALCULATED outside PROC SQL"),
+    ],
+)
+def test_unsupported_case_and_calculated(program: str, message: str) -> None:
+    assert issues(program) == [message]
+
+
+def test_calculated_columns_are_computed_again_in_select_and_where() -> None:
+    relation = sql(
+        "select x * 2 as d, calculated d + 1 as e from t where calculated d > 4"
+    )
+
+    doubled = BinaryOp(BinaryOperator.MULTIPLY, X, Literal(2))
+    assert relation == ir.Project(
+        ir.Filter(
+            T,
+            BinaryOp(
+                BinaryOperator.AND,
+                IsNull(doubled, negated=True),
+                BinaryOp(BinaryOperator.GREATER, doubled, Literal(4)),
+            ),
+        ),
+        (
+            ir.Alias(doubled, "d"),
+            ir.Alias(BinaryOp(BinaryOperator.ADD, doubled, Literal(1)), "e"),
+        ),
+    )
+
+
+def test_calculated_summaries_are_computed_after_the_summary() -> None:
+    relation = sql(
+        "select a.g, sum(a.x) as s, calculated s * 2 as d, a.g + calculated d as z "
+        "from t a group by a.g"
+    )
+
+    assert relation == ir.WithColumn(
+        ir.WithColumn(
+            ir.Aggregate(
+                ir.RelationAlias(T, "a"),
+                (Column(("a", "g")),),
+                (
+                    ir.Alias(
+                        ir.AggregateCall(
+                            ir.AggregateFunction.SUM, (Column(("a", "x")),)
+                        ),
+                        "s",
+                    ),
+                ),
+            ),
+            "d",
+            BinaryOp(BinaryOperator.MULTIPLY, Column(("s",)), Literal(2)),
+        ),
+        "z",
+        BinaryOp(BinaryOperator.ADD, Column(("g",)), Column(("d",))),
+    )
+
+
+def test_a_calculated_column_inside_a_summary_is_computed_again() -> None:
+    relation = sql(
+        "select g, sum(x) as s, sum(y) / calculated s as share from t group by g"
+    )
+
+    assert isinstance(relation, ir.Aggregate)
+    assert [a.name for a in relation.aggregates if isinstance(a, ir.Alias)] == [
+        "s",
+        "share",
+    ]
+
+
+DATA_LINES = (
+    "data acc; input id kind $; datalines;\n1 A\n;\nrun; "
+    "data tx; input id amount note $; datalines;\n1 5 x\n;\nrun; "
+)
+
+
+def test_proc_sql_knows_the_columns_of_data_lines() -> None:
+    program = DATA_LINES + (
+        "proc sql; create table s as select a.id, b.amount from acc a "
+        "left join tx b on a.id = b.id and a.kind = b.note; quit;"
+    )
+
+    translation = translate(program)
+    assert translation.warnings == ()
+    join = translation.datasets[-1].source
+    assert isinstance(join, ir.Project)
+    assert isinstance(join.source, ir.Join)
+    assert join.source.condition == BinaryOp(
+        BinaryOperator.AND,
+        ir.NullSafeEqual(Column(("a", "id")), Column(("b", "id"))),
+        BinaryOp(
+            BinaryOperator.EQUAL,
+            text(Column(("a", "kind"))),
+            text(Column(("b", "note"))),
+        ),
+    )
+
+
+def test_proc_sql_rejects_comparing_known_text_with_a_number() -> None:
+    program = DATA_LINES + (
+        "proc sql; create table s as select a.id from acc a "
+        "left join tx b on a.kind = b.amount; quit;"
+    )
+
+    assert issues(program) == ["comparison of text with a number"]
+
+
+def test_proc_sql_knows_the_columns_of_one_table() -> None:
+    program = DATA_LINES + (
+        "proc sql; create table s as select id from tx where amount = id; quit;"
+    )
+
+    assert translate(program).warnings == ()
+
+
+def test_unknown_columns_still_warn_in_a_join() -> None:
+    assert sql_warnings("select a.x from t a left join u b on a.x = b.x") == [
+        "equality of two columns"
+    ]
+
+
+def test_a_summary_inside_case_makes_a_summary_query() -> None:
+    relation = sql(
+        "select g, case when sum(x) > 1 then 1 else 0 end as big from t group by g"
+    )
+
+    assert isinstance(relation, ir.Aggregate)
+
+
+@pytest.mark.parametrize(
+    ("query", "message"),
+    [
+        (
+            "select g, upcase(name) as u, count(*) as n from t group by g",
+            "column name neither grouped nor summarized",
+        ),
+        (
+            "select g, sum(round(max(x))) as s from t group by g",
+            "summary function inside a summary function",
+        ),
+        (
+            "select g, count(*) as n from t group by g "
+            "having case when max(x) > 1 then name else 'a' end = 'a'",
+            "HAVING on a column neither grouped nor summarized",
+        ),
+    ],
+)
+def test_columns_inside_functions_and_case_are_checked(
+    query: str, message: str
+) -> None:
+    assert sql_issues(query) == [message]

@@ -47,7 +47,7 @@ Procedure User's Guide*, *SAS 9.4 Statements: Reference* for `INPUT` and
 | `FORMAT` statement | Accepted: a format changes how SAS displays a value, never the value. The variables it names must exist at that point. See [FORMAT](#format) |
 | `PROC PRINT` | `DATA=`, `VAR`, `WHERE`, and the options that only change the printout (`NOOBS`, `LABEL`, ...). What the last PROC PRINT shows is the result. See [PROC PRINT](#proc-print) |
 | `PROC SORT` | `DATA=`, `OUT=` (with data set options), `NODUPKEY`, `BY` with `DESCENDING`, and `WHERE`. Options that do not change the result (`EQUALS`, `FORCE`, `TAGSORT`, `SORTSIZE=`, ...) are accepted. See [PROC SORT](#proc-sort) |
-| `PROC SQL` | `CREATE TABLE name AS SELECT` with `DISTINCT`, columns and `AS` names, `FROM` a data set (with data set options and an alias), `INNER JOIN` and `LEFT JOIN ... ON`, `WHERE`, `GROUP BY` columns, `HAVING`, `ORDER BY` names or positions with `DESC`, and the summary functions `COUNT(*)`, `COUNT`, `SUM`, `AVG`/`MEAN`, `MIN`, `MAX`, `NMISS`, `RANGE`, `STD`, `VAR` (`COUNT` and `SUM` also with `DISTINCT`). See [PROC SQL](#proc-sql) |
+| `PROC SQL` | `CREATE TABLE name AS SELECT` with `DISTINCT`, columns and `AS` names, `CASE`, `CALCULATED`, `FROM` a data set (with data set options and an alias), `INNER JOIN` and `LEFT JOIN ... ON`, `WHERE`, `GROUP BY` columns, `HAVING`, `ORDER BY` names or positions with `DESC`, and the summary functions `COUNT(*)`, `COUNT`, `SUM`, `AVG`/`MEAN`, `MIN`, `MAX`, `NMISS`, `RANGE`, `STD`, `VAR` (`COUNT` and `SUM` also with `DISTINCT`). See [PROC SQL](#proc-sql) |
 | `PROC FREQ` | `DATA=`, `BY`, `WHERE`, and `TABLES a` or `TABLES a*b*...` with `/ OUT=`, `MISSING`, and `OUTPCT` (two-way tables). Options that only change printed output are accepted. See [PROC FREQ](#proc-freq) |
 | `PROC MEANS`, `PROC SUMMARY` | `DATA=`, `NWAY`, `MISSING`; `CLASS` (with `/ MISSING`), `VAR`, `BY`, `WHERE`; `OUTPUT OUT=` with `N`, `NMISS`, `SUM`, `MEAN`, `MIN`, `MAX`, `RANGE`, `STD`, and `VAR`, in the forms `mean=`, `mean=names`, and `mean(variables)=names`. Options that only change printed output are accepted. See [PROC MEANS and SUMMARY](#proc-means-and-summary) |
 | Comments | `/* ... */` anywhere, and `* ... ;` statements |
@@ -65,7 +65,8 @@ collating sequences, PROC MEANS without `OUTPUT` (a printed report), quantiles
 such as `MEDIAN`, `AUTONAME`, `TYPES`, `WAYS`, `ID`, `FREQ`, and `WEIGHT`, PROC
 FREQ without `OUT=` (printed tables), its `OUTPUT` statement, `SPARSE`,
 `OUTCUM`, and grouped requests such as `(a b)*c`, PROC SQL queries that are not
-in `CREATE TABLE ... AS` (they print a report), subqueries, `CALCULATED`,
+in `CREATE TABLE ... AS` (they print a report), subqueries, `CALCULATED`
+outside `SELECT` and `WHERE`,
 `UNION` and the other set operators, `RIGHT`, `FULL`, `CROSS`, and comma joins,
 `INSERT`, `UPDATE`, and the other PROC SQL statements, and the other PROC
 steps.
@@ -579,7 +580,34 @@ condition `a.id = b.id` matches missing values with each other, which
 `eqNullSafe` does. SparkShift cannot see whether the columns are numbers or
 text; for text, SAS would also ignore trailing blanks and treat empty text as
 missing. So an equality of two columns is translated with a warning; other
-comparisons of two columns are rejected, as in a DATA step.
+comparisons of two columns are rejected, as in a DATA step. For tables read
+from data lines, whose columns SparkShift knows (see [Data lines](#data-lines)),
+two numbers or two texts are compared by SAS's rules without a warning, and a
+number compared with text is rejected.
+
+**CASE.** *SAS SQL Procedure User's Guide*, "CASE Expression": the result is
+the value after the first `WHEN` whose condition is true; "if no ELSE
+expression is present and every when-condition is false, then the result of
+the CASE expression is a missing value". Both forms are supported, and become
+`F.when(...).otherwise(...)`: `CASE WHEN condition THEN ...`, whose conditions
+follow SAS's rules as in `WHERE`, and `CASE operand WHEN value THEN ...`,
+which compares the operand with each value for equality (text without its
+trailing blanks). Every `THEN` and `ELSE` value must be of one type: SAS stops
+with an error otherwise, and SparkShift rejects it. A CASE expression can be
+an argument of a summary function, as in `sum(case when kind = 'A' then amount
+else 0 end)`. In a DATA step, use `IF`-`THEN`/`ELSE` instead.
+
+**CALCULATED.** *SAS SQL Procedure User's Guide*, "CALCULATED Component":
+`CALCULATED name` refers to a column the `SELECT` list computes under that
+name, "in the same SELECT clause or in the WHERE clause". In `SELECT` it must
+refer to a column computed earlier in the list; in `WHERE`, to any of them
+(a summary there is rejected, as `WHERE` cannot filter on one; use `HAVING`).
+The column is computed again from its expression, except in a query with
+summaries: a column that uses `CALCULATED` columns and no summary function of
+its own, such as `calculated total - calculated refunds`, is computed after
+the summaries, from their columns, with `.withColumn(...)`. Elsewhere
+(`HAVING`, `ORDER BY`, `GROUP BY`, `ON`) it is rejected; order by the column's
+name instead.
 
 **Summary functions.** In a query's `SELECT` and `HAVING`, `COUNT(*)` counts
 rows, and a summary function with one argument, such as `SUM(amount)`,
