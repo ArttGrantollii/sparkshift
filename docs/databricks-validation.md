@@ -41,6 +41,23 @@ those tables with other columns, so each write must replace a table, schema
 included; after each example it compares every table the example wrote with
 the expected types and rows of that table.
 
+With `--pipeline CATALOG.SCHEMA`, it validates a Lakeflow pipeline instead
+([pipelines](pipelines.md)). It creates the tables as above, converts every
+example into a pipeline source file, with one more SAS program whose data
+sets use `drop`, `distinct`, and `dropDuplicates` on each other, uploads the
+files, and creates or updates one pipeline, `sparkshift validation`, that
+keeps its tables in `CATALOG.SCHEMA`. It runs the pipeline twice, a full
+refresh and then an update, because a later run is where Apache Spark's own
+pipelines can go wrong ([ADR 0013](adr/0013-pipelines-from-the-same-plan.md)),
+and after each run compares every table the pipeline keeps with what the
+plain code computes on local Spark.
+
+```bash
+uv run python tools/validate_databricks.py --profile sparkshift \
+    --folder /Workspace/Users/you@example.com/sparkshift-validation \
+    --pipeline workspace.sparkshift_pipeline
+```
+
 ## Results
 
 ### 2026-10-15, Databricks Free Edition, serverless compute
