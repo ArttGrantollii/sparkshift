@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 import pytest
 
 import sparkshift
+from sparkshift.notebook import notebook_cells
 
 pytestmark = pytest.mark.browser
 
@@ -159,6 +160,7 @@ def test_choosing_notebooks_converts_nothing_that_was_not_converted(
         page.wait_for_timeout(500)
         page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
         assert page.is_hidden("#output"), kind
+        assert page.is_hidden("#output-cells"), kind
         assert page.is_enabled("#convert")
 
 
@@ -433,19 +435,142 @@ def test_notebook_output_is_what_the_command_line_writes(session: dict) -> None:
     convert_in_page(page, sql, "tsql")
 
     page.click("#output-notebook")
-    page.wait_for_selector("#output:visible", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector("#output-cells:visible", timeout=READY_TIMEOUT_MS)
     page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
 
     result = sparkshift.convert(sql, dialect="tsql")
+    # Shown as cells; the file stays what Copy and Download take.
+    assert page.is_hidden("#output")
     assert page.text_content("#code") == sparkshift.to_notebook(result, dialect="tsql")
     assert page.text_content("#output-label") == "Notebook"
     assert page.get_attribute("#output-notebook", "aria-checked") == "true"
 
     page.click("#output-code")
     page.wait_for_selector("#output:visible", timeout=READY_TIMEOUT_MS)
+    assert page.is_hidden("#output-cells")
     page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
     assert page.text_content("#code") == result.code
     assert page.text_content("#output-label") == "PySpark"
+
+
+NOTEBOOK_PROGRAM = (
+    "data recent; set orders(keep=order_id amount); where amount > 10; run; "
+    "proc sort data=recent out=dedup nodupkey; by order_id; run;"
+)
+
+
+@pytest.fixture
+def notebook_page(session: dict) -> Iterator[Any]:
+    """The shared page, back to plain code afterwards."""
+    page = session["page"]
+    yield page
+    if page.get_attribute("#output-notebook", "aria-checked") == "true":
+        page.click("#output-code")
+        page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
+
+
+def show_notebook(page: Any, sql: str, dialect: str) -> list:
+    """Convert ``sql`` as a notebook in the file view; return its cells."""
+    convert_in_page(page, sql, dialect)
+    if page.get_attribute("#output-notebook", "aria-checked") != "true":
+        page.click("#output-notebook")
+    page.wait_for_selector("#output-cells:visible", timeout=READY_TIMEOUT_MS)
+    page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
+    return notebook_cells(
+        sparkshift.convert(sql, dialect=dialect or None), dialect=dialect or None
+    )
+
+
+def test_a_notebook_is_shown_as_its_cells(notebook_page: Any) -> None:
+    page = notebook_page
+    cells = show_notebook(page, NOTEBOOK_PROGRAM, "sas")
+
+    shown = page.locator("#output-cells > .cell")
+    assert shown.count() == len(cells)
+    for position, cell in enumerate(cells):
+        element = shown.nth(position)
+        if cell.kind == "markdown":
+            assert element.evaluate("node => node.tagName") == "SECTION"
+            assert element.locator("h3").text_content() == "Converted code"
+            assert "# MAGIC" not in element.text_content()
+        elif cell.kind == "setup":
+            # Folded, with what it does, until the visitor opens it.
+            assert element.evaluate("node => node.tagName") == "DETAILS"
+            assert element.get_attribute("open") is None
+            assert element.locator(".cell-title").text_content() == cell.title
+            lines = cell.source.count("\n") + 1
+            assert (
+                element.locator(".cell-meta").text_content() == f"Setup · {lines} lines"
+            )
+            assert element.locator("pre").is_hidden()
+            assert element.locator("pre").text_content() == cell.source
+        else:
+            assert element.locator(".cell-head").text_content() == (
+                f"Cell {position + 1}Python"
+            )
+            assert element.locator("pre").text_content() == cell.source
+            assert element.locator("pre .ln").count() == cell.source.count("\n") + 1
+    notebook = sparkshift.to_notebook(
+        sparkshift.convert(NOTEBOOK_PROGRAM, dialect="sas"), dialect="sas"
+    )
+    assert page.text_content("#output-lines") == (
+        f"{len(cells)} cells · {notebook.count(chr(10))} lines"
+    )
+
+
+def test_a_setup_cell_opens_to_show_its_code(notebook_page: Any) -> None:
+    page = notebook_page
+    show_notebook(page, NOTEBOOK_PROGRAM, "sas")
+    setup = page.locator("#output-cells > details.setup").first
+
+    setup.locator("summary").click()
+
+    assert setup.get_attribute("open") == ""
+    assert setup.locator("pre").is_visible()
+    setup.locator("summary").press("Enter")
+    assert setup.get_attribute("open") is None
+
+
+def test_notebook_markdown_is_formatted(notebook_page: Any) -> None:
+    page = notebook_page
+    show_notebook(page, WARNING_PROGRAM, "sas")
+    markdown = page.locator("#output-cells > .cell.markdown")
+
+    warnings = sparkshift.convert(WARNING_PROGRAM, dialect="sas").warnings
+    assert markdown.locator("strong").text_content() == "Review before running:"
+    assert markdown.locator("li").count() == len(warnings)
+    assert markdown.locator("li code").first.text_content() == warnings[0].sql
+    codes = markdown.locator("p code").all_text_contents()
+    assert {"catalog", "schema", "output_schema", "dedup"} <= set(codes)
+
+
+def test_copy_and_download_keep_the_notebook_file(notebook_page: Any) -> None:
+    page = notebook_page
+    show_notebook(page, NOTEBOOK_PROGRAM, "sas")
+    notebook = sparkshift.to_notebook(
+        sparkshift.convert(NOTEBOOK_PROGRAM, dialect="sas"), dialect="sas"
+    )
+
+    page.click("#copy")
+    page.wait_for_selector("#status:has-text('Copied the notebook.')")
+    assert page.evaluate("navigator.clipboard.readText()") == notebook
+    with page.expect_download() as download_info:
+        page.click("#download")
+    download = download_info.value
+    assert download.suggested_filename == "converted_notebook.py"
+    assert Path(download.path()).read_text(encoding="utf-8") == notebook
+
+
+def test_a_failed_notebook_clears_its_cells(notebook_page: Any) -> None:
+    page = notebook_page
+    show_notebook(page, NOTEBOOK_PROGRAM, "sas")
+
+    convert_in_page(page, "data a; set b; retain x; run;", "sas")
+
+    assert page.is_visible("#errors")
+    assert page.is_hidden("#output-cells")
+    assert page.locator("#output-cells > .cell").count() == 0
+    assert page.is_disabled("#copy")
 
 
 def test_input_highlighting_shows_exactly_the_source(session: dict) -> None:
@@ -700,6 +825,17 @@ def test_a_folder_of_notebooks(folder_view: Any) -> None:
         source="daily_revenue.sql",
     )
     assert files["coverage_notebooks/orders/daily_revenue.py"] == expected.encode()
+
+    # Each file's notebook is shown as its cells.
+    file_button(page, "daily_revenue.sql").click()
+    cells = notebook_cells(
+        sparkshift.convert(revenue.read_text(encoding="utf-8")),
+        source="daily_revenue.sql",
+    )
+    assert page.is_hidden("#file-output")
+    assert page.locator("#file-cells > .cell").count() == len(cells)
+    assert page.text_content("#file-code") == expected
+    assert page.locator("#file-cells h3").text_content() == "daily_revenue"
 
 
 def test_files_chosen_one_by_one_use_the_dialect_except_sas(folder_view: Any) -> None:
@@ -1231,6 +1367,36 @@ def test_page_has_no_accessibility_violations(
     page.context.close()
 
 
+@pytest.mark.parametrize("color_scheme", ["light", "dark"])
+def test_notebook_cells_have_no_accessibility_violations(
+    browser: Any, site_url: str, color_scheme: str
+) -> None:
+    from axe_playwright_python.sync_playwright import Axe
+
+    page = open_page(browser, site_url, bypass_csp=True, color_scheme=color_scheme)
+    show_notebook(page, WARNING_PROGRAM, "sas")
+    # One setup cell open, one folded.
+    page.locator("#output-cells > details.setup summary").first.click()
+
+    results = Axe().run(
+        page, options={"runOnly": ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"]}
+    )
+
+    assert results.violations_count == 0, results.generate_report()
+    page.context.close()
+
+
+def test_notebook_cells_fit_a_phone_screen(browser: Any, site_url: str) -> None:
+    page = open_page(browser, site_url, viewport={"width": 375, "height": 812})
+
+    show_notebook(page, WARNING_PROGRAM, "sas")
+    page.locator("#output-cells > details.setup summary").first.click()
+    scroll_width = page.evaluate("document.documentElement.scrollWidth")
+
+    assert scroll_width <= 375
+    page.context.close()
+
+
 def test_page_fits_a_phone_screen(browser: Any, site_url: str) -> None:
     page = open_page(browser, site_url, viewport={"width": 375, "height": 812})
 
@@ -1304,6 +1470,7 @@ WARNING_PROGRAM = "proc sort data=orders out=dedup nodupkey; by customer_id; run
 def assert_failed_output_is_cleared(page: Any) -> None:
     assert page.is_visible("#errors")
     assert page.is_hidden("#output")
+    assert page.is_hidden("#output-cells")
     assert page.is_disabled("#copy")
     assert page.text_content("#code") == ""
     assert page.is_hidden("#warnings")

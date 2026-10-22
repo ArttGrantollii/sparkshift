@@ -1,6 +1,7 @@
 // The page owns the UI; a cancellable worker owns Python and conversion.
 import { ConversionWorker, STARTUP_TIMEOUT_MS, CONVERSION_TIMEOUT_MS } from "./worker-client.js";
 import { highlightLines, lineCount } from "./highlight.js";
+import { renderCells } from "./cells.js";
 import { filesFromDrop, filesFromInput, readSource } from "./files.js";
 import { looksLikeSas, looksLikeSql } from "./language.js";
 import {
@@ -33,6 +34,7 @@ const elements = Object.fromEntries(
     "sql-view",
     "language",
     "output",
+    "output-cells",
     "output-empty",
     "output-label",
     "output-code",
@@ -71,6 +73,7 @@ const elements = Object.fromEntries(
     "file-output-lines",
     "file-output-empty",
     "file-output",
+    "file-cells",
     "file-code",
     "file-warnings",
     "file-errors",
@@ -329,9 +332,11 @@ function clearOutput() {
   if (mode === "file") elements.copy.disabled = true;
   elements.download.disabled = true;
   elements.output.hidden = true;
+  elements["output-cells"].hidden = true;
   elements["output-empty"].hidden = false;
   elements["output-lines"].textContent = "";
   elements.code.replaceChildren();
+  elements["output-cells"].replaceChildren();
   for (const panel of [elements.errors, elements.warnings]) {
     panel.replaceChildren();
     panel.hidden = true;
@@ -409,10 +414,10 @@ async function convert() {
       return false;
     }
     elements.code.replaceChildren(highlightLines(result.code, "python"));
-    elements["output-lines"].textContent = lineCount(result.code);
+    elements["output-lines"].textContent = outputSize(result);
     showWarnings(result.warnings, elements.warnings);
     elements["output-empty"].hidden = true;
-    elements.output.hidden = false;
+    showCells(result, elements.output, elements["output-cells"]);
     if (mode === "file") elements.copy.disabled = false;
     elements.download.disabled = false;
     setStatus(result.warnings.length
@@ -432,6 +437,26 @@ async function convert() {
       updateControls();
     }
   }
+}
+
+// A notebook's cells, when it has them, in place of its file.
+function showCells(result, file, cells) {
+  const shown = notebook && result.cells !== undefined;
+  cells.replaceChildren(shown ? renderCells(result.cells) : "");
+  cells.hidden = !shown;
+  file.hidden = shown;
+  cells.scrollTop = 0;
+}
+
+function outputSize(result) {
+  const size = lineCount(result.code);
+  if (!notebook || result.cells === undefined) return size;
+  return `${result.cells.length} cells · ${size}`;
+}
+
+// Whether converted code is shown, as a file or as a notebook's cells.
+function outputShown() {
+  return !elements.output.hidden || !elements["output-cells"].hidden;
 }
 
 function showWarnings(warnings, panel) {
@@ -604,6 +629,7 @@ async function convertFile(candidate, entry) {
       state: result.warnings.length ? "warn" : "ok",
       sql,
       code: result.code,
+      cells: result.cells,
       warnings: result.warnings,
     };
   } catch (error) {
@@ -822,10 +848,16 @@ function showSelected() {
     : result.state === "bad" ? "This file cannot be shown." : "Waiting to be read.";
 
   const code = result?.code;
-  elements["file-output"].hidden = code === undefined;
   elements["file-output-empty"].hidden = code !== undefined;
   elements["file-code"].replaceChildren(code === undefined ? "" : highlightLines(code, "python"));
-  elements["file-output-lines"].textContent = code === undefined ? "" : lineCount(code);
+  if (code === undefined) {
+    elements["file-output"].hidden = true;
+    elements["file-cells"].hidden = true;
+    elements["file-cells"].replaceChildren();
+  } else {
+    showCells(result, elements["file-output"], elements["file-cells"]);
+  }
+  elements["file-output-lines"].textContent = code === undefined ? "" : outputSize(result);
   elements["file-output-empty"].textContent = entry
     ? WAITING_OUTPUT[result.state] ?? ""
     : "The converted code appears here.";
@@ -875,7 +907,7 @@ function chooseMode(next) {
   elements.download.hidden = folder || deploy;
   elements.share.hidden = folder || deploy;
   elements["download-zip"].hidden = !folder;
-  elements.copy.disabled = folder ? results[selected]?.code === undefined : elements.output.hidden;
+  elements.copy.disabled = folder ? results[selected]?.code === undefined : !outputShown();
   updateControls();
   if (ready) {
     const saved = savedStatus[next];
@@ -897,7 +929,7 @@ function chooseOutput(asNotebook) {
     resetFolder();
     // Shown code is converted again in the new kind; nothing converts that
     // the visitor has not converted yet.
-    const shown = !elements.output.hidden;
+    const shown = outputShown();
     clearOutput();
     if (shown && ready && !busy) void convert();
   }
@@ -1187,7 +1219,7 @@ elements.sql.addEventListener("keydown", (event) => {
 elements.copy.addEventListener("click", async () => {
   const code = mode === "folder" ? elements["file-code"] : elements.code;
   await navigator.clipboard.writeText(code.textContent);
-  setStatus("Copied the PySpark code.", "ok");
+  setStatus(notebook ? "Copied the notebook." : "Copied the PySpark code.", "ok");
 });
 elements.download.addEventListener("click", download);
 elements["download-zip"].addEventListener("click", () => {

@@ -21,6 +21,7 @@ import sparkshift
 from sparkshift.batch import colliding, dialect_of, source_suffixes
 from sparkshift.dialects import DIALECT_CHOICES
 from sparkshift.jobs import create_job_notebook, default_job_name, job_settings
+from sparkshift.notebook import markdown_text, notebook_cells
 
 # Playground policies, not limits imposed by the library or CLI.
 MAX_SOURCE_BYTES = 50_000
@@ -53,7 +54,9 @@ def notebook_for_page(
     """As ``convert_for_page``, with the code written as a Databricks
     notebook, exactly as ``sparkshift convert --notebook`` writes it;
     ``source`` is the name of the file it came from, for the title, and the
-    other values are the initial values of its widgets."""
+    other values are the initial values of its widgets. The JSON also has
+    ``cells``, each ``{"kind": ..., "title": ..., "text": ...}``, where
+    ``text`` is a Markdown cell's Markdown, or the code of another."""
     locations = {
         "catalog": catalog,
         "schema": schema,
@@ -248,20 +251,25 @@ def _convert(
                 "issues": [_issue(issue) for issue in issues],
             }
         )
-    code = (
-        sparkshift.to_notebook(
-            result, source=source, dialect=dialect or None, **(locations or {})
-        )
-        if notebook
-        else result.code
-    )
-    return json.dumps(
-        {
-            "ok": True,
-            "code": code,
-            "warnings": [str(warning) for warning in result.warnings],
-        }
-    )
+    converted: dict[str, object] = {
+        "ok": True,
+        "code": result.code,
+        "warnings": [str(warning) for warning in result.warnings],
+    }
+    if notebook:
+        options = {"source": source, "dialect": dialect or None, **(locations or {})}
+        converted["code"] = sparkshift.to_notebook(result, **options)
+        converted["cells"] = [
+            {
+                "kind": cell.kind,
+                "title": cell.title,
+                "text": markdown_text(cell.source)
+                if cell.kind == "markdown"
+                else cell.source,
+            }
+            for cell in notebook_cells(result, **options)
+        ]
+    return json.dumps(converted)
 
 
 def about() -> str:

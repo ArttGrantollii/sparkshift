@@ -21,7 +21,11 @@ switch; nothing switches by itself. SQL dialects are not guessed: the same
 query can return different results in different databases (NULL ordering,
 integer division, string lengths), so you choose one. The **PySpark /
 Notebook** switch chooses between the plain code and the Databricks notebook
-that `sparkshift convert --notebook` writes.
+that `sparkshift convert --notebook` writes. A notebook is shown as its cells,
+as Databricks shows them: the Markdown cell formatted, each code cell with its
+own line numbers, and the setup cells that are the same in every notebook (the
+widgets, and the writing of results to tables) folded to one line that opens
+on a click. **Copy** and **Download .py** still give the notebook file itself.
 Both editors show line numbers and syntax highlighting; the numbers are drawn
 by CSS, so **Copy** and **Download .py** give exactly the generated code.
 **Copy link** puts the query in the link's `#` fragment, which browsers do not
@@ -160,7 +164,8 @@ Pages after CI passes on `main`, from the exact commit CI tested.
   Chromium: every example must convert exactly as on the command line, errors
   must list the same issues, warnings must be visible, failures and input edits
   must clear stale results, and shared links must restore the query. Notebook
-  output must match the command line, highlighting and line numbers must not
+  output must match the command line, and be shown cell by cell (setup cells
+  folded, Markdown formatted), highlighting and line numbers must not
   change the text, downloads must contain exactly the code, and the theme choice
   must be remembered. A chosen folder must give a zip identical to what the
   command line writes, including files with Windows line endings or that are

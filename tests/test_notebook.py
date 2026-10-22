@@ -6,7 +6,14 @@ import pytest
 
 import sparkshift
 from sparkshift.diagnostics import ConversionResult, Diagnostic
-from sparkshift.notebook import CELL_SEPARATOR, HEADER, to_notebook
+from sparkshift.notebook import (
+    CELL_SEPARATOR,
+    HEADER,
+    Cell,
+    markdown_text,
+    notebook_cells,
+    to_notebook,
+)
 from sparkshift.notebook import _table_name as table_name
 
 SEPARATOR = f"\n\n{CELL_SEPARATOR}\n\n"
@@ -388,3 +395,54 @@ def test_any_catalog_or_schema_name_stays_a_plain_value(name: str) -> None:
     assert defaults == [name] * 4
     assert len(tree.body) == len(ast.parse(program(result.code)).body)
     assert notebook.splitlines().count(CELL_SEPARATOR) == 4
+
+
+# --- Cells, for pages that show them -------------------------------------------
+
+
+def test_the_cells_make_the_notebook() -> None:
+    program = "data a; set t; x = 1; run; data b; set a; run;"
+    result = sparkshift.convert(program, dialect="sas")
+    options = {"source": "job.sas", "dialect": "sas", "output_schema": "out"}
+
+    cells = notebook_cells(result, **options)
+
+    notebook = to_notebook(result, **options)
+    separator = f"\n\n{CELL_SEPARATOR}\n\n"
+    assert notebook == f"{HEADER}\n{separator.join(cell.source for cell in cells)}\n"
+    assert [cell.kind for cell in cells] == [
+        "markdown",
+        "setup",
+        "code",  # the imports
+        "code",  # a
+        "code",  # b
+        "code",  # result = b
+        "setup",
+        "code",  # display(result)
+    ]
+    assert [cell.title for cell in cells if cell.kind == "setup"] == [
+        "Widgets: the catalog and schema to read from and write to",
+        "Write the results to tables",
+    ]
+    assert all(cell.title == "" for cell in cells if cell.kind != "setup")
+    assert cells[-1] == Cell("code", "display(result)")
+
+
+def test_a_notebook_without_tables_has_one_setup_cell() -> None:
+    result = sparkshift.convert("proc print data=t; run;", dialect="sas")
+
+    kinds = [cell.kind for cell in notebook_cells(result, dialect="sas")]
+
+    assert kinds.count("setup") == 1
+
+
+def test_markdown_text_is_the_markdown_of_a_cell() -> None:
+    result = sparkshift.convert("SELECT a FROM t")
+    [markdown] = [cell for cell in notebook_cells(result) if cell.kind == "markdown"]
+
+    text = markdown_text(markdown.source)
+
+    assert text.startswith("# Converted code\n\nConverted from code (generic SQL)")
+    assert "# MAGIC" not in text
+    cell = "# MAGIC %md\n# MAGIC # Title\n# MAGIC\n# MAGIC   kept"
+    assert markdown_text(cell) == "# Title\n\n  kept"

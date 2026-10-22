@@ -18,9 +18,14 @@ predefined in Databricks notebooks.
 
 The results written are each data set a SAS program creates, as a table of
 the same name, or a SQL query's result, as a table named after its file.
+
+``notebook_cells`` describes the same cells, for a page that shows them as
+Databricks does: Markdown formatted, and the setup cells, which are the same
+in every notebook, folded.
 """
 
 import re
+from dataclasses import dataclass
 from pathlib import PurePath
 
 from sparkshift.diagnostics import ConversionResult, Diagnostic
@@ -41,6 +46,18 @@ _LANGUAGES = {
     "bigquery": "BigQuery",
     "oracle": "Oracle",
 }
+
+
+@dataclass(frozen=True)
+class Cell:
+    """A cell of a notebook: ``kind`` is "markdown", "setup" (the widgets,
+    and the writing of results to tables, the same in every notebook), or
+    "code"; ``source`` is the cell as the notebook file has it, and ``title``
+    says what a setup cell does."""
+
+    kind: str
+    source: str
+    title: str = ""
 
 
 def to_notebook(
@@ -65,15 +82,57 @@ def to_notebook(
     is written while ``output_schema`` is empty, and an empty
     ``output_catalog`` means the current catalog.
     """
-    tables = _tables(result, source, dialect)
-    cells = [markdown_cell(_description(result, source, dialect, tables))]
-    cells.append(_location_cell(catalog, schema, output_catalog, output_schema))
-    cells += _code_cells(result.code)
-    if tables:
-        cells.append(_write_cell(result.code, tables))
-    cells.append("display(result)")
-    body = f"\n\n{CELL_SEPARATOR}\n\n".join(cells)
+    cells = notebook_cells(
+        result,
+        source=source,
+        dialect=dialect,
+        catalog=catalog,
+        schema=schema,
+        output_catalog=output_catalog,
+        output_schema=output_schema,
+    )
+    body = f"\n\n{CELL_SEPARATOR}\n\n".join(cell.source for cell in cells)
     return f"{HEADER}\n{body}\n"
+
+
+def notebook_cells(
+    result: ConversionResult,
+    *,
+    source: str | None = None,
+    dialect: str | None = None,
+    catalog: str = "",
+    schema: str = "",
+    output_catalog: str = "",
+    output_schema: str = "",
+) -> list[Cell]:
+    """The cells of the notebook ``to_notebook`` writes, with the same
+    arguments, in order."""
+    tables = _tables(result, source, dialect)
+    cells = [
+        Cell("markdown", markdown_cell(_description(result, source, dialect, tables)))
+    ]
+    cells.append(
+        Cell(
+            "setup",
+            _location_cell(catalog, schema, output_catalog, output_schema),
+            "Widgets: the catalog and schema to read from and write to",
+        )
+    )
+    cells += [Cell("code", code) for code in _code_cells(result.code)]
+    if tables:
+        cells.append(
+            Cell(
+                "setup", _write_cell(result.code, tables), "Write the results to tables"
+            )
+        )
+    cells.append(Cell("code", "display(result)"))
+    return cells
+
+
+def markdown_text(cell: str) -> str:
+    """The Markdown of a Markdown cell, without its ``# MAGIC`` prefixes."""
+    lines = cell.split("\n")[1:]  # after "# MAGIC %md"
+    return "\n".join(line.removeprefix(_MAGIC).removeprefix(" ") for line in lines)
 
 
 def _tables(

@@ -13,6 +13,7 @@ import pytest
 
 import sparkshift
 from sparkshift.dialects import DIALECT_CHOICES
+from sparkshift.notebook import markdown_text, notebook_cells
 
 BRIDGE = Path(__file__).parents[1] / "playground" / "bridge.py"
 
@@ -52,11 +53,26 @@ def test_a_notebook_is_what_the_command_line_writes(
     result = json.loads(bridge.notebook_for_page(sql, dialect))
 
     converted = sparkshift.convert(sql, dialect=dialect or None)
+    cells = notebook_cells(converted, dialect=dialect or None)
     assert result == {
         "ok": True,
         "code": sparkshift.to_notebook(converted, dialect=dialect or None),
         "warnings": [str(warning) for warning in converted.warnings],
+        "cells": [
+            {
+                "kind": cell.kind,
+                "title": cell.title,
+                "text": markdown_text(cell.source)
+                if cell.kind == "markdown"
+                else cell.source,
+            }
+            for cell in cells
+        ],
     }
+
+
+def test_plain_code_has_no_cells(bridge: ModuleType) -> None:
+    assert "cells" not in json.loads(bridge.convert_for_page("SELECT a FROM t", ""))
 
 
 def test_a_notebook_request_reports_errors_like_code(bridge: ModuleType) -> None:

@@ -24,6 +24,7 @@ PLAYGROUND_FILES = [
     "theme.js",
     "app.js",
     "highlight.js",
+    "cells.js",
     "files.js",
     "deploy.js",
     "language.js",

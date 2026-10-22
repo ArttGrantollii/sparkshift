@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The playground shows a notebook as its cells, as Databricks does: the
+  Markdown formatted, each code cell on its own, and the setup cells (widgets,
+  and writing results to tables) folded until opened. Copy and Download still
+  give the notebook file.
 - The playground has a new design: side-by-side editors with line numbers and
   syntax highlighting, a dark and a light theme (remembered per browser), and
   self-hosted fonts.
