@@ -30,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uploads them and creates the pipeline on serverless compute. Datasets read
   each other by name, so the pipeline orders them; a data set created twice
   is first a temporary view. See docs/pipelines.md and ADR 0013.
+- The playground shows a program as a pipeline source file (**Pipeline**),
+  converts folders into them, and deploys them: the Deploy tab can create a
+  Lakeflow pipeline instead of a job, with a **Create pipeline** notebook
+  that creates or updates it in the workspace.
 - The playground can show the Databricks notebook that `convert --notebook`
   writes, and download the result as a `.py` file.
 - The playground converts folders: drop or choose a folder or files, see each

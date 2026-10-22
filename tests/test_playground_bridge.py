@@ -245,10 +245,8 @@ def chosen_folder(folder: Path) -> list[str]:
     ]
 
 
-def plan(bridge: ModuleType, paths: list[str], dialect: str = "", **options: bool):
-    return json.loads(
-        bridge.plan_for_page(json.dumps(paths), dialect, options.get("notebook", False))
-    )
+def plan(bridge: ModuleType, paths: list[str], dialect: str = "", kind: str = "code"):
+    return json.loads(bridge.plan_for_page(json.dumps(paths), dialect, kind))
 
 
 def test_a_folder_is_planned_as_the_command_line_converts_it(
@@ -298,7 +296,7 @@ def test_sas_files_are_always_sas_and_the_sas_dialect_selects_only_them(
 
 
 def test_files_chosen_one_by_one_keep_their_names(bridge: ModuleType) -> None:
-    result = plan(bridge, ["b.sql", "a.sql"], notebook=True)
+    result = plan(bridge, ["b.sql", "a.sql"], kind="notebook")
 
     assert result["folder"] == "converted_notebooks"
     assert [(f["name"], f["output"]) for f in result["files"]] == [
@@ -475,3 +473,117 @@ def test_source_limit_is_not_imposed_on_the_python_library(bridge: ModuleType) -
     sql = "SELECT id FROM t --" + "x" * 50_000
     assert sparkshift.convert(sql).code == sparkshift.convert("SELECT id FROM t").code
     assert json.loads(bridge.convert_for_page(sql, ""))["ok"] is False
+
+
+# --- Pipelines -------------------------------------------------------------------
+
+
+def test_a_pipeline_is_what_the_command_line_writes(bridge: ModuleType) -> None:
+    sql = "SELECT order_id FROM orders"
+
+    result = json.loads(bridge.pipeline_for_page(sql, "", "daily.sql", "main", "raw"))
+
+    converted = sparkshift.convert(sql)
+    assert result == {
+        "ok": True,
+        "code": sparkshift.to_pipeline(
+            converted, source="daily.sql", catalog="main", schema="raw"
+        ),
+        "warnings": [],
+        "tables": ["daily"],
+    }
+
+
+def test_a_program_that_cannot_be_a_pipeline_reports_why(bridge: ModuleType) -> None:
+    printed = json.loads(bridge.pipeline_for_page("proc print data=t; run;", "sas"))
+    catalog_only = json.loads(
+        bridge.pipeline_for_page("SELECT a FROM t", "", None, "main")
+    )
+
+    assert printed["ok"] is False
+    assert printed["issues"][0]["message"] == (
+        "a pipeline of a program that creates no data set"
+    )
+    assert catalog_only == {
+        "ok": False,
+        "error": "a catalog needs a schema to read tables from",
+        "issues": [],
+    }
+
+
+def test_files_that_define_the_same_dataset_are_found(bridge: ModuleType) -> None:
+    definitions = [
+        ["a/daily.sql", ["daily"]],
+        ["load.sas", ["clean"]],
+        ["b/daily.sql", ["Daily"]],
+    ]
+
+    result = json.loads(bridge.shared_datasets_for_page(json.dumps(definitions)))
+
+    assert result == {
+        "ok": True,
+        "shared": {
+            "0": "its dataset daily is also defined by b/daily.sql; a pipeline "
+            "defines each dataset once",
+            "2": "its dataset daily is also defined by a/daily.sql; a pipeline "
+            "defines each dataset once",
+        },
+    }
+
+
+def test_the_pipeline_notebook_is_the_one_upload_would_create(
+    bridge: ModuleType,
+) -> None:
+    from sparkshift.pipelines import create_pipeline_notebook, pipeline_settings
+
+    files = [f"{FOLDER}/load.py", f"{FOLDER}/legacy/report.py"]
+
+    result = json.loads(
+        bridge.pipeline_notebook_for_page(
+            "", FOLDER, json.dumps(files), "main", "claims"
+        )
+    )
+
+    settings = pipeline_settings(
+        f"sparkshift {FOLDER.rsplit('/', 1)[1]}",
+        FOLDER,
+        files,
+        catalog="main",
+        schema="claims",
+    )
+    assert result == {
+        "ok": True,
+        "name": settings["name"],
+        "notebook": create_pipeline_notebook(settings),
+    }
+
+
+@pytest.mark.parametrize(
+    ("folder", "files", "catalog", "schema", "error"),
+    [
+        ("relative/path", [], "main", "claims", "must be an absolute path"),
+        (FOLDER, ["/elsewhere/a.py"], "main", "claims", "must be an absolute path"),
+        (FOLDER, [f"{FOLDER}/a.py"], "", "claims", "keeps its tables in a catalog"),
+        (FOLDER, [f"{FOLDER}/a.py"], "main", "", "keeps its tables in a catalog"),
+    ],
+)
+def test_a_pipeline_needs_its_folder_and_its_catalog_and_schema(
+    bridge: ModuleType,
+    folder: str,
+    files: list[str],
+    catalog: str,
+    schema: str,
+    error: str,
+) -> None:
+    result = json.loads(
+        bridge.pipeline_notebook_for_page(
+            "", folder, json.dumps(files), catalog, schema
+        )
+    )
+
+    assert result["ok"] is False
+    assert error in result["error"]
+
+
+def test_a_folder_of_pipeline_files_is_named_after_its_kind(bridge: ModuleType) -> None:
+    assert plan(bridge, ["jobs/a.sql"], kind="pipeline")["folder"] == "jobs_pipeline"

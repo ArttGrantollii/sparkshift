@@ -42,3 +42,25 @@ def test_a_sas_file_is_always_a_sas_program(
 )
 def test_outputs_collide_ignoring_case(outputs: list[str], expected: set[int]) -> None:
     assert colliding([PurePosixPath(output) for output in outputs]) == expected
+
+
+def test_files_that_define_the_same_dataset_are_shared() -> None:
+    from sparkshift.batch import shared_datasets
+
+    found = shared_datasets(
+        [
+            ("a.sql", ["a"]),
+            ("x/b.sas", ["b", "Clean"]),
+            ("y/b.sas", ["b"]),
+            ("z.sas", ["clean", "z"]),
+        ]
+    )
+
+    assert found == {
+        1: "its dataset b is also defined by y/b.sas; a pipeline defines each "
+        "dataset once",
+        2: "its dataset b is also defined by x/b.sas; a pipeline defines each "
+        "dataset once",
+        3: "its dataset clean is also defined by x/b.sas; a pipeline defines "
+        "each dataset once",
+    }

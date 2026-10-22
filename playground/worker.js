@@ -4,9 +4,12 @@ import { loadPyodide } from "https://cdn.jsdelivr.net/pyodide/v314.0.7/full/pyod
 
 let convertForPage = null;
 let notebookForPage = null;
+let pipelineForPage = null;
 let planForPage = null;
 let zipForPage = null;
 let jobForPage = null;
+let sharedForPage = null;
+let pipelineNotebookForPage = null;
 
 async function fetchOk(path) {
   const response = await fetch(path);
@@ -14,10 +17,11 @@ async function fetchOk(path) {
   return response;
 }
 
-// ``locations``: the notebook widgets' values, [catalog, schema,
-// output_catalog, output_schema], or none for empty widgets.
+// ``kind``: "code", "notebook", or "pipeline". ``locations``: [catalog,
+// schema, output_catalog, output_schema], where tables are read and written,
+// or none for empty values.
 self.onmessage = async ({ data }) => {
-  const { id, type, sql, dialect, notebook, source, locations = ["", "", "", ""] } = data;
+  const { id, type, sql, dialect, kind = "code", source, locations = ["", "", "", ""] } = data;
   try {
     if (type === "init") {
       const [pyodide, manifest] = await Promise.all([
@@ -31,20 +35,34 @@ self.onmessage = async ({ data }) => {
       pyodide.runPython(await (await fetchOk("bridge.py")).text());
       convertForPage = pyodide.globals.get("convert_for_page");
       notebookForPage = pyodide.globals.get("notebook_for_page");
+      pipelineForPage = pyodide.globals.get("pipeline_for_page");
       planForPage = pyodide.globals.get("plan_for_page");
       zipForPage = pyodide.globals.get("zip_for_page");
       jobForPage = pyodide.globals.get("job_for_page");
+      sharedForPage = pyodide.globals.get("shared_datasets_for_page");
+      pipelineNotebookForPage = pyodide.globals.get("pipeline_notebook_for_page");
       const aboutFunction = pyodide.globals.get("about");
       const about = JSON.parse(aboutFunction());
       aboutFunction.destroy();
       self.postMessage({ id, result: { about, manifest, pyodideVersion: pyodide.version } });
     } else if (type === "convert" && convertForPage !== null) {
-      const result = JSON.parse(notebook
-        ? notebookForPage(sql, dialect, source ?? null, ...locations)
-        : convertForPage(sql, dialect));
+      const converters = {
+        code: () => convertForPage(sql, dialect),
+        notebook: () => notebookForPage(sql, dialect, source ?? null, ...locations),
+        pipeline: () => pipelineForPage(sql, dialect, source ?? null, locations[0], locations[1]),
+      };
+      const result = JSON.parse(converters[kind]());
       self.postMessage({ id, result });
     } else if (type === "plan" && planForPage !== null) {
-      const result = JSON.parse(planForPage(JSON.stringify(data.paths), dialect, notebook));
+      const result = JSON.parse(planForPage(JSON.stringify(data.paths), dialect, kind));
+      self.postMessage({ id, result });
+    } else if (type === "shared" && sharedForPage !== null) {
+      const result = JSON.parse(sharedForPage(JSON.stringify(data.definitions)));
+      self.postMessage({ id, result });
+    } else if (type === "pipeline" && pipelineNotebookForPage !== null) {
+      const result = JSON.parse(pipelineNotebookForPage(
+        data.name, data.folder, JSON.stringify(data.files), locations[2], locations[3],
+      ));
       self.postMessage({ id, result });
     } else if (type === "zip" && zipForPage !== null) {
       const result = JSON.parse(zipForPage(data.folder, JSON.stringify(data.files)));

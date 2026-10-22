@@ -20,8 +20,10 @@ SQL dialect is chosen, or like SQL while SAS is chosen, a hint offers to
 switch; nothing switches by itself. SQL dialects are not guessed: the same
 query can return different results in different databases (NULL ordering,
 integer division, string lengths), so you choose one. The **PySpark /
-Notebook** switch chooses between the plain code and the Databricks notebook
-that `sparkshift convert --notebook` writes. A notebook is shown as its cells,
+Notebook / Pipeline** switch chooses between the plain code, the Databricks
+notebook that `sparkshift convert --notebook` writes, and the Lakeflow
+pipeline source file that `sparkshift convert --pipeline` writes
+([pipelines](../docs/pipelines.md)). A notebook is shown as its cells,
 as Databricks shows them: the Markdown cell formatted, each code cell with its
 own line numbers, and the setup cells that are the same in every notebook (the
 widgets, and the writing of results to tables) folded to one line that opens
@@ -48,14 +50,18 @@ browser and never uploaded. The page follows the command line's rules for
   reads them; a file that is not UTF-8 text is reported, not guessed at;
 - each output keeps its input's relative path, with `.py`; if two outputs would
   have the same path ignoring case (`report.sql` and `report.sas`), nothing is
-  converted and the colliding files are listed.
+  converted and the colliding files are listed;
+- for a pipeline, files that define the same dataset are not converted, and
+  each says which other file defines it: a pipeline defines each dataset
+  once.
 
 The list shows every file's state, and selecting one shows its source, its
 code, and its warnings or errors. **Download .zip** saves the converted files
-in a folder named after the chosen one (`claims_pyspark/`, or
-`claims_notebooks/` for notebooks); files that cannot be converted get no
-output, as on the command line, so the zip holds exactly what the CLI would
-write. Changing the dialect or the output kind converts the files again.
+in a folder named after the chosen one (`claims_pyspark/`,
+`claims_notebooks/` for notebooks, or `claims_pipeline/` for pipeline source
+files); files that cannot be converted get no output, as on the command
+line, so the zip holds exactly what the CLI would write. Changing the
+dialect or the output kind converts the files again.
 
 Each file converts in its own worker request, with the same limits and
 deadline as a single file. A file that reaches the deadline is reported, Python
@@ -64,15 +70,28 @@ batch. The demo converts at most **200 files** at a time.
 
 ## Deploying to Databricks
 
-The **Deploy** tab imports a converted folder into a Databricks workspace:
-each file as a notebook, written with the read and write locations of the
-form (as `sparkshift upload --catalog --schema --output-catalog
---output-schema` would), and a **Create job** notebook. Run that notebook
-once in the workspace (**Run all**): it creates a job that runs the notebooks
-in order on serverless compute, or updates the job of the same name. The
-page cannot create the job itself, because Databricks does not let web pages
-from other sites call its Jobs API; the workspace import API is allowed. See
-[ADR 0012](../docs/adr/0012-create-jobs-from-one-description.md).
+The **Deploy** tab imports a converted folder into a Databricks workspace,
+and creates one of two things from it:
+
+- **A job that runs the notebooks in order**: each file is imported as a
+  notebook, written with the read and write locations of the form (as
+  `sparkshift upload --catalog --schema --output-catalog --output-schema`
+  would), and a **Create job** notebook with it. Run that notebook once in
+  the workspace (**Run all**): it creates a job that runs the notebooks in
+  order on serverless compute, or updates the job of the same name.
+- **A Lakeflow pipeline of the converted files**: each file is imported as a
+  pipeline source file (a workspace file, not a notebook) that reads its
+  tables from **Read tables from**, and a **Create pipeline** notebook with
+  them. Run it once: it creates the pipeline that `sparkshift upload
+  --pipeline` would, or updates the one of the same name. **Write results
+  to** must name both the catalog and the schema, where the pipeline keeps
+  its tables.
+
+The page cannot create the job or the pipeline itself, because Databricks
+does not let web pages from other sites call its Jobs or Pipelines APIs; the
+workspace import API is allowed. See
+[ADR 0012](../docs/adr/0012-create-jobs-from-one-description.md) and
+[ADR 0013](../docs/adr/0013-pipelines-from-the-same-plan.md).
 
 - **The token** is read from its field when you deploy, sent only in the
   `Authorization` header of requests to the workspace you typed, and the
@@ -83,12 +102,15 @@ from other sites call its Jobs API; the workspace import API is allowed. See
   address on `cloud.databricks.com`, `azuredatabricks.net`, or
   `gcp.databricks.com`, and the page's Content-Security-Policy allows
   connections to those hosts only (besides this site and Pyodide's CDN).
-- **A job needs every file**: if any file of the folder does not convert,
-  nothing is deployed, as with `upload --job`.
-- Python writes every notebook before anything is sent; then the folders are
-  created and the notebooks imported one by one, and the first error stops
-  the deployment with an explanation. An existing notebook is replaced only
-  when **Replace notebooks that already exist** is ticked.
+- **A job or a pipeline needs every file**: if any file of the folder does
+  not convert, nothing is deployed, as with `upload --job` and `upload
+  --pipeline`. For a pipeline, two files that define the same dataset do not
+  convert.
+- Python writes every notebook and file before anything is sent; then the
+  folders are created and the files imported one by one, and the first error
+  stops the deployment with an explanation. An existing notebook or file is
+  replaced only when **Replace notebooks that already exist** (**Replace
+  files that already exist**, for a pipeline) is ticked.
 
 ## Warnings, errors and input limits
 
@@ -136,7 +158,7 @@ revision so late replies cannot replace the current query's output. See
 | `language.js` | Tells a SAS program from SQL, for the hint to switch the source language |
 | `worker-client.js` | Matches request IDs, bounds loading/conversion time, and terminates workers |
 | `worker.js` | Loads Pyodide and the wheels and invokes the Python bridge off the UI thread |
-| `bridge.py` | Runs inside Pyodide: converts SQL and returns JSON with the code or the issues; plans folders and packs their zip |
+| `bridge.py` | Runs inside Pyodide: converts SQL and returns JSON with the code or the issues; plans folders and packs their zip; writes the Create job and Create pipeline notebooks |
 
 `tools/build_playground.py` assembles the site: these files, the SparkShift
 wheel built from the checkout, the SQLGlot wheel pinned in `uv.lock`, and
@@ -164,16 +186,18 @@ Pages after CI passes on `main`, from the exact commit CI tested.
   Chromium: every example must convert exactly as on the command line, errors
   must list the same issues, warnings must be visible, failures and input edits
   must clear stale results, and shared links must restore the query. Notebook
-  output must match the command line, and be shown cell by cell (setup cells
-  folded, Markdown formatted), highlighting and line numbers must not
-  change the text, downloads must contain exactly the code, and the theme choice
-  must be remembered. A chosen folder must give a zip identical to what the
+  and pipeline output must match the command line, notebooks shown cell by
+  cell (setup cells folded, Markdown formatted), highlighting and line numbers
+  must not change the text, downloads must contain exactly the code, and the
+  theme choice must be remembered. A chosen folder must give a zip identical to what the
   command line writes, including files with Windows line endings or that are
   not UTF-8; colliding outputs, dropped folders, a file past the deadline and
-  cancelling a folder are covered too. Deploying is tested against a fake
-  workspace: every request, notebook and header is checked, as are refused
-  tokens, existing notebooks, unreachable or non-Databricks hosts, and that
-  the page may connect to no other site. The page
+  cancelling a folder are covered too, as are pipeline files that define a
+  dataset twice. Deploying a job or a pipeline is tested against a fake
+  workspace: every request, notebook, file and header is checked, as are
+  refused tokens, existing notebooks, unreachable or non-Databricks hosts, a
+  pipeline without a catalog and schema for its tables, and that the page may
+  connect to no other site. The page
   must contact no other sites, fit a phone screen, and pass an axe-core
   accessibility audit (WCAG 2.1 AA) in light and dark mode, with and without
   warnings. Fault injection covers Python failures and malformed JSON; tests

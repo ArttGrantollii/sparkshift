@@ -39,6 +39,7 @@ const elements = Object.fromEntries(
     "output-label",
     "output-code",
     "output-notebook",
+    "output-pipeline",
     "code",
     "copy",
     "download",
@@ -86,6 +87,14 @@ const elements = Object.fromEntries(
     "view-deploy",
     "convert-controls",
     "deploy-form",
+    "deploy-intro",
+    "deploy-kind-job",
+    "deploy-kind-pipeline",
+    "deploy-job-label",
+    "deploy-job-hint",
+    "deploy-overwrite-label",
+    "deploy-what",
+    "deploy-then",
     "deploy-host",
     "deploy-host-hint",
     "deploy-token",
@@ -113,7 +122,17 @@ let revision = 0;
 let populated = false;
 let examples = [];
 let maxSourceBytes = null;
-let notebook = false;
+// What the code is converted into: "code", "notebook", or "pipeline".
+const KINDS = {
+  code: { label: "PySpark", download: "converted.py", copied: "Copied the PySpark code." },
+  notebook: { label: "Notebook", download: "converted_notebook.py", copied: "Copied the notebook." },
+  pipeline: {
+    label: "Pipeline",
+    download: "converted_pipeline.py",
+    copied: "Copied the pipeline source file.",
+  },
+};
+let kind = "code";
 let mode = "file";
 // The last status of each view, shown again when the visitor returns to it.
 const savedStatus = { file: null, folder: null, deploy: null };
@@ -162,8 +181,9 @@ function updateControls() {
   // A folder's results follow the dialect and output kind, so those stay
   // fixed while its files convert.
   elements.dialect.disabled = !populated || (folder && working());
-  elements["output-code"].disabled = folder && working();
-  elements["output-notebook"].disabled = folder && working();
+  for (const name of Object.keys(KINDS)) {
+    elements[`output-${name}`].disabled = folder && working();
+  }
   // An empty query is nothing to share.
   elements.share.disabled = !populated || elements.sql.value.trim() === "";
   elements["choose-folder"].disabled = !ready || working();
@@ -405,7 +425,7 @@ async function convert() {
     const result = await candidate.request("convert", {
       sql: elements.sql.value,
       dialect: elements.dialect.value,
-      notebook,
+      kind,
     }, CONVERSION_TIMEOUT_MS);
     // Input edits and cancellation invalidate results, even if they arrive late.
     if (runtime !== candidate || revision !== currentRevision) return false;
@@ -441,7 +461,7 @@ async function convert() {
 
 // A notebook's cells, when it has them, in place of its file.
 function showCells(result, file, cells) {
-  const shown = notebook && result.cells !== undefined;
+  const shown = kind === "notebook" && result.cells !== undefined;
   cells.replaceChildren(shown ? renderCells(result.cells) : "");
   cells.hidden = !shown;
   file.hidden = shown;
@@ -450,7 +470,7 @@ function showCells(result, file, cells) {
 
 function outputSize(result) {
   const size = lineCount(result.code);
-  if (!notebook || result.cells === undefined) return size;
+  if (kind !== "notebook" || result.cells === undefined) return size;
   return `${result.cells.length} cells · ${size}`;
 }
 
@@ -554,7 +574,7 @@ async function convertFolder() {
     const planned = await candidate.request("plan", {
       paths: chosen.map((entry) => entry.path),
       dialect: elements.dialect.value,
-      notebook,
+      kind,
     }, CONVERSION_TIMEOUT_MS);
     if (stale()) return false;
     if (!planned.ok) {
@@ -579,6 +599,10 @@ async function convertFolder() {
         candidate = runtime;
         updateControls();
       }
+    }
+    if (kind === "pipeline") {
+      await markSharedDatasets(candidate);
+      if (stale()) return false;
     }
     const [summary, state] = folderSummary();
     setStatus(await packFolder(candidate, stale) ? summary : `${summary} The zip could not be made.`, state);
@@ -619,7 +643,7 @@ async function convertFile(candidate, entry) {
     const result = await candidate.request("convert", {
       sql,
       dialect: entry.dialect,
-      notebook,
+      kind,
       source: entry.name.split("/").pop(),
     }, CONVERSION_TIMEOUT_MS);
     if (!result.ok) {
@@ -630,10 +654,27 @@ async function convertFile(candidate, entry) {
       sql,
       code: result.code,
       cells: result.cells,
+      tables: result.tables,
       warnings: result.warnings,
     };
   } catch (error) {
     return { state: "bad", sql, error: failureMessage(error), issues: [] };
+  }
+}
+
+// A pipeline defines each dataset once: as on the command line, the files
+// that define a dataset another file defines are not converted.
+async function markSharedDatasets(candidate) {
+  const converted = results.flatMap((result, position) =>
+    result.tables === undefined ? [] : [[position, result]]);
+  if (converted.length < 2) return;
+  const answer = await candidate.request("shared", {
+    definitions: converted.map(([position, result]) => [plan.files[position].name, result.tables]),
+  }, CONVERSION_TIMEOUT_MS);
+  if (!answer.ok) return;
+  for (const [index, reason] of Object.entries(answer.shared)) {
+    const [position, result] = converted[Number(index)];
+    setResult(position, { state: "bad", sql: result.sql, error: `Not converted: ${reason}.`, issues: [] });
   }
 }
 
@@ -835,7 +876,7 @@ function showSelected() {
   const sas = entry?.dialect === "sas";
   elements["file-source-label"].textContent = entry ? (sas ? "SAS program" : "SQL") : "Source";
   elements["file-source-name"].textContent = entry?.name ?? "";
-  elements["file-output-label"].textContent = notebook ? "Notebook" : "PySpark";
+  elements["file-output-label"].textContent = KINDS[kind].label;
   elements["file-output-name"].textContent = entry?.output ?? "";
 
   const source = result?.sql;
@@ -878,7 +919,7 @@ const MODES = ["file", "folder", "deploy"];
 const FIRST_STATUS = {
   file: "Ready to convert.",
   folder: "Choose a folder or files to convert them all at once.",
-  deploy: "Convert a folder, then deploy its notebooks to a Databricks workspace.",
+  deploy: "Convert a folder, then deploy it to a Databricks workspace.",
 };
 
 function chooseMode(next) {
@@ -915,12 +956,13 @@ function chooseMode(next) {
   }
 }
 
-function chooseOutput(asNotebook) {
-  if (notebook === asNotebook) return;
-  notebook = asNotebook;
-  elements["output-code"].setAttribute("aria-checked", String(!asNotebook));
-  elements["output-notebook"].setAttribute("aria-checked", String(asNotebook));
-  elements["output-label"].textContent = asNotebook ? "Notebook" : "PySpark";
+function chooseOutput(next) {
+  if (kind === next) return;
+  kind = next;
+  for (const name of Object.keys(KINDS)) {
+    elements[`output-${name}`].setAttribute("aria-checked", String(name === next));
+  }
+  elements["output-label"].textContent = KINDS[next].label;
   if (mode === "folder") {
     clearOutput();
     if (ready && !working() && chosen !== null) void convertFolder();
@@ -974,13 +1016,53 @@ function toggleTheme() {
 // --- Deploying ----------------------------------------------------------------
 //
 // The folder's notebooks, with the form's widget values, and a Create job
-// notebook are imported into a workspace with the visitor's token. Python
-// writes them all first, so a notebook that no longer converts stops the
-// deployment before anything is sent. The token is read from its field when
-// needed, sent only to the workspace typed, and the field is cleared after a
-// deployment.
+// notebook, or its pipeline source files and a Create pipeline notebook, are
+// imported into a workspace with the visitor's token. Python writes them all
+// first, so a file that no longer converts stops the deployment before
+// anything is sent. The token is read from its field when needed, sent only
+// to the workspace typed, and the field is cleared after a deployment.
 
-const DEFAULT_HINTS = {};
+// What each kind of deployment says, where it differs.
+const DEPLOYMENTS = {
+  job: {
+    name: "job",
+    intro: "Imports the folder's notebooks into your workspace, and a Create job " +
+      "notebook that creates a job running them in order.",
+    files: "notebook",
+    creator: "Create job",
+    nameLabel: "Job name",
+    overwrite: "Replace notebooks that already exist",
+    then: "Find the job under Jobs & Pipelines and run it, or give it a schedule.",
+    hints: {
+      "deploy-host": "The address of your workspace, as in your browser's address bar.",
+      "deploy-folder": "Created if it does not exist. The notebooks keep their relative paths.",
+      "deploy-read": "Empty: the current catalog and schema.",
+      "deploy-write": "Tables of the same names are replaced. Empty: nothing is written.",
+      "deploy-job": "Empty: sparkshift and the folder's name. A job of the same name is updated.",
+    },
+  },
+  pipeline: {
+    name: "pipeline",
+    intro: "Imports the folder's pipeline source files into your workspace, and a " +
+      "Create pipeline notebook that creates a Lakeflow pipeline from them.",
+    files: "file",
+    creator: "Create pipeline",
+    nameLabel: "Pipeline name",
+    overwrite: "Replace files that already exist",
+    then: "Find the pipeline under Jobs & Pipelines and start it, or give it a schedule.",
+    hints: {
+      "deploy-host": "The address of your workspace, as in your browser's address bar.",
+      "deploy-folder": "Created if it does not exist. The files keep their relative paths.",
+      "deploy-read": "For tables named without a schema. Empty: the pipeline's own schema.",
+      "deploy-write": "Where the pipeline keeps its tables, as catalog.schema.",
+      "deploy-job": "Empty: sparkshift and the folder's name. A pipeline of the same name is updated.",
+    },
+  },
+};
+
+function deployKind() {
+  return DEPLOYMENTS[elements["deploy-kind-pipeline"].checked ? "pipeline" : "job"];
+}
 // Each step's state and message in the last deployment, shown until the
 // form or the folder changes.
 let stepStates = [];
@@ -989,7 +1071,7 @@ let stepStates = [];
 // file, as with sparkshift upload --job.
 function deployment() {
   if (!plan) {
-    return { reason: "Convert a folder first, in the Folder tab: its notebooks are what is deployed." };
+    return { reason: "Convert a folder first, in the Folder tab: its files are what is deployed." };
   }
   if (batch || results.some(({ state }) => state === "pending" || state === "busy")) {
     return { reason: "Convert the folder first: its results are not up to date." };
@@ -999,7 +1081,8 @@ function deployment() {
     const names = failed.map(({ name }) => name).join(", ");
     return {
       reason: `${fileCount(failed.length)} of the folder ${failed.length === 1 ? "does" : "do"} ` +
-        `not convert (${names}). A job needs every file: fix ${failed.length === 1 ? "it" : "them"}, ` +
+        `not convert (${names}). A ${deployKind().name} needs every file: ` +
+        `fix ${failed.length === 1 ? "it" : "them"}, ` +
         "or choose only the files that convert.",
     };
   }
@@ -1012,13 +1095,16 @@ function deployForm() {
   const folder = elements["deploy-folder"].value.trim().replace(/(.)\/+$/, "$1");
   const read = catalogAndSchema(elements["deploy-read"].value);
   const write = catalogAndSchema(elements["deploy-write"].value);
+  const pipeline = deployKind().name === "pipeline";
   const problems = {
     "deploy-host": host && !workspaceOrigin(host)
       ? "Not a Databricks workspace URL, such as https://dbc-1234.cloud.databricks.com." : "",
     "deploy-folder": folder && !isWorkspaceFolder(folder)
       ? "Use an absolute path, such as /Workspace/Users/you@example.com/sparkshift." : "",
     "deploy-read": read ? "" : "Use catalog.schema, or only a schema.",
-    "deploy-write": write ? "" : "Use catalog.schema, or only a schema.",
+    "deploy-write": !write ? "Use catalog.schema, or only a schema."
+      : pipeline && !(write[0] && write[1]) ? "A pipeline keeps its tables in catalog.schema: type both."
+        : "",
   };
   return {
     origin: host ? workspaceOrigin(host) : null,
@@ -1035,28 +1121,38 @@ function renderDeploy() {
   if (deploying) return;
   const { files, reason } = deployment();
   const form = deployForm();
+  const what = deployKind();
+  elements["deploy-intro"].textContent = what.intro;
+  elements["deploy-job-label"].textContent = what.nameLabel;
+  elements["deploy-job-hint"].textContent = what.hints["deploy-job"];
+  elements["deploy-overwrite-label"].textContent = what.overwrite;
   for (const [id, problem] of Object.entries(form.problems)) {
     const hint = elements[`${id}-hint`];
-    DEFAULT_HINTS[id] ??= hint.textContent;
-    hint.textContent = problem || DEFAULT_HINTS[id];
+    hint.textContent = problem || what.hints[id];
     hint.classList.toggle("error", Boolean(problem));
     elements[id].setAttribute("aria-invalid", String(Boolean(problem)));
   }
   const warned = files?.filter(({ result }) => result.state === "warn").length ?? 0;
   elements["deploy-note"].textContent = reason ?? (warned
-    ? `${fileCount(warned)} with warnings: review them in the Folder tab before running the job.`
+    ? `${fileCount(warned)} with warnings: review them in the Folder tab before running the ${what.name}.`
     : "");
   elements["deploy-note"].hidden = !elements["deploy-note"].textContent;
   const steps = files ? [
     ["Check the workspace", form.folder ?? "the folder"],
-    ...files.map(({ entry }) => [`Import ${entry.name.replace(/\.(sql|sas)$/i, "")}`, entry.name]),
-    ["Import Create job", "creates or updates the job"],
+    ...files.map(({ entry }) => [`Import ${importedName(entry, what)}`, entry.name]),
+    [`Import ${what.creator}`, `creates or updates the ${what.name}`],
   ] : [];
   elements["deploy-plan"].replaceChildren(...steps.map(([title, detail]) => planStep(title, detail)));
   stepStates.forEach(([state, message], index) => markStep(index, state, message, false));
-  elements.deploy.textContent = files ? `Deploy ${files.length} notebook${files.length === 1 ? "" : "s"}` : "Deploy";
+  elements.deploy.textContent = files
+    ? `Deploy ${files.length} ${what.files}${files.length === 1 ? "" : "s"}` : "Deploy";
   elements.deploy.disabled = !files || !form.valid || !form.origin || !form.folder ||
     !elements["deploy-token"].value || !ready || working();
+}
+
+// A notebook's path has no suffix; a pipeline source file keeps its .py.
+function importedName(entry, what) {
+  return what.name === "pipeline" ? entry.output : entry.output.replace(/\.py$/, "");
 }
 
 function planStep(title, detail) {
@@ -1104,26 +1200,40 @@ async function deploy(event) {
   updateControls();
   for (const name of MODES) elements[`tab-${name}`].disabled = name !== "deploy";
   const { origin, folder, locations } = form;
-  const paths = files.map(({ entry }) => `${folder}/${entry.output.replace(/\.py$/, "")}`);
+  const what = deployKind();
+  const pipeline = what.name === "pipeline";
+  const paths = files.map(({ entry }) => `${folder}/${importedName(entry, what)}`);
   let step = 0;
   try {
-    setStatus("Preparing the notebooks…", "busy");
+    setStatus(`Preparing the ${what.files}s…`, "busy");
     const sources = [];
+    const definitions = [];
     for (const { entry, result } of files) {
       const converted = await runtime.request("convert", {
         sql: result.sql,
         dialect: entry.dialect,
-        notebook: true,
+        kind: pipeline ? "pipeline" : "notebook",
         source: entry.name.split("/").pop(),
         locations,
       }, CONVERSION_TIMEOUT_MS);
-      if (!converted.ok) throw new DeployError(`${entry.name} no longer converts: ${converted.error}`);
+      if (!converted.ok) {
+        throw new DeployError(pipeline
+          ? `${entry.name} cannot be a pipeline: ${converted.error}`
+          : `${entry.name} no longer converts: ${converted.error}`);
+      }
       sources.push(converted.code);
+      definitions.push([entry.name, converted.tables ?? []]);
     }
-    const job = await runtime.request("job", {
+    if (pipeline) {
+      const shared = await runtime.request("shared", { definitions }, CONVERSION_TIMEOUT_MS);
+      const [first] = Object.entries(shared.shared ?? {});
+      if (first) throw new DeployError(`${definitions[Number(first[0])][0]}: ${first[1]}.`);
+    }
+    const job = await runtime.request(pipeline ? "pipeline" : "job", {
       name: form.name,
       folder,
       notebooks: paths,
+      files: paths,
       locations,
     }, CONVERSION_TIMEOUT_MS);
     if (!job.ok) throw new DeployError(job.error);
@@ -1135,8 +1245,12 @@ async function deploy(event) {
     await post(origin, token, "/api/2.0/workspace/mkdirs", { path: folder });
     markStep(step, "ok");
     const folders = new Set([folder]);
-    const imports = [...paths.map((path, index) => [path, sources[index]]), [`${folder}/Create job`, job.notebook]];
-    for (const [path, source] of imports) {
+    const creator = `${folder}/${what.creator}`;
+    const imports = [
+      ...paths.map((path, index) => [path, sources[index], pipeline ? "RAW" : "SOURCE"]),
+      [creator, job.notebook, "SOURCE"],
+    ];
+    for (const [path, source, format] of imports) {
       step += 1;
       progress();
       markStep(step, "busy");
@@ -1148,29 +1262,35 @@ async function deploy(event) {
       try {
         await post(origin, token, "/api/2.0/workspace/import", {
           path,
-          format: "SOURCE",
-          language: "PYTHON",
+          format,
+          // A notebook's language; a file is imported as it is.
+          ...(format === "SOURCE" ? { language: "PYTHON" } : {}),
           content: base64(source),
           overwrite: form.overwrite,
         });
       } catch (error) {
         if (error.code === "RESOURCE_ALREADY_EXISTS") {
-          throw new DeployError(`A notebook already exists at ${path}. Tick “Replace notebooks ` +
-            "that already exist” to replace it.");
+          const thing = format === "SOURCE" ? "A notebook" : "A file";
+          throw new DeployError(`${thing} already exists at ${path}. Tick “${what.overwrite}” ` +
+            "to replace it.");
         }
         throw error;
       }
       markStep(step, "ok");
     }
     elements["deploy-token"].value = "";
-    elements["deploy-link"].href = `${origin}/#workspace${encodeURI(`${folder}/Create job`)}`;
+    elements["deploy-link"].href = `${origin}/#workspace${encodeURI(creator)}`;
+    elements["deploy-link"].textContent = what.creator;
+    elements["deploy-what"].textContent = what.name;
+    elements["deploy-then"].textContent = what.then;
     elements["deploy-job-name"].textContent = job.name;
     elements["deploy-next"].hidden = false;
-    setStatus(`Deployed ${fileCount(paths.length).replace("file", "notebook")} and Create job to ${origin}.`, "ok");
+    const count = fileCount(paths.length).replace("file", what.files);
+    setStatus(`Deployed ${count} and ${what.creator} to ${origin}.`, "ok");
   } catch (error) {
     const message = error instanceof DeployError
       ? error.message
-      : "Preparing the notebooks failed unexpectedly. Try again.";
+      : `Preparing the ${what.files}s failed unexpectedly. Try again.`;
     markStep(step, "bad", message);
     setStatus(`Deployment stopped: ${message}`, "bad");
     if (!(error instanceof DeployError) && runtime?.closed) {
@@ -1195,7 +1315,7 @@ function save(blob, name) {
 
 function download() {
   const blob = new Blob([elements.code.textContent], { type: "text/x-python" });
-  save(blob, notebook ? "converted_notebook.py" : "converted.py");
+  save(blob, KINDS[kind].download);
 }
 
 // --- Events -----------------------------------------------------------------
@@ -1219,7 +1339,7 @@ elements.sql.addEventListener("keydown", (event) => {
 elements.copy.addEventListener("click", async () => {
   const code = mode === "folder" ? elements["file-code"] : elements.code;
   await navigator.clipboard.writeText(code.textContent);
-  setStatus(notebook ? "Copied the notebook." : "Copied the PySpark code.", "ok");
+  setStatus(KINDS[kind].copied, "ok");
 });
 elements.download.addEventListener("click", download);
 elements["download-zip"].addEventListener("click", () => {
@@ -1231,8 +1351,9 @@ elements.share.addEventListener("click", async () => {
   await navigator.clipboard.writeText(link);
   setStatus("Copied a link to this query.", "ok");
 });
-elements["output-code"].addEventListener("click", () => chooseOutput(false));
-elements["output-notebook"].addEventListener("click", () => chooseOutput(true));
+for (const name of Object.keys(KINDS)) {
+  elements[`output-${name}`].addEventListener("click", () => chooseOutput(name));
+}
 elements.theme.addEventListener("click", toggleTheme);
 matchMedia("(prefers-color-scheme: light)").addEventListener("change", showThemeButton);
 

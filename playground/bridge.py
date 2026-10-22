@@ -6,9 +6,13 @@ prints, so the playground and the CLI always agree.
 
 For many files, ``plan_for_page`` chooses the files and their output paths
 with the command line's rules, the page converts them one at a time, and
-``zip_for_page`` packs the results. To deploy them, ``notebook_for_page``
-writes each notebook with its widgets' values and ``job_for_page`` the
-notebook that creates their job, as ``sparkshift upload --job`` would.
+``zip_for_page`` packs the results; for a pipeline, ``shared_datasets_for_page``
+finds the files that define the same dataset. To deploy them,
+``notebook_for_page`` writes each notebook with its widgets' values and
+``job_for_page`` the notebook that creates their job, as ``sparkshift upload
+--job`` would; or ``pipeline_for_page`` writes each pipeline source file and
+``pipeline_notebook_for_page`` the notebook that creates the pipeline, as
+``sparkshift upload --pipeline`` would.
 """
 
 import base64
@@ -18,10 +22,17 @@ import zipfile
 from pathlib import PurePosixPath
 
 import sparkshift
-from sparkshift.batch import colliding, dialect_of, source_suffixes
+from sparkshift.batch import colliding, dialect_of, shared_datasets, source_suffixes
 from sparkshift.dialects import DIALECT_CHOICES
 from sparkshift.jobs import create_job_notebook, default_job_name, job_settings
 from sparkshift.notebook import markdown_text, notebook_cells
+from sparkshift.pipelines import (
+    create_pipeline_notebook,
+    default_pipeline_name,
+    pipeline_settings,
+    pipeline_tables,
+    to_pipeline,
+)
 
 # Playground policies, not limits imposed by the library or CLI.
 MAX_SOURCE_BYTES = 50_000
@@ -39,7 +50,7 @@ def convert_for_page(sql: str, dialect: str) -> str:
     ``{"ok": false, "error": ..., "issues": [...]}`` when it cannot be
     converted; ``issues`` lists each unsupported construct separately.
     """
-    return _convert(sql, dialect, notebook=False)
+    return _convert(sql, dialect)
 
 
 def notebook_for_page(
@@ -63,7 +74,32 @@ def notebook_for_page(
         "output_catalog": output_catalog,
         "output_schema": output_schema,
     }
-    return _convert(sql, dialect, notebook=True, source=source, locations=locations)
+    return _convert(sql, dialect, kind="notebook", source=source, locations=locations)
+
+
+def pipeline_for_page(
+    sql: str,
+    dialect: str,
+    source: str | None = None,
+    catalog: str = "",
+    schema: str = "",
+) -> str:
+    """As ``convert_for_page``, with the code written as a pipeline source
+    file, exactly as ``sparkshift convert --pipeline`` writes it, reading
+    tables from ``catalog`` and ``schema``. The JSON also has ``tables``, the
+    datasets the file defines."""
+    locations = {"catalog": catalog, "schema": schema}
+    return _convert(sql, dialect, kind="pipeline", source=source, locations=locations)
+
+
+def shared_datasets_for_page(definitions: str) -> str:
+    """The files of a pipeline that define a dataset another file defines
+    too: ``definitions`` is a JSON list of ``[name, [dataset, ...]]``. Return
+    JSON ``{"ok": true, "shared": {position: reason}}``."""
+    found = shared_datasets(
+        [(name, tables) for name, tables in json.loads(definitions)]
+    )
+    return json.dumps({"ok": True, "shared": {str(k): v for k, v in found.items()}})
 
 
 def job_for_page(
@@ -81,17 +117,7 @@ def job_for_page(
     ``{"ok": true, "name": ..., "notebook": ...}``, or ``{"ok": false,
     "error": ..., "issues": []}``."""
     paths = json.loads(notebooks)
-    inside = folder + "/"
-    if not (
-        folder.startswith("/")
-        and _is_relative_path(folder[1:])
-        and all(
-            isinstance(path, str)
-            and path.startswith(inside)
-            and _is_relative_path(path[len(inside) :])
-            for path in paths
-        )
-    ):
+    if not _inside(folder, paths):
         return _failure(
             "The workspace folder must be an absolute path, such as "
             "/Workspace/Users/you@example.com/sparkshift."
@@ -114,10 +140,68 @@ def job_for_page(
     )
 
 
-def plan_for_page(paths: str, dialect: str, notebook: bool) -> str:
+def pipeline_notebook_for_page(
+    name: str, folder: str, files: str, catalog: str, schema: str
+) -> str:
+    """The notebook that creates the pipeline whose source files are
+    ``files`` (a JSON list of workspace paths under ``folder``), keeping its
+    tables in ``catalog``.``schema``, as ``sparkshift upload --pipeline``
+    would create it; ``name`` empty for the default name. Return JSON
+    ``{"ok": true, "name": ..., "notebook": ...}``, or ``{"ok": false,
+    "error": ..., "issues": []}``."""
+    paths = json.loads(files)
+    if not _inside(folder, paths):
+        return _failure(
+            "The workspace folder must be an absolute path, such as "
+            "/Workspace/Users/you@example.com/sparkshift."
+        )
+    if not (catalog and schema):
+        return _failure(
+            "A pipeline keeps its tables in a catalog and schema: type "
+            "catalog.schema in Write results to."
+        )
+    settings = pipeline_settings(
+        name.strip() or default_pipeline_name(folder),
+        folder,
+        paths,
+        catalog=catalog,
+        schema=schema,
+    )
+    return json.dumps(
+        {
+            "ok": True,
+            "name": settings["name"],
+            "notebook": create_pipeline_notebook(settings),
+        }
+    )
+
+
+def _inside(folder: str, paths: object) -> bool:
+    """Whether ``folder`` is an absolute workspace path, and ``paths`` a list
+    of paths inside it."""
+    inside = folder + "/"
+    return (
+        folder.startswith("/")
+        and _is_relative_path(folder[1:])
+        and isinstance(paths, list)
+        and all(
+            isinstance(path, str)
+            and path.startswith(inside)
+            and _is_relative_path(path[len(inside) :])
+            for path in paths
+        )
+    )
+
+
+# The folder of a zip, after the kind of code in it.
+_FOLDER_SUFFIXES = {"code": "pyspark", "notebook": "notebooks", "pipeline": "pipeline"}
+
+
+def plan_for_page(paths: str, dialect: str, kind: str) -> str:
     """Choose the files to convert from ``paths``, a JSON list of the
     relative paths of the files a visitor chose, as the command line would
-    for a folder. Return JSON:
+    for a folder, into ``kind`` of code: "code", "notebook", or "pipeline".
+    Return JSON:
 
     ``{"ok": true, "folder": ..., "files": [...], "skipped": n}``, where
     ``folder`` names the zip and the folder in it, and each file has the
@@ -162,11 +246,10 @@ def plan_for_page(paths: str, dialect: str, notebook: bool) -> str:
                 if position in conflicts
             ],
         )
-    kind = "notebooks" if notebook else "pyspark"
     return json.dumps(
         {
             "ok": True,
-            "folder": f"{root or 'converted'}_{kind}",
+            "folder": f"{root or 'converted'}_{_FOLDER_SUFFIXES[kind]}",
             "files": [
                 {
                     "index": index,
@@ -218,7 +301,7 @@ def _convert(
     sql: str,
     dialect: str,
     *,
-    notebook: bool,
+    kind: str = "code",
     source: str | None = None,
     locations: dict[str, str] | None = None,
 ) -> str:
@@ -243,20 +326,22 @@ def _convert(
             }
         )
     except sparkshift.SparkShiftError as error:
-        issues = getattr(error, "issues", ())
-        return json.dumps(
-            {
-                "ok": False,
-                "error": str(error),
-                "issues": [_issue(issue) for issue in issues],
-            }
-        )
+        return _error(error)
     converted: dict[str, object] = {
         "ok": True,
         "code": result.code,
         "warnings": [str(warning) for warning in result.warnings],
     }
-    if notebook:
+    if kind == "pipeline":
+        options = {"source": source, "dialect": dialect or None}
+        try:
+            converted["code"] = to_pipeline(result, **options, **(locations or {}))
+        except sparkshift.SparkShiftError as error:
+            return _error(error)
+        except ValueError as error:
+            return _failure(str(error))
+        converted["tables"] = pipeline_tables(result, **options)
+    if kind == "notebook":
         options = {"source": source, "dialect": dialect or None, **(locations or {})}
         converted["code"] = sparkshift.to_notebook(result, **options)
         converted["cells"] = [
@@ -270,6 +355,17 @@ def _convert(
             for cell in notebook_cells(result, **options)
         ]
     return json.dumps(converted)
+
+
+def _error(error: sparkshift.SparkShiftError) -> str:
+    issues = getattr(error, "issues", ())
+    return json.dumps(
+        {
+            "ok": False,
+            "error": str(error),
+            "issues": [_issue(issue) for issue in issues],
+        }
+    )
 
 
 def about() -> str:

@@ -38,7 +38,7 @@ from typing import TypeVar
 
 from sparkshift import __version__, databricks
 from sparkshift.api import convert
-from sparkshift.batch import colliding, dialect_of, source_suffixes
+from sparkshift.batch import colliding, dialect_of, shared_datasets, source_suffixes
 from sparkshift.diagnostics import ConversionResult
 from sparkshift.dialects import DIALECT_CHOICES
 from sparkshift.errors import SparkShiftError
@@ -370,23 +370,14 @@ def _defined_once(
 ) -> list[tuple[Path, PathT, str, list[str]]]:
     """The outputs whose datasets no other file of the pipeline defines; the
     others are reported, as a pipeline defines each dataset once."""
-    definers: dict[str, list[Path]] = {}
-    for path, _, _, tables in outputs:
-        for table in tables:
-            definers.setdefault(table.lower(), []).append(path)
-    shared: set[Path] = set()
-    for table, paths in definers.items():
-        if len(paths) < 2:
-            continue
-        for path in paths:
-            others = ", ".join(str(other) for other in paths if other != path)
-            print(
-                f"{prog}: cannot convert {path}: its dataset {table} is also defined "
-                f"by {others}; a pipeline defines each dataset once",
-                file=sys.stderr,
-            )
-            shared.add(path)
-    return [output for output in outputs if output[0] not in shared]
+    reasons = shared_datasets([(str(path), tables) for path, _, _, tables in outputs])
+    for position, reason in sorted(reasons.items()):
+        print(
+            f"{prog}: cannot convert {outputs[position][0]}: {reason}", file=sys.stderr
+        )
+    return [
+        output for position, output in enumerate(outputs) if position not in reasons
+    ]
 
 
 def _batch_outputs(

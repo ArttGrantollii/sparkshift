@@ -464,7 +464,7 @@ def notebook_page(session: dict) -> Iterator[Any]:
     """The shared page, back to plain code afterwards."""
     page = session["page"]
     yield page
-    if page.get_attribute("#output-notebook", "aria-checked") == "true":
+    if page.get_attribute("#output-code", "aria-checked") != "true":
         page.click("#output-code")
         page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
 
@@ -571,6 +571,41 @@ def test_a_failed_notebook_clears_its_cells(notebook_page: Any) -> None:
     assert page.is_hidden("#output-cells")
     assert page.locator("#output-cells > .cell").count() == 0
     assert page.is_disabled("#copy")
+
+
+def test_pipeline_output_is_what_the_command_line_writes(notebook_page: Any) -> None:
+    page = notebook_page
+    convert_in_page(page, NOTEBOOK_PROGRAM, "sas")
+
+    page.click("#output-pipeline")
+    page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
+
+    result = sparkshift.convert(NOTEBOOK_PROGRAM, dialect="sas")
+    pipeline = sparkshift.to_pipeline(result, dialect="sas")
+    assert page.is_visible("#output")
+    assert page.is_hidden("#output-cells")
+    assert page.text_content("#code") == pipeline
+    assert page.text_content("#output-label") == "Pipeline"
+    assert page.get_attribute("#output-pipeline", "aria-checked") == "true"
+    assert page.get_attribute("#output-notebook", "aria-checked") == "false"
+    with page.expect_download() as download_info:
+        page.click("#download")
+    download = download_info.value
+    assert download.suggested_filename == "converted_pipeline.py"
+    assert Path(download.path()).read_text(encoding="utf-8") == pipeline
+
+
+def test_a_program_that_cannot_be_a_pipeline_says_why(notebook_page: Any) -> None:
+    page = notebook_page
+    page.click("#output-pipeline")
+
+    convert_in_page(page, "proc print data=orders; run;", "sas")
+
+    assert page.is_visible("#errors")
+    assert "a pipeline of a program that creates no data set" in page.text_content(
+        "#errors"
+    )
+    assert page.is_hidden("#output")
 
 
 def test_input_highlighting_shows_exactly_the_source(session: dict) -> None:
@@ -700,7 +735,7 @@ def reset_file_view(page: Any) -> None:
     page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
     if page.input_value("#dialect") != "":
         page.select_option("#dialect", "")
-    if page.get_attribute("#output-notebook", "aria-checked") == "true":
+    if page.get_attribute("#output-code", "aria-checked") != "true":
         page.click("#output-code")
         page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
 
@@ -836,6 +871,44 @@ def test_a_folder_of_notebooks(folder_view: Any) -> None:
     assert page.locator("#file-cells > .cell").count() == len(cells)
     assert page.text_content("#file-code") == expected
     assert page.locator("#file-cells h3").text_content() == "daily_revenue"
+
+
+PIPELINE_FOLDER = {
+    "a/daily.sql": "SELECT order_id FROM orders",
+    "b/daily.sql": "SELECT customer_id FROM customers",
+    "load.sas": "data clean; set customers(keep=customer_id score); run;",
+    "show.sas": "proc print data=clean; run;",
+}
+
+
+def test_a_folder_of_pipeline_files(folder_view: Any, tmp_path: Path) -> None:
+    page = folder_view
+    root = tmp_path / "jobs"
+    for name, text in PIPELINE_FOLDER.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(text, encoding="utf-8")
+    page.click("#output-pipeline")
+    # A folder chosen before converts again first.
+    page.wait_for_selector(IDLE, timeout=READY_TIMEOUT_MS)
+
+    choose(page, str(root))
+
+    expected = command_line_outputs(root, tmp_path / "out", "--pipeline")
+    assert list(expected) == ["load.py"]
+    name, files = downloaded_zip(page)
+    assert name == "jobs_pipeline.zip"
+    assert files == {f"jobs_pipeline/{path}": code for path, code in expected.items()}
+    assert page.text_content("#folder-count") == "1 of 4 files converted"
+    # As on the command line: the files that define the same dataset, and the
+    # program that creates none, are not converted.
+    file_button(page, "daily.sql").first.click()
+    assert "its dataset daily is also defined by b/daily.sql" in page.text_content(
+        "#file-errors"
+    )
+    file_button(page, "show.sas").click()
+    assert "a pipeline of a program that creates no data set" in page.text_content(
+        "#file-errors"
+    )
 
 
 def test_files_chosen_one_by_one_use_the_dialect_except_sas(folder_view: Any) -> None:
@@ -1169,6 +1242,99 @@ def test_deploying_imports_every_notebook_and_the_create_job_notebook(
     )
 
 
+def test_deploying_a_pipeline_imports_its_files_and_the_create_pipeline_notebook(
+    deploy_page: tuple[Any, FakeDatabricks],
+) -> None:
+    from sparkshift.pipelines import create_pipeline_notebook, pipeline_settings
+
+    page, workspace = deploy_page
+    workspace.requests.clear()
+    workspace.answers.clear()
+    page.check("#deploy-kind-pipeline")
+    try:
+        fill_deploy_form(page)
+        assert page.text_content("#deploy") == "Deploy 2 files"
+        assert page.text_content("#deploy-job-label") == "Pipeline name"
+        steps = page.locator("#deploy-plan li .step-title").all_text_contents()
+        assert steps == [
+            "Check the workspace",
+            "Import legacy/report.py",
+            "Import load.py",
+            "Import Create pipeline",
+        ]
+
+        deploy_and_wait(page)
+
+        assert page.text_content("#status") == (
+            f"Deployed 2 files and Create pipeline to {MOCK_ORIGIN}."
+        )
+        report = f"{DEPLOY_FOLDER}/legacy/report.py"
+        load = f"{DEPLOY_FOLDER}/load.py"
+        creator = f"{DEPLOY_FOLDER}/Create pipeline"
+        imports = [r for r in workspace.requests if r["path"].endswith("/import")]
+        assert [(r["body"]["path"], r["body"]["format"]) for r in imports] == [
+            (report, "RAW"),
+            (load, "RAW"),
+            (creator, "SOURCE"),
+        ]
+        # A file has no language; a notebook's is Python.
+        assert ["language" in r["body"] for r in imports] == [False, False, True]
+        reading = {"catalog": "workspace", "schema": "raw"}
+        expected = {
+            report: sparkshift.to_pipeline(
+                sparkshift.convert(DEPLOY_SOURCES["legacy/report.sas"], dialect="sas"),
+                source="report.sas",
+                dialect="sas",
+                **reading,
+            ),
+            load: sparkshift.to_pipeline(
+                sparkshift.convert(DEPLOY_SOURCES["load.sql"]),
+                source="load.sql",
+                **reading,
+            ),
+            creator: create_pipeline_notebook(
+                pipeline_settings(
+                    "sparkshift claims",
+                    DEPLOY_FOLDER,
+                    [report, load],
+                    catalog="workspace",
+                    schema="claims",
+                )
+            ),
+        }
+        assert imported(workspace) == {
+            path: (source, False) for path, source in expected.items()
+        }
+        assert page.text_content("#deploy-link") == "Create pipeline"
+        assert page.get_attribute("#deploy-link", "href") == (
+            f"{MOCK_ORIGIN}/#workspace{DEPLOY_FOLDER}/Create%20pipeline"
+        )
+        assert page.text_content("#deploy-what") == "pipeline"
+        assert page.text_content("#deploy-job-name") == "sparkshift claims"
+    finally:
+        page.check("#deploy-kind-job")
+
+
+def test_a_pipeline_needs_a_catalog_and_schema_to_keep_its_tables(
+    deploy_page: tuple[Any, FakeDatabricks],
+) -> None:
+    page, _ = deploy_page
+    page.check("#deploy-kind-pipeline")
+    try:
+        fill_deploy_form(page, write="claims")
+
+        assert page.text_content("#deploy-write-hint") == (
+            "A pipeline keeps its tables in catalog.schema: type both."
+        )
+        assert page.get_attribute("#deploy-write", "aria-invalid") == "true"
+        assert page.is_disabled("#deploy")
+    finally:
+        page.check("#deploy-kind-job")
+    # A job writes nothing without a schema, and only a schema is fine.
+    assert page.get_attribute("#deploy-write", "aria-invalid") == "false"
+    assert page.is_enabled("#deploy")
+
+
 def test_a_refused_token_stops_before_any_import(
     deploy_page: tuple[Any, FakeDatabricks],
 ) -> None:
@@ -1299,6 +1465,35 @@ def test_deploying_needs_every_file_of_the_folder(folder_view: Any) -> None:
     assert page.locator("#deploy-plan li").count() == 0
 
 
+def test_a_pipeline_is_not_deployed_when_two_files_define_a_dataset(
+    folder_view: Any, tmp_path: Path
+) -> None:
+    page = folder_view
+    root = tmp_path / "jobs"
+    for name in ("a/daily.sql", "b/daily.sql"):
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text("SELECT order_id FROM orders", encoding="utf-8")
+    # As plain code both files convert; as a pipeline both define daily.
+    choose(page, str(root))
+    workspace = FakeDatabricks()
+    page.context.route(f"{MOCK_ORIGIN}/**", workspace)
+    page.click("#tab-deploy")
+    page.check("#deploy-kind-pipeline")
+    try:
+        fill_deploy_form(page)
+
+        deploy_and_wait(page)
+
+        assert page.text_content("#status") == (
+            "Deployment stopped: a/daily.sql: its dataset daily is also defined "
+            "by b/daily.sql; a pipeline defines each dataset once."
+        )
+        assert workspace.requests == []
+    finally:
+        page.check("#deploy-kind-job")
+        page.context.unroute(f"{MOCK_ORIGIN}/**")
+
+
 @pytest.mark.parametrize("color_scheme", ["light", "dark"])
 def test_deploy_view_has_no_accessibility_violations(
     browser: Any, site_url: str, color_scheme: str, tmp_path: Path
@@ -1313,6 +1508,8 @@ def test_deploy_view_has_no_accessibility_violations(
     page.click("#tab-deploy")
     fill_deploy_form(page, host="https://not-databricks.example.com")
     assert page.locator("#deploy-plan li").count() == 3
+    # The pipeline's form: its own labels and hints.
+    page.check("#deploy-kind-pipeline")
 
     results = Axe().run(
         page, options={"runOnly": ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"]}

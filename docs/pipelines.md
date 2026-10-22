@@ -108,6 +108,20 @@ The pipeline then appears under **Jobs & Pipelines**: start it there, or give
 it a schedule. Databricks Free Edition allows one active pipeline of each
 kind.
 
+## In the playground
+
+The [playground](https://arttgrantollii.github.io/sparkshift/) shows a
+program as its pipeline source file (**Pipeline**, next to PySpark and
+Notebook), converts a folder into them, and deploys them. In the **Deploy**
+tab, choose **A Lakeflow pipeline of the converted files** and type where
+the pipeline keeps its tables under **Write results to**, as
+`catalog.schema`. The page imports each file into the workspace folder,
+with a **Create pipeline** notebook: run it once (**Run all**) to create the
+pipeline that `upload --pipeline` would create, or to update the one of the
+same name. The notebook calls the Pipelines API from inside the workspace,
+because a web page from another site may not
+([playground](../playground/README.md#deploying-to-databricks)).
+
 ## Apache Spark's pipelines
 
 Apache Spark 4.1 and later run the same files with `spark-pipelines`, but not

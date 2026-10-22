@@ -54,6 +54,7 @@
             <div class="segmented" role="radiogroup" aria-label="Output">
               <button id="output-code" type="button" role="radio" aria-checked="true">PySpark</button>
               <button id="output-notebook" type="button" role="radio" aria-checked="false">Notebook</button>
+              <button id="output-pipeline" type="button" role="radio" aria-checked="false">Pipeline</button>
             </div>
             <button id="open-file" class="button" type="button" disabled>Open file</button>
             <input id="pick-source" type="file" accept=".sql,.sas" hidden />
@@ -164,9 +165,9 @@
           <form class="card" id="deploy-form" novalidate>
             <div class="card-head">
               <h2>Deploy to Databricks</h2>
-              <p class="muted">
-                Imports the folder's notebooks into your workspace, and a
-                <b>Create job</b> notebook that creates a job running them in order.
+              <p class="muted" id="deploy-intro">
+                Imports the folder's notebooks into your workspace, and a Create job
+                notebook that creates a job running them in order.
               </p>
             </div>
 
@@ -185,6 +186,18 @@
                 a deployment. Use a short-lived token.
               </span>
             </div>
+
+            <fieldset class="choice">
+              <legend>Create</legend>
+              <label class="check">
+                <input id="deploy-kind-job" type="radio" name="deploy-kind" value="job" checked />
+                A job that runs the notebooks in order
+              </label>
+              <label class="check">
+                <input id="deploy-kind-pipeline" type="radio" name="deploy-kind" value="pipeline" />
+                A Lakeflow pipeline of the converted files
+              </label>
+            </fieldset>
 
             <h3>Where</h3>
             <div class="form-field">
@@ -205,13 +218,13 @@
               </div>
             </div>
             <div class="form-field">
-              <label for="deploy-job">Job name</label>
+              <label for="deploy-job" id="deploy-job-label">Job name</label>
               <input id="deploy-job" class="input" type="text" autocomplete="off" spellcheck="false" aria-describedby="deploy-job-hint" />
               <span class="hint" id="deploy-job-hint">Empty: sparkshift and the folder's name. A job of the same name is updated.</span>
             </div>
             <label class="check">
               <input id="deploy-overwrite" type="checkbox" />
-              Replace notebooks that already exist
+              <span id="deploy-overwrite-label">Replace notebooks that already exist</span>
             </label>
             <div class="form-actions">
               <button id="deploy" class="button primary" type="submit" disabled>Deploy</button>
@@ -224,11 +237,11 @@
             <p id="deploy-note" class="muted"></p>
             <ol id="deploy-plan" class="plan"></ol>
             <div id="deploy-next" class="next" hidden>
-              <p><b>Deployed.</b> To create the job:</p>
+              <p><b>Deployed.</b> To create the <span id="deploy-what">job</span>:</p>
               <ol>
                 <li>Open <a id="deploy-link" href="#" target="_blank" rel="noopener noreferrer">Create job</a> in your workspace.</li>
-                <li>Click <b>Run all</b>. It creates the job <b id="deploy-job-name"></b>, or updates the one of that name.</li>
-                <li>Find the job under <b>Jobs &amp; Pipelines</b> and run it, or give it a schedule.</li>
+                <li>Click <b>Run all</b>. It creates <b id="deploy-job-name"></b>, or updates the one of that name.</li>
+                <li id="deploy-then">Find the job under Jobs &amp; Pipelines and run it, or give it a schedule.</li>
               </ol>
             </div>
           </section>
