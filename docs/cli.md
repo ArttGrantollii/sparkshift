@@ -15,6 +15,7 @@ sparkshift convert query.sql -o query.py        # write the code to a file
 cat query.sql | sparkshift convert -            # read standard input
 sparkshift convert queries/ -o pyspark/         # every .sql and .sas file in a directory
 sparkshift convert queries/ -o notebooks/ --notebook   # Databricks notebooks
+sparkshift convert queries/ -o pipeline/ --pipeline    # Lakeflow pipeline source files
 ```
 
 For example:
@@ -42,7 +43,8 @@ result = (
 | `-d`, `--dialect` | The SQL dialect: `tsql`, `postgres`, `mysql`, `snowflake`, `bigquery`, `oracle`, or `sas`. Omit it for generic SQL. A `.sas` file is always a SAS program; in a directory, `--dialect sas` selects only the `.sas` files |
 | `-o`, `--output` | The file to write, or for a directory input, the directory to write `.py` files into (required) |
 | `--notebook` | Write Databricks notebooks instead of plain code; see [databricks.md](databricks.md) |
-| `--catalog`, `--schema` | With `--notebook`: the initial values of the notebooks' `catalog` and `schema` widgets, where tables are read from |
+| `--pipeline` | Write pipeline source files for Lakeflow pipelines instead of plain code; see [pipelines.md](pipelines.md). In a directory, files that define a dataset of the same name are not written |
+| `--catalog`, `--schema` | With `--notebook`: the initial values of the notebooks' `catalog` and `schema` widgets, where tables are read from. With `--pipeline`: the schema (in the catalog, if given) that tables without a schema are read from |
 | `--output-catalog`, `--output-schema` | With `--notebook`: the initial values of the `output_catalog` and `output_schema` widgets, where results are written; nothing is written without an output schema. See [databricks.md](databricks.md#writing-results-to-tables) |
 | `--strict` | Reject any conversion with warnings and write no output for it |
 
@@ -139,8 +141,11 @@ blocker's hint, an example file, and every file's status. The JSON has a
 workspace folder. It takes `--dialect`, `--catalog`, `--schema`,
 `--output-catalog`, `--output-schema`, and `--strict` as `convert` does,
 plus `--job [NAME]` (also create a job that runs the notebooks in order; see
-[databricks.md](databricks.md#a-job-that-runs-the-notebooks)), `--profile`,
-`--overwrite`, and
+[databricks.md](databricks.md#a-job-that-runs-the-notebooks)), `--pipeline
+[NAME]` (upload pipeline source files instead, and create a Lakeflow pipeline
+from them, keeping its tables in `--output-catalog` and `--output-schema`,
+both required; see [pipelines.md](pipelines.md#creating-the-pipeline)),
+`--profile`, `--overwrite`, and
 `--dry-run`. It needs `pip install 'sparkshift[databricks]'`, except with
 `--dry-run`. See [databricks.md](databricks.md#uploading-to-a-workspace).
 
@@ -149,5 +154,5 @@ plus `--job [NAME]` (also create a job that runs the notebooks in order; see
 | Status | `convert` | `report` | `upload` |
 |---|---|---|---|
 | 0 | Every input was converted | The report was produced, whatever it finds | Every input was converted and uploaded |
-| 1 | Some input could not be converted, or `--strict` rejected its warnings | `--fail-under` was given and fewer files convert | Some input could not be converted or uploaded, or the `--job` could not be created |
+| 1 | Some input could not be converted, or `--strict` rejected its warnings | `--fail-under` was given and fewer files convert | Some input could not be converted or uploaded, or the `--job` or `--pipeline` could not be created |
 | 2 | Usage error, such as a missing file, an unknown dialect, or colliding output paths | Usage error | Usage error, or no connection to Databricks |

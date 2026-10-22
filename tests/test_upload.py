@@ -12,6 +12,7 @@ from sparkshift import databricks
 from sparkshift.cli import EXIT_CONVERTED, EXIT_NOT_CONVERTED, EXIT_USAGE, main
 from sparkshift.jobs import job_settings
 from sparkshift.notebook import to_notebook
+from sparkshift.pipelines import pipeline_settings, to_pipeline
 
 FOLDER = "/Workspace/Users/me@example.com/migrated"
 TOKEN = "dapi-fake-0123456789abcdef"
@@ -24,7 +25,9 @@ class FakeWorkspace:
         self.existing = set(existing)
         self.folders: list[str] = []
         self.notebooks: dict[str, tuple[str, bool]] = {}
+        self.files: dict[str, tuple[str, bool]] = {}
         self.jobs = {}
+        self.pipelines = {}
 
     def mkdirs(self, path: str) -> None:
         self.folders.append(path)
@@ -35,6 +38,32 @@ class FakeWorkspace:
                 "a notebook already exists there; pass --overwrite to replace it"
             )
         self.notebooks[path] = (source, overwrite)
+
+    def import_file(self, path: str, source: str, *, overwrite: bool) -> None:
+        if path in self.existing and not overwrite:
+            raise databricks.UploadError(
+                "a file already exists there; pass --overwrite to replace it"
+            )
+        self.files[path] = (source, overwrite)
+
+    # Pipelines, as jobs: ``pipelines`` maps IDs to settings.
+    pipelines: dict[str, dict]
+
+    def pipelines_named(self, name: str) -> list[str]:
+        self.fail_if_asked()
+        return [
+            key for key, settings in self.pipelines.items() if settings["name"] == name
+        ]
+
+    def create_pipeline(self, settings: dict) -> str:
+        self.fail_if_asked()
+        pipeline_id = f"p{len(self.pipelines) + 1}"
+        self.pipelines[pipeline_id] = settings
+        return pipeline_id
+
+    def edit_pipeline(self, pipeline_id: str, settings: dict) -> None:
+        self.fail_if_asked()
+        self.pipelines[pipeline_id] = settings
 
     # Jobs: ``jobs`` maps IDs to settings; ``job_error`` fails every call.
     jobs: dict[int, dict]
@@ -510,3 +539,251 @@ def test_redact_replaces_every_secret_and_ignores_tiny_values(
     assert databricks.redact(text, ["abcdef-long", "abcdef", "1"]) == (
         "token ***, prefix ***, secret ***, digit 1"
     )
+
+
+# --- Pipelines ------------------------------------------------------------------------
+
+# Tables are read from raw: the fixture orders.sql reads a table named orders,
+# which in a pipeline would otherwise be its own dataset.
+PIPELINE_TARGET = ["--schema", "raw", "--output-catalog", "main"]
+PIPELINE_TARGET += ["--output-schema", "claims"]
+
+
+def test_a_pipeline_is_made_of_the_uploaded_source_files(
+    workspace: FakeWorkspace, converting: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    arguments = [str(converting), "--to", FOLDER, "--pipeline"]
+
+    assert upload(*arguments, *PIPELINE_TARGET) == EXIT_CONVERTED
+
+    customers = sparkshift.convert("data us; set customers; run;", dialect="sas")
+    orders = sparkshift.convert("SELECT order_id FROM orders")
+    assert workspace.notebooks == {}
+    assert workspace.files == {
+        f"{FOLDER}/customers.py": (
+            to_pipeline(customers, source="customers.sas", dialect="sas", schema="raw"),
+            False,
+        ),
+        f"{FOLDER}/daily/orders.py": (
+            to_pipeline(orders, source="orders.sql", schema="raw"),
+            False,
+        ),
+    }
+    assert workspace.pipelines == {
+        "p1": pipeline_settings(
+            "sparkshift migrated",
+            FOLDER,
+            [f"{FOLDER}/customers.py", f"{FOLDER}/daily/orders.py"],
+            catalog="main",
+            schema="claims",
+        )
+    }
+    assert capsys.readouterr().err.endswith(
+        "created the pipeline 'sparkshift migrated' (ID p1): 2 source files, tables "
+        "in main.claims; start it under Jobs & Pipelines\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        (["--pipeline"], "--pipeline needs --output-catalog and --output-schema"),
+        (
+            ["--pipeline", "--output-schema", "claims"],
+            "--pipeline needs --output-catalog and --output-schema",
+        ),
+        (
+            [
+                "--pipeline",
+                "--catalog",
+                "c",
+                "--output-catalog",
+                "c",
+                "--output-schema",
+                "s",
+            ],
+            "--catalog needs --schema",
+        ),
+        (["--pipeline", "--job", *PIPELINE_TARGET], "not allowed with argument"),
+    ],
+)
+def test_pipeline_upload_options(
+    converting: Path,
+    capsys: pytest.CaptureFixture[str],
+    options: list[str],
+    message: str,
+) -> None:
+    with pytest.raises(SystemExit) as caught:
+        upload(str(converting), "--to", FOLDER, *options)
+
+    assert caught.value.code == EXIT_USAGE
+    assert message in capsys.readouterr().err
+
+
+def test_no_pipeline_without_every_file(
+    workspace: FakeWorkspace, jobs: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    status = upload(str(jobs), "--to", FOLDER, "--pipeline", *PIPELINE_TARGET)
+
+    assert status == EXIT_NOT_CONVERTED
+    assert len(workspace.files) == 2
+    assert workspace.pipelines == {}
+    assert "no pipeline created: it needs every file converted and uploaded" in (
+        capsys.readouterr().err
+    )
+
+
+def test_files_that_define_the_same_dataset_make_no_pipeline(
+    workspace: FakeWorkspace, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "jobs"
+    (root / "a").mkdir(parents=True)
+    (root / "b").mkdir()
+    (root / "a" / "daily.sql").write_text("SELECT x FROM t")
+    (root / "b" / "daily.sql").write_text("SELECT y FROM u")
+
+    status = upload(str(root), "--to", FOLDER, "--pipeline", *PIPELINE_TARGET)
+
+    assert status == EXIT_NOT_CONVERTED
+    assert workspace.files == {}
+    assert workspace.pipelines == {}
+    assert "its dataset daily is also defined by" in capsys.readouterr().err
+
+
+def test_an_existing_pipeline_is_kept_unless_overwrite_is_given(
+    workspace: FakeWorkspace, converting: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace.pipelines["old"] = {"name": "sparkshift migrated", "libraries": []}
+    arguments = [str(converting), "--to", FOLDER, "--pipeline", *PIPELINE_TARGET]
+
+    assert upload(*arguments) == EXIT_NOT_CONVERTED
+    assert workspace.pipelines["old"]["libraries"] == []
+    assert "a pipeline named 'sparkshift migrated' already exists (ID old)" in (
+        capsys.readouterr().err
+    )
+
+    assert upload(*arguments, "--overwrite") == EXIT_CONVERTED
+    assert list(workspace.pipelines) == ["old"]
+    assert len(workspace.pipelines["old"]["libraries"]) == 2
+    assert "updated the pipeline 'sparkshift migrated' (ID old)" in (
+        capsys.readouterr().err
+    )
+
+
+def test_no_guess_between_pipelines_of_the_same_name(
+    workspace: FakeWorkspace, converting: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace.pipelines.update({"1": {"name": "x"}, "2": {"name": "x"}})
+    arguments = [str(converting), "--to", FOLDER, "--pipeline", "x", "--overwrite"]
+
+    assert upload(*arguments, *PIPELINE_TARGET) == EXIT_NOT_CONVERTED
+    assert workspace.pipelines == {"1": {"name": "x"}, "2": {"name": "x"}}
+    assert "2 pipelines are named 'x'" in capsys.readouterr().err
+
+
+def test_a_pipeline_that_cannot_be_created_is_reported(
+    workspace: FakeWorkspace, converting: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace.job_error = "permission denied"
+    arguments = [str(converting), "--to", FOLDER, "--pipeline", *PIPELINE_TARGET]
+
+    assert upload(*arguments) == EXIT_NOT_CONVERTED
+    assert (
+        "cannot create the pipeline 'sparkshift migrated': permission denied"
+        in capsys.readouterr().err
+    )
+
+
+def test_a_program_that_cannot_be_a_pipeline_is_not_uploaded(
+    workspace: FakeWorkspace, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "report.sas"
+    path.write_text("proc print data=t; run;")
+
+    status = upload(str(path), "--to", FOLDER, "--pipeline", *PIPELINE_TARGET)
+
+    assert status == EXIT_NOT_CONVERTED
+    assert workspace.files == {}
+    assert "a pipeline of a program that creates no data set" in capsys.readouterr().err
+
+
+def test_dry_run_shows_the_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    converting: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(databricks, "connect", mock.Mock(side_effect=AssertionError))
+    arguments = [str(converting), "--to", FOLDER, "--pipeline", "--dry-run"]
+
+    assert upload(*arguments, *PIPELINE_TARGET) == EXIT_CONVERTED
+    assert capsys.readouterr().out.splitlines() == [
+        f"{converting / 'customers.sas'} -> {FOLDER}/customers.py",
+        f"{converting / 'daily' / 'orders.sql'} -> {FOLDER}/daily/orders.py",
+        "pipeline 'sparkshift migrated': 2 source files, tables in main.claims",
+    ]
+
+
+def test_pipelines_are_created_and_edited_with_the_create_body() -> None:
+    client = mock.Mock()
+    client.api_client.do.return_value = {"pipeline_id": "abc"}
+    workspace = databricks._SdkWorkspace(client)
+    settings = {"name": "x", "libraries": []}
+
+    assert workspace.create_pipeline(settings) == "abc"
+    workspace.edit_pipeline("abc", settings)
+
+    assert client.api_client.do.call_args_list == [
+        mock.call("POST", "/api/2.0/pipelines", body=settings),
+        mock.call("PUT", "/api/2.0/pipelines/abc", body={**settings, "id": "abc"}),
+    ]
+
+
+def test_pipelines_are_matched_by_their_exact_name() -> None:
+    client = mock.Mock()
+    found = [mock.Mock(pipeline_id="1"), mock.Mock(pipeline_id="2")]
+    found[0].name = "Claims"
+    found[1].name = "claims"
+    client.pipelines.list_pipelines.return_value = found
+
+    assert databricks._SdkWorkspace(client).pipelines_named("claims") == ["2"]
+
+
+def test_pipeline_source_files_are_imported_as_files() -> None:
+    from databricks.sdk.errors import ResourceAlreadyExists
+    from databricks.sdk.service.workspace import ImportFormat
+
+    client = mock.Mock()
+    workspace = databricks._SdkWorkspace(client)
+
+    workspace.import_file("/a/b.py", "x = 1\n", overwrite=True)
+
+    client.workspace.import_.assert_called_once_with(
+        "/a/b.py",
+        content=base64.b64encode(b"x = 1\n").decode("ascii"),
+        format=ImportFormat.RAW,
+        overwrite=True,
+    )
+    client.workspace.import_.side_effect = ResourceAlreadyExists("exists")
+    with pytest.raises(databricks.UploadError, match="a file already exists there"):
+        workspace.import_file("/a/b.py", "x = 1\n", overwrite=False)
+
+
+def test_pipeline_errors_never_show_the_token() -> None:
+    from databricks.sdk.errors import DatabricksError
+
+    client = mock.Mock()
+    client.config.token = TOKEN
+    client.api_client.do.side_effect = DatabricksError(f"denied for {TOKEN}")
+    client.pipelines.list_pipelines.side_effect = DatabricksError(f"denied for {TOKEN}")
+    client.workspace.import_.side_effect = DatabricksError(f"denied for {TOKEN}")
+    workspace = databricks._SdkWorkspace(client)
+
+    for call in (
+        lambda: workspace.create_pipeline({}),
+        lambda: workspace.edit_pipeline("x", {}),
+        lambda: workspace.pipelines_named("x"),
+        lambda: workspace.import_file("/a.py", "", overwrite=False),
+    ):
+        with pytest.raises(databricks.UploadError) as caught:
+            call()
+        assert str(caught.value) == "denied for ***"

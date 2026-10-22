@@ -1263,6 +1263,17 @@ connect = [
     { name = "pyarrow" },
     { name = "zstandard" },
 ]
+pipelines = [
+    { name = "googleapis-common-protos" },
+    { name = "grpcio" },
+    { name = "grpcio-status" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "pandas" },
+    { name = "pyarrow" },
+    { name = "pyyaml" },
+    { name = "zstandard" },
+]
 
 [[package]]
 name = "pytest"
@@ -1459,7 +1470,7 @@ databricks = [
 [package.dev-dependencies]
 connect = [
     { name = "pandas" },
-    { name = "pyspark", extra = ["connect"] },
+    { name = "pyspark", extra = ["connect", "pipelines"] },
 ]
 dev = [
     { name = "axe-playwright-python" },
@@ -1485,7 +1496,7 @@ provides-extras = ["databricks"]
 [package.metadata.requires-dev]
 connect = [
     { name = "pandas", specifier = ">=2.2,<3" },
-    { name = "pyspark", extras = ["connect"], specifier = ">=4.2.0" },
+    { name = "pyspark", extras = ["connect", "pipelines"], specifier = ">=4.2.0" },
 ]
 dev = [
     { name = "axe-playwright-python", specifier = ">=0.1.8" },

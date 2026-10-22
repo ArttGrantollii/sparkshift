@@ -150,6 +150,21 @@ to `…358.037037036`, where Spark SQL gives `decimal(34,12)`,
 `…358.037037035901`. SparkShift therefore emits a decimal literal as its text cast to its exact
 type, `F.lit("0.5").cast("decimal(1,1)")`, the same in both modes.
 
+### Pipelines
+
+`tests/equivalence/test_pipeline_runs.py` runs pipeline source files as
+pipelines, on Apache Spark's Spark Declarative Pipelines through the same
+local Spark Connect server (so it runs with `SPARKSHIFT_SPARK_MODE=connect`,
+in the "Spark Connect" CI job): every SQL example as one pipeline, every SAS
+example as another, a file that reads another file's dataset, and a data set
+created twice. Each materialized view must hold what the plain code computes
+for it. Each pipeline runs in a new schema, because Apache Spark 4.2 can lose
+the order of datasets once their tables exist
+([ADR 0013](adr/0013-pipelines-from-the-same-plan.md)); for the same reason,
+these programs avoid `drop`, `distinct`, and `dropDuplicates` on a dataset of
+the pipeline, which `tools/validate_databricks.py --pipeline` runs on
+Databricks instead.
+
 ### Testing the comparator
 
 A comparator that always reports "equal" would make every equivalence test

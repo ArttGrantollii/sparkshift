@@ -146,7 +146,7 @@ def _tables(
     file, or ``result`` without one.
     """
     if not result.datasets and not is_sas(dialect):
-        return [("result", _table_name(source))]
+        return [("result", table_name(source))]
     seen: set[str] = set()
     last: list[tuple[str, str]] = []
     for dataset in reversed(result.datasets):
@@ -156,11 +156,18 @@ def _tables(
     return last[::-1]
 
 
-def _table_name(source: str | None) -> str:
+def table_name(source: str | None) -> str:
     """A table name from a file name: its stem in lowercase, with characters
     other than ASCII letters, digits and underscores replaced by underscores."""
     stem = PurePath(source).stem if source else ""
     return re.sub(r"[^a-z0-9_]", "_", stem.lower()) or "result"
+
+
+def language_name(dialect: str | None) -> str | None:
+    """How a notebook names the language it was converted from."""
+    if is_sas(dialect):
+        return "SAS"
+    return _LANGUAGES.get(dialect.lower() if dialect else None, dialect)
 
 
 def _description(
@@ -172,8 +179,7 @@ def _description(
     from sparkshift import __version__
 
     title = PurePath(source).stem if source else "Converted code"
-    key = dialect.lower() if dialect else None
-    language = "SAS" if is_sas(dialect) else _LANGUAGES.get(key, dialect)
+    language = language_name(dialect)
     origin = f"`{PurePath(source).name}`" if source else "code"
     lines = [
         f"# {title}",

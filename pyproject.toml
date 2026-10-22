@@ -91,12 +91,13 @@ dev = [
     "ruff>=0.16.10",
 ]
 # The Spark Connect client, to test the generated code the way Databricks
-# serverless compute runs it: uv sync --group connect, then run the tests with
-# SPARKSHIFT_SPARK_MODE=connect.
+# serverless compute runs it, and pipeline source files the way Spark
+# Declarative Pipelines run them: uv sync --group connect, then run the tests
+# with SPARKSHIFT_SPARK_MODE=connect.
 connect = [
     # PySpark 4.2 warns that it does not fully support pandas 3 yet.
     "pandas>=2.2,<3",
-    "pyspark[connect]>=4.2.0",
+    "pyspark[connect,pipelines]>=4.2.0",
 ]
 
 [tool.ruff]

@@ -72,6 +72,18 @@ widgets that choose where results are written (nothing is written while
 `output_schema` is empty; see
 [writing results](databricks.md#writing-results-to-tables)).
 
+## `to_pipeline(result, *, source=None, dialect=None, catalog="", schema="")`
+
+Returns the datasets of `result` as a pipeline source file for Lakeflow
+pipelines (see [pipelines.md](pipelines.md)): each data set a SAS program
+creates, or a query's result, is a materialized view. `source` names the
+file the code came from, which names a query's dataset; `dialect` is the
+language it was converted from, as given to `convert`; `schema` (in
+`catalog`, if given) is where tables without a schema are read from. It
+raises `UnsupportedSQLError` for a program a pipeline cannot run, and
+`ValueError` for a `catalog` without a `schema`, or a `result` that does not
+come from `convert`.
+
 ## Errors
 
 Every error derives from `SparkShiftError`, so one `except` handles them all:

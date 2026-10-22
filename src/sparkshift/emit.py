@@ -11,6 +11,7 @@ import keyword
 import re
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import TypeAlias, assert_never
 
@@ -34,6 +35,9 @@ _RESERVED_NAMES = frozenset(
         "datetime",
         "dbutils",
         "display",
+        # The pipelines module and Spark's types, in pipeline source files.
+        "dp",
+        "T",
     }
 )
 
@@ -41,6 +45,10 @@ _INDENT = "    "
 _MAX_LINE_LENGTH = 88
 # Chain steps start at column 4 and their arguments at column 8.
 _ARGUMENT_COLUMN = 8
+
+# The pyspark.sql.types class of each column type of rows written in the
+# code, for pipeline source files.
+_SCHEMA_TYPES = {"double": "DoubleType", "string": "StringType", "date": "DateType"}
 
 # Identifier parts Spark accepts without backtick quoting.
 _PLAIN_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -141,6 +149,64 @@ def emit_datasets_and_variables(
     return code, {dataset: emitter.named_variables[dataset] for dataset in datasets}
 
 
+@dataclass(frozen=True)
+class PipelineDataset:
+    """A dataset of a pipeline source file: its ``name`` in the pipeline, the
+    ``relation`` that computes it, and whether it is a temporary view, which
+    only the pipeline reads, rather than a materialized view."""
+
+    name: str
+    relation: ir.Relation
+    temporary: bool = False
+
+
+def emit_pipeline(
+    datasets: Sequence[PipelineDataset], *, line_length: int = _MAX_LINE_LENGTH
+) -> str:
+    """Return a pipeline source file: for each dataset, a function decorated
+    with ``dp.materialized_view`` or ``dp.temporary_view`` that returns its
+    DataFrame, computed as plain code would compute it. The file imports what
+    the functions use, ``pyspark.pipelines`` as ``dp``, and expects a
+    SparkSession named ``spark``, which pipelines provide."""
+    if not datasets:
+        raise ValueError("emit_pipeline needs at least one dataset")
+    taken = set(_RESERVED_NAMES)
+    functions = []
+    emitters = []
+    for dataset in datasets:
+        emitter = _Emitter(line_length - len(_INDENT))
+        # A pipeline may not analyze anything while it defines a dataset, and
+        # Spark Connect asks its server to parse a schema written as text.
+        emitter.typed_schemas = True
+        # Imports are gathered below, from every function.
+        _, body = emitter.sections(
+            [dataset.relation],
+            lambda e=emitter, d=dataset: f"return {e.relation(d.relation)}",
+        )
+        emitters.append(emitter)
+        name = _unique_name(_python_name(dataset.name), taken)
+        taken.add(name)
+        decorator = "temporary_view" if dataset.temporary else "materialized_view"
+        functions.append(
+            f"@dp.{decorator}(name={python_string(dataset.name)})\n"
+            f"def {name}():\n" + _indent("\n\n".join(body))
+        )
+    standard = []
+    if any(e.uses_datetime for e in emitters):
+        standard.append("import datetime")
+    if any(e.uses_decimal for e in emitters):
+        standard.append("from decimal import Decimal")
+    pyspark = ["from pyspark import pipelines as dp"]
+    if any(e.uses_window for e in emitters):
+        pyspark.append("from pyspark.sql import Window")
+    if any(e.uses_functions for e in emitters):
+        pyspark.append("from pyspark.sql import functions as F")
+    if any(e.uses_types for e in emitters):
+        pyspark.append("from pyspark.sql import types as T")
+    imports = ["\n".join(section) for section in (standard, pyspark) if section]
+    return "\n\n".join(imports) + "\n\n\n" + "\n\n\n".join(functions) + "\n"
+
+
 def emit_expression(expression: ir.Expression) -> str:
     """Return the PySpark code for a single expression."""
     return _Emitter().expression(expression)
@@ -153,6 +219,10 @@ class _Emitter:
         self.uses_decimal = False
         self.uses_datetime = False
         self.uses_window = False
+        self.uses_types = False
+        # Whether the schema of rows written in the code is a StructType,
+        # rather than text (see emit_pipeline).
+        self.typed_schemas = False
         self.table_variables: dict[tuple[str, ...], str] = {}
         self.table_uses: Counter[tuple[str, ...]] = Counter()
         self.window_variables: dict[_WindowKey, str] = {}
@@ -186,6 +256,20 @@ class _Emitter:
     def assemble(self, roots: Sequence[ir.Relation], result: Callable[[], str]) -> str:
         """The whole program: imports, shared variables, the declarations
         ``result`` makes while rendering, then ``result = ...``."""
+        imports, body = self.sections(
+            roots, lambda: f"{RESULT_VARIABLE} = {result()}\n"
+        )
+        # Standard-library imports, third-party imports, table variables,
+        # windows, each named relation, and the result are separated by blank
+        # lines.
+        return "\n\n".join([*imports, *body])
+
+    def sections(
+        self, roots: Sequence[ir.Relation], statement: Callable[[], str]
+    ) -> tuple[list[str], list[str]]:
+        """The import sections, then the code's other sections: the shared
+        variables, the declarations ``statement`` makes while rendering, and
+        the statement itself."""
         nodes = [node for root in roots for node in _walk(root)]
         self.table_uses = Counter(
             node.name_parts for node in nodes if isinstance(node, ir.TableScan)
@@ -200,7 +284,7 @@ class _Emitter:
         self.taken_names |= {*self.table_variables.values()}
         self.taken_names |= {*self.window_variables.values()}
 
-        statement = f"{RESULT_VARIABLE} = {result()}\n"
+        final = statement()
         windows = [
             self.window_variable(name, key)
             for key, name in self.window_variables.items()
@@ -210,16 +294,13 @@ class _Emitter:
             imports.append("from pyspark.sql import Window")
         if self.uses_functions:
             imports.append("from pyspark.sql import functions as F")
-        sections = []
         standard = []
         if self.uses_datetime:
             standard.append("import datetime")
         if self.uses_decimal:
             standard.append("from decimal import Decimal")
-        if standard:
-            sections.append("\n".join(standard))
-        if imports:
-            sections.append("\n".join(imports))
+        import_sections = ["\n".join(part) for part in (standard, imports) if part]
+        sections = []
         if self.table_variables:
             sections.append(
                 "\n".join(
@@ -229,10 +310,7 @@ class _Emitter:
             )
         if windows:
             sections.append("\n".join(windows))
-        # Standard-library imports, third-party imports, table variables,
-        # windows, each named relation, and the result are separated by blank
-        # lines.
-        return "\n\n".join([*sections, *self.declarations, statement])
+        return import_sections, [*sections, *self.declarations, final]
 
     def named_variable(self, node: ir.Named) -> str:
         """The variable holding a named relation. It is declared the first time
@@ -267,6 +345,9 @@ class _Emitter:
         data = "[]"
         if rows:
             data = "[\n" + "".join(_indent(row) + "\n" for row in rows) + "]"
+        if self.typed_schemas:
+            schema = self.struct_type(plan)
+            return f"spark.createDataFrame(\n{_indent(data)},\n{_indent(schema)},\n)"
         names = [f"`{name.replace('`', '``')}` {kind}" for name, kind in plan.columns]
         # The schema in string literals that fit; Python joins adjacent ones.
         lines: list[str] = []
@@ -283,6 +364,16 @@ class _Emitter:
         lines.append(python_string(current))
         schema = "\n".join(lines)
         return f"spark.createDataFrame(\n{_indent(data)},\n{_indent(schema)},\n)"
+
+    def struct_type(self, plan: ir.InlineRows) -> str:
+        """The schema of rows written in the code as T.StructType([...])."""
+        self.uses_types = True
+        fields = [
+            f"T.StructField({python_string(name)}, T.{_SCHEMA_TYPES[kind]}()),"
+            for name, kind in plan.columns
+        ]
+        body = "\n".join(_indent(_indent(field)) for field in fields)
+        return f"T.StructType(\n{_indent('[')}\n{body}\n{_indent(']')}\n)"
 
     def inline_value(self, value: object) -> str:
         """A value of a row written in the code, as a Python literal."""

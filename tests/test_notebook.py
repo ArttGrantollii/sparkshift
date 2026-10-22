@@ -12,9 +12,9 @@ from sparkshift.notebook import (
     Cell,
     markdown_text,
     notebook_cells,
+    table_name,
     to_notebook,
 )
-from sparkshift.notebook import _table_name as table_name
 
 SEPARATOR = f"\n\n{CELL_SEPARATOR}\n\n"
 

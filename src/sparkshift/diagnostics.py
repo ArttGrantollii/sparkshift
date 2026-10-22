@@ -6,7 +6,9 @@ returns a ``ConversionResult``, whose warnings describe anything the caller
 should review — for example, a construct translated through a fallback.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from sparkshift import ir
 
 _MAX_SQL_IN_MESSAGE = 80
 
@@ -55,3 +57,8 @@ class ConversionResult:
     code: str
     warnings: tuple[Diagnostic, ...] = ()
     datasets: tuple[DataSet, ...] = ()
+    # What the code was generated from, for to_pipeline: a query's plan, or
+    # the data sets of a SAS program and what it prints. Not part of the
+    # result's value.
+    _plans: tuple[ir.Relation, ...] = field(default=(), repr=False, compare=False)
+    _printed: ir.Relation | None = field(default=None, repr=False, compare=False)

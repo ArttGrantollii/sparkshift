@@ -2,16 +2,19 @@
 ``sparkshift report queries/``, and ``sparkshift upload queries/ --to FOLDER``.
 
 ``convert`` converts one SQL file or SAS program, standard input, or every
-``.sql`` and ``.sas`` file in a directory. Generated code goes to standard
-output, or to the file or directory named by ``--output``; every message goes
-to standard error, so redirecting the output never captures an error message.
+``.sql`` and ``.sas`` file in a directory, into plain code, Databricks
+notebooks (``--notebook``), or pipeline source files (``--pipeline``).
+Generated code goes to standard output, or to the file or directory named by
+``--output``; every message goes to standard error, so redirecting the output
+never captures an error message.
 
 ``report`` assesses a file or every ``.sql`` and ``.sas`` file in a directory
 and reports how many convert and what blocks the rest, without writing code.
 
 ``upload`` converts a file or every ``.sql`` and ``.sas`` file in a directory
 into Databricks notebooks and imports them into a workspace folder (see
-:mod:`sparkshift.databricks`).
+:mod:`sparkshift.databricks`), and can create a job that runs them; or, with
+``--pipeline``, into pipeline source files and a Lakeflow pipeline.
 
 A ``.sas`` file is always a SAS program; ``--dialect`` gives the dialect of
 the SQL files, and ``--dialect sas`` selects only the SAS programs.
@@ -41,6 +44,12 @@ from sparkshift.dialects import DIALECT_CHOICES
 from sparkshift.errors import SparkShiftError
 from sparkshift.jobs import default_job_name, job_settings
 from sparkshift.notebook import to_notebook
+from sparkshift.pipelines import (
+    default_pipeline_name,
+    pipeline_settings,
+    pipeline_tables,
+    to_pipeline,
+)
 from sparkshift.report import Report, assess, to_json, to_markdown, to_text, unreadable
 
 EXIT_CONVERTED = 0
@@ -64,15 +73,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _report(parser, arguments)
     if arguments.command == "upload":
         return _upload(parser, arguments)
-    locations = (
-        arguments.catalog,
-        arguments.schema,
-        arguments.output_catalog,
-        arguments.output_schema,
-    )
-    if any(locations) and not arguments.notebook:
+    reading = (arguments.catalog, arguments.schema)
+    writing = (arguments.output_catalog, arguments.output_schema)
+    if arguments.pipeline:
+        if any(writing):
+            parser.error(
+                "--output-catalog and --output-schema are for notebooks; a "
+                "pipeline keeps its tables in the catalog and schema it is "
+                "created with"
+            )
+        if arguments.catalog and not arguments.schema:
+            parser.error("--catalog needs --schema with --pipeline")
+    elif any(reading + writing) and not arguments.notebook:
         parser.error(
-            "--catalog, --schema, --output-catalog and --output-schema need --notebook"
+            "--catalog, --schema, --output-catalog and --output-schema need "
+            "--notebook (--catalog and --schema also work with --pipeline)"
         )
     if arguments.input != _STDIN and Path(arguments.input).is_dir():
         return _convert_directory(parser, arguments)
@@ -119,10 +134,18 @@ def _parser() -> argparse.ArgumentParser:
             "directory input, the directory to write .py files into (required)"
         ),
     )
-    convert_command.add_argument(
+    kinds = convert_command.add_mutually_exclusive_group()
+    kinds.add_argument(
         "--notebook",
         action="store_true",
         help="write Databricks notebooks (source format) instead of plain code",
+    )
+    kinds.add_argument(
+        "--pipeline",
+        action="store_true",
+        help="write pipeline source files, for Lakeflow pipelines on Databricks "
+        "or spark-pipelines on Apache Spark: each data set, or a query's result, "
+        "becomes a materialized view",
     )
     _add_location_arguments(convert_command, "with --notebook, ")
 
@@ -219,7 +242,8 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="convert and list the notebook paths without connecting to Databricks",
     )
-    upload_command.add_argument(
+    deployments = upload_command.add_mutually_exclusive_group()
+    deployments.add_argument(
         "--job",
         nargs="?",
         const="",
@@ -228,6 +252,18 @@ def _parser() -> argparse.ArgumentParser:
         "compute, named NAME (default: sparkshift and the folder's name); with "
         "--overwrite, a job of that name is updated. The job is created only if "
         "every file converts and uploads",
+    )
+    deployments.add_argument(
+        "--pipeline",
+        nargs="?",
+        const="",
+        metavar="NAME",
+        help="upload pipeline source files instead of notebooks, and create a "
+        "Lakeflow pipeline from them on serverless compute, named NAME (default: "
+        "sparkshift and the folder's name), keeping its tables in "
+        "--output-catalog and --output-schema; with --overwrite, a pipeline of "
+        "that name is updated. The pipeline is created only if every file "
+        "converts and uploads",
     )
     return parser
 
@@ -266,7 +302,9 @@ def _convert_one(parser: argparse.ArgumentParser, arguments: argparse.Namespace)
     if result is None:
         return EXIT_NOT_CONVERTED
     source = None if arguments.input == _STDIN else arguments.input
-    code = _output(result, arguments, source, dialect)
+    code = _output(parser.prog, result, arguments, source, dialect, name)
+    if code is None:
+        return EXIT_NOT_CONVERTED
     if arguments.output is None:
         sys.stdout.write(code)
     else:
@@ -279,7 +317,9 @@ def _convert_directory(
 ) -> int:
     """Convert every .sql and .sas file under a directory, in sorted order,
     into a .py file at the same relative path under the output directory.
-    Files that cannot be converted are reported, and get no output file."""
+    Files that cannot be converted are reported, and get no output file. The
+    pipeline source files of a directory are one pipeline: files that define
+    a dataset of the same name are reported too."""
     source = Path(arguments.input)
     output: Path | None = arguments.output
     if output is None:
@@ -289,7 +329,7 @@ def _convert_directory(
     files = _source_files(parser, source, arguments.dialect)
     destinations = _batch_outputs(parser, source, output, files)
 
-    converted = 0
+    outputs: list[tuple[Path, Path, str, list[str]]] = []
     for path, destination in destinations:
         sql, reason = _read_text(path)
         if sql is None:
@@ -299,14 +339,23 @@ def _convert_directory(
         result = _conversion(
             parser.prog, sql, str(path), dialect, strict=arguments.strict
         )
-        if result is not None:
-            _write(
-                parser,
-                destination,
-                _output(result, arguments, path.name, dialect),
-            )
-            converted += 1
+        if result is None:
+            continue
+        code = _output(parser.prog, result, arguments, path.name, dialect, str(path))
+        if code is None:
+            continue
+        tables = (
+            pipeline_tables(result, source=path.name, dialect=dialect)
+            if arguments.pipeline
+            else []
+        )
+        outputs.append((path, destination, code, tables))
+    if arguments.pipeline:
+        outputs = _defined_once(parser.prog, outputs)
+    for _, destination, code, _ in outputs:
+        _write(parser, destination, code)
 
+    converted = len(outputs)
     failed = len(files) - converted
     noun = "file" if len(files) == 1 else "files"
     summary = f"{parser.prog}: converted {converted} of {len(files)} {noun}"
@@ -314,6 +363,30 @@ def _convert_directory(
         summary += f"; {failed} could not be converted"
     print(summary, file=sys.stderr)
     return EXIT_CONVERTED if failed == 0 else EXIT_NOT_CONVERTED
+
+
+def _defined_once(
+    prog: str, outputs: list[tuple[Path, PathT, str, list[str]]]
+) -> list[tuple[Path, PathT, str, list[str]]]:
+    """The outputs whose datasets no other file of the pipeline defines; the
+    others are reported, as a pipeline defines each dataset once."""
+    definers: dict[str, list[Path]] = {}
+    for path, _, _, tables in outputs:
+        for table in tables:
+            definers.setdefault(table.lower(), []).append(path)
+    shared: set[Path] = set()
+    for table, paths in definers.items():
+        if len(paths) < 2:
+            continue
+        for path in paths:
+            others = ", ".join(str(other) for other in paths if other != path)
+            print(
+                f"{prog}: cannot convert {path}: its dataset {table} is also defined "
+                f"by {others}; a pipeline defines each dataset once",
+                file=sys.stderr,
+            )
+            shared.add(path)
+    return [output for output in outputs if output[0] not in shared]
 
 
 def _batch_outputs(
@@ -395,9 +468,17 @@ def _report(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> i
 
 def _upload(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int:
     """Convert a file, or every .sql and .sas file under a directory, into
-    notebooks and import them into a workspace folder. Every file is converted
-    before connecting; a notebook that cannot be imported is reported, and the
-    others are still imported."""
+    notebooks, or pipeline source files, and import them into a workspace
+    folder. Every file is converted before connecting; a file that cannot be
+    imported is reported, and the others are still imported."""
+    pipeline = arguments.pipeline is not None
+    if pipeline and not (arguments.output_catalog and arguments.output_schema):
+        parser.error(
+            "--pipeline needs --output-catalog and --output-schema: the catalog "
+            "and schema the pipeline keeps its tables in"
+        )
+    if pipeline and arguments.catalog and not arguments.schema:
+        parser.error("--catalog needs --schema with --pipeline")
     folder = PurePosixPath(arguments.to)
     if not folder.is_absolute() or ".." in folder.parts:
         parser.error(
@@ -411,10 +492,12 @@ def _upload(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> i
         files, source = [source], source.parent
     else:
         parser.error(f"cannot read {arguments.input}: no such file or directory")
-    planned = _batch_outputs(parser, source, folder, files, suffix="")
+    # Notebooks have no suffix in a workspace; pipeline source files are files.
+    suffix = ".py" if pipeline else ""
+    planned = _batch_outputs(parser, source, folder, files, suffix=suffix)
 
-    notebooks: list[tuple[Path, PurePosixPath, str]] = []
-    for path, notebook_path in planned:
+    outputs: list[tuple[Path, PurePosixPath, str, list[str]]] = []
+    for path, target in planned:
         sql, reason = _read_text(path)
         if sql is None:
             print(f"{parser.prog}: cannot read {path}: {reason}", file=sys.stderr)
@@ -423,7 +506,9 @@ def _upload(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> i
         result = _conversion(
             parser.prog, sql, str(path), dialect, strict=arguments.strict
         )
-        if result is not None:
+        if result is None:
+            continue
+        if not pipeline:
             notebook = to_notebook(
                 result,
                 source=path.name,
@@ -433,29 +518,61 @@ def _upload(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> i
                 output_catalog=arguments.output_catalog,
                 output_schema=arguments.output_schema,
             )
-            notebooks.append((path, notebook_path, notebook))
+            outputs.append((path, target, notebook, []))
+            continue
+        try:
+            code = to_pipeline(
+                result,
+                source=path.name,
+                dialect=dialect,
+                catalog=arguments.catalog,
+                schema=arguments.schema,
+            )
+        except SparkShiftError as error:
+            print(f"{parser.prog}: cannot convert {path}: {error}", file=sys.stderr)
+            continue
+        tables = pipeline_tables(result, source=path.name, dialect=dialect)
+        outputs.append((path, target, code, tables))
+    if pipeline:
+        outputs = _defined_once(parser.prog, outputs)
 
     settings = None
+    paths = [str(target) for _, target, _, _ in outputs]
     if arguments.job is not None:
         settings = job_settings(
             arguments.job or default_job_name(str(folder)),
             str(folder),
-            [str(notebook_path) for _, notebook_path, _ in notebooks],
+            paths,
             catalog=arguments.catalog,
             schema=arguments.schema,
             output_catalog=arguments.output_catalog,
             output_schema=arguments.output_schema,
         )
+    elif pipeline:
+        settings = pipeline_settings(
+            arguments.pipeline or default_pipeline_name(str(folder)),
+            str(folder),
+            paths,
+            catalog=arguments.output_catalog,
+            schema=arguments.output_schema,
+        )
 
     if arguments.dry_run:
-        for path, notebook_path, _ in notebooks:
-            print(f"{path} -> {notebook_path}")
+        for path, target, _, _ in outputs:
+            print(f"{path} -> {target}")
         status = _upload_summary(
-            parser.prog, "would upload", "converted", len(notebooks), files
+            parser.prog, "would upload", "converted", len(outputs), files
         )
         if settings is not None and status == EXIT_CONVERTED:
-            keys = " -> ".join(task["task_key"] for task in settings["tasks"])
-            print(f"job {settings['name']!r}: {keys}")
+            if pipeline:
+                print(
+                    f"pipeline {settings['name']!r}: {len(paths)} source "
+                    f"{'file' if len(paths) == 1 else 'files'}, tables in "
+                    f"{settings['catalog']}.{settings['schema']}"
+                )
+            else:
+                keys = " -> ".join(task["task_key"] for task in settings["tasks"])
+                print(f"job {settings['name']!r}: {keys}")
         return status
 
     try:
@@ -465,35 +582,40 @@ def _upload(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> i
         return EXIT_USAGE
     uploaded = 0
     created: set[PurePosixPath] = set()
-    for path, notebook_path, notebook in notebooks:
+    upload_one = workspace.import_file if pipeline else workspace.import_notebook
+    for path, target, code, _ in outputs:
         try:
-            if notebook_path.parent not in created:
-                workspace.mkdirs(str(notebook_path.parent))
-                created.add(notebook_path.parent)
-            workspace.import_notebook(
-                str(notebook_path), notebook, overwrite=arguments.overwrite
-            )
+            if target.parent not in created:
+                workspace.mkdirs(str(target.parent))
+                created.add(target.parent)
+            upload_one(str(target), code, overwrite=arguments.overwrite)
         except databricks.UploadError as error:
             print(
-                f"{parser.prog}: cannot upload {path} to {notebook_path}: {error}",
+                f"{parser.prog}: cannot upload {path} to {target}: {error}",
                 file=sys.stderr,
             )
             continue
-        print(f"{parser.prog}: uploaded {path} to {notebook_path}", file=sys.stderr)
+        print(f"{parser.prog}: uploaded {path} to {target}", file=sys.stderr)
         uploaded += 1
     status = _upload_summary(
         parser.prog, "uploaded", "converted or uploaded", uploaded, files
     )
     if settings is None:
         return status
+    kind = "pipeline" if pipeline else "job"
     if status != EXIT_CONVERTED:
-        # A job without one of its steps would quietly compute something else.
+        # A job or pipeline without one of its files would quietly compute
+        # something else.
         print(
-            f"{parser.prog}: no job created: it needs every file converted and "
+            f"{parser.prog}: no {kind} created: it needs every file converted and "
             "uploaded",
             file=sys.stderr,
         )
         return status
+    if pipeline:
+        return _create_pipeline(
+            parser.prog, workspace, settings, overwrite=arguments.overwrite
+        )
     return _create_job(parser.prog, workspace, settings, overwrite=arguments.overwrite)
 
 
@@ -535,6 +657,47 @@ def _create_job(
     return EXIT_CONVERTED
 
 
+def _create_pipeline(
+    prog: str, workspace: databricks.Workspace, settings: dict, *, overwrite: bool
+) -> int:
+    """Create the pipeline, or update the one of the same name with
+    --overwrite."""
+    name = settings["name"]
+    files = len(settings["libraries"])
+    try:
+        existing = workspace.pipelines_named(name)
+        if len(existing) > 1:
+            print(
+                f"{prog}: no pipeline created: {len(existing)} pipelines are named "
+                f"{name!r}; delete or rename all but one",
+                file=sys.stderr,
+            )
+            return EXIT_NOT_CONVERTED
+        if existing and not overwrite:
+            print(
+                f"{prog}: no pipeline created: a pipeline named {name!r} already "
+                f"exists (ID {existing[0]}); pass --overwrite to update it",
+                file=sys.stderr,
+            )
+            return EXIT_NOT_CONVERTED
+        if existing:
+            workspace.edit_pipeline(existing[0], settings)
+            done, pipeline_id = "updated", existing[0]
+        else:
+            done, pipeline_id = "created", workspace.create_pipeline(settings)
+    except databricks.UploadError as error:
+        print(f"{prog}: cannot create the pipeline {name!r}: {error}", file=sys.stderr)
+        return EXIT_NOT_CONVERTED
+    noun = "file" if files == 1 else "files"
+    print(
+        f"{prog}: {done} the pipeline {name!r} (ID {pipeline_id}): {files} source "
+        f"{noun}, tables in {settings['catalog']}.{settings['schema']}; start it "
+        "under Jobs & Pipelines",
+        file=sys.stderr,
+    )
+    return EXIT_CONVERTED
+
+
 def _upload_summary(
     prog: str, done: str, failure: str, count: int, files: list[Path]
 ) -> int:
@@ -565,12 +728,28 @@ def _source_files(
 
 
 def _output(
+    prog: str,
     result: ConversionResult,
     arguments: argparse.Namespace,
     source: str | None,
     dialect: str | None,
-) -> str:
-    """The code to write: plain, or as a Databricks notebook."""
+    name: str,
+) -> str | None:
+    """The code to write: plain, as a Databricks notebook, or as a pipeline
+    source file; None, after reporting why, for a program that cannot be a
+    pipeline."""
+    if arguments.pipeline:
+        try:
+            return to_pipeline(
+                result,
+                source=source,
+                dialect=dialect,
+                catalog=arguments.catalog,
+                schema=arguments.schema,
+            )
+        except SparkShiftError as error:
+            print(f"{prog}: cannot convert {name}: {error}", file=sys.stderr)
+            return None
     if not arguments.notebook:
         return result.code
     return to_notebook(

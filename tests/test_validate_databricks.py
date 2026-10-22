@@ -131,3 +131,82 @@ def test_the_driver_check_reports_differences(tool: ModuleType) -> None:
     assert bad["types"] == ["struct<x:int>", "struct<x:bigint>"]
     assert bad["unexpected"] == ['["b"]']
     assert bad["counts"] == [1, 2]
+
+
+# --- Pipelines -------------------------------------------------------------------
+
+
+def test_the_tables_notebook_loads_the_test_tables(tool: ModuleType) -> None:
+    source = tool.tables_source("workspace", "sparkshift", "workspace.pipeline")
+
+    ast.parse(source)
+    assert 'spark.sql("CREATE SCHEMA IF NOT EXISTS workspace.sparkshift")' in source
+    assert 'spark.sql("CREATE SCHEMA IF NOT EXISTS workspace.pipeline")' in source
+    assert 'saveAsTable("workspace.sparkshift." + _name)' in source
+
+
+def test_the_pipeline_check_compares_each_materialized_view(tool: ModuleType) -> None:
+    expected = {"ok": ("struct<x:int>", ['["a"]']), "bad": ("struct<x:int>", ['["a"]'])}
+    source = tool.check_source(expected, "workspace.pipeline")
+    ast.parse(source)
+
+    class Frame:
+        def __init__(self, rows: list[tuple[object, ...]], types: str) -> None:
+            self.rows, self.schema = (
+                rows,
+                type("S", (), {"simpleString": lambda _: types})(),
+            )
+
+        def collect(self) -> list[tuple[object, ...]]:
+            return self.rows
+
+    frames = {
+        "workspace.pipeline.ok": Frame([("a",)], "struct<x:int>"),
+        "workspace.pipeline.bad": Frame([("a",), ("b",)], "struct<x:int>"),
+    }
+    exits: list[str] = []
+    spark = type(
+        "Spark",
+        (),
+        {
+            "conf": type("C", (), {"set": lambda *_: None})(),
+            "table": staticmethod(lambda name: frames[name]),
+            "version": "4.2.0",
+        },
+    )()
+    notebook = type("N", (), {"exit": staticmethod(exits.append)})()
+    scope: dict[str, object] = {
+        "spark": spark,
+        "dbutils": type("D", (), {"notebook": notebook})(),
+    }
+    exec(source.removeprefix("# Databricks notebook source\n"), scope)
+
+    import json
+
+    [report] = [json.loads(text) for text in exits]
+    ok, bad = report["results"]
+    assert ok == {"example": "ok", "status": "pass"}
+    assert bad["status"] == "fail"
+    assert bad["unexpected"] == ['["b"]']
+    assert bad["counts"] == [1, 2]
+
+
+def test_the_pipeline_program_runs_the_steps_spark_analyzes_early(
+    tool: ModuleType,
+) -> None:
+    import sparkshift
+    from sparkshift.pipelines import pipeline_tables
+
+    name, program = tool.PIPELINE_PROGRAM
+    result = sparkshift.convert(program, dialect="sas")
+    code = sparkshift.to_pipeline(result, source="pipeline_steps.sas", dialect="sas")
+
+    assert name == "sas/pipeline_steps"
+    assert pipeline_tables(result, dialect="sas") == [
+        "scored",
+        "trimmed",
+        "unique_scores",
+        "countries",
+    ]
+    for step in ('.drop("country")', ".dropDuplicates(", ".distinct()"):
+        assert step in code

@@ -1,4 +1,5 @@
-"""Import generated notebooks into a Databricks workspace (``sparkshift upload``).
+"""Import generated notebooks, or pipeline source files, into a Databricks
+workspace (``sparkshift upload``), and create their job or pipeline.
 
 This needs the optional extra: ``pip install 'sparkshift[databricks]'``. Only
 this module uses the Databricks SDK, and only inside its functions, so the rest
@@ -47,6 +48,9 @@ class Workspace(Protocol):
     def import_notebook(self, path: str, source: str, *, overwrite: bool) -> None:
         """Import a source-format Python notebook at ``path``."""
 
+    def import_file(self, path: str, source: str, *, overwrite: bool) -> None:
+        """Import a file, such as a pipeline source file, at ``path``."""
+
     def jobs_named(self, name: str) -> list[int]:
         """The IDs of the jobs named ``name``."""
 
@@ -55,6 +59,15 @@ class Workspace(Protocol):
 
     def reset_job(self, job_id: int, settings: dict) -> None:
         """Replace a job's settings with a Jobs API ``create`` body."""
+
+    def pipelines_named(self, name: str) -> list[str]:
+        """The IDs of the pipelines named ``name``."""
+
+    def create_pipeline(self, settings: dict) -> str:
+        """Create a pipeline from a Pipelines API ``create`` body; its ID."""
+
+    def edit_pipeline(self, pipeline_id: str, settings: dict) -> None:
+        """Replace a pipeline's settings with a Pipelines API ``create`` body."""
 
 
 def connect(profile: str | None = None) -> Workspace:
@@ -108,6 +121,24 @@ class _SdkWorkspace:
         except DatabricksError as error:
             raise UploadError(self.message(error)) from None
 
+    def import_file(self, path: str, source: str, *, overwrite: bool) -> None:
+        from databricks.sdk.errors import DatabricksError, ResourceAlreadyExists
+        from databricks.sdk.service.workspace import ImportFormat
+
+        try:
+            self.client.workspace.import_(
+                path,
+                content=base64.b64encode(source.encode("utf-8")).decode("ascii"),
+                format=ImportFormat.RAW,
+                overwrite=overwrite,
+            )
+        except ResourceAlreadyExists:
+            raise UploadError(
+                "a file already exists there; pass --overwrite to replace it"
+            ) from None
+        except DatabricksError as error:
+            raise UploadError(self.message(error)) from None
+
     def jobs_named(self, name: str) -> list[int]:
         from databricks.sdk.errors import DatabricksError
 
@@ -130,13 +161,34 @@ class _SdkWorkspace:
             "/api/2.2/jobs/reset", {"job_id": job_id, "new_settings": settings}
         )
 
-    def request(self, path: str, body: dict) -> Any:
-        """POST ``body`` to a REST API path: the same JSON the notebook that
-        creates a job sends (see sparkshift.jobs)."""
+    def pipelines_named(self, name: str) -> list[str]:
         from databricks.sdk.errors import DatabricksError
 
         try:
-            return self.client.api_client.do("POST", path, body=body)
+            return [
+                pipeline.pipeline_id
+                for pipeline in self.client.pipelines.list_pipelines()
+                if pipeline.name == name
+            ]
+        except DatabricksError as error:
+            raise UploadError(self.message(error)) from None
+
+    def create_pipeline(self, settings: dict) -> str:
+        created = self.request("/api/2.0/pipelines", settings)
+        return str(created["pipeline_id"])
+
+    def edit_pipeline(self, pipeline_id: str, settings: dict) -> None:
+        body = {**settings, "id": pipeline_id}
+        self.request(f"/api/2.0/pipelines/{pipeline_id}", body, method="PUT")
+
+    def request(self, path: str, body: dict, method: str = "POST") -> Any:
+        """Send ``body`` to a REST API path: the same JSON the notebook that
+        creates a job or a pipeline sends (see sparkshift.jobs and
+        sparkshift.pipelines)."""
+        from databricks.sdk.errors import DatabricksError
+
+        try:
+            return self.client.api_client.do(method, path, body=body)
         except DatabricksError as error:
             raise UploadError(self.message(error)) from None
 

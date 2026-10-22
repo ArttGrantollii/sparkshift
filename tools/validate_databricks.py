@@ -26,6 +26,14 @@ first fills that schema with tables of the same names and other columns, so
 every write must replace a table, and after each example compares every table
 it wrote with the rows that table should hold.
 
+With --pipeline CATALOG.SCHEMA, it validates pipeline source files instead
+(`sparkshift convert --pipeline`): every example, and PIPELINE_PROGRAM, as
+one Lakeflow pipeline on serverless compute, keeping its materialized views
+in that schema. It loads the test tables, uploads the files, creates or
+updates the pipeline, and runs it twice, a full refresh and then an update,
+comparing every materialized view with local Spark after each run: Apache
+Spark's own pipelines lose datasets' order on later runs (SPARK-59663).
+
 It prints one line per example and exits with 1 if any differ. Credentials
 come only from the profile; nothing here prints them.
 """
@@ -35,12 +43,26 @@ import datetime
 import inspect
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 EXAMPLES = REPOSITORY / "examples"
 sys.path.insert(0, str(REPOSITORY / "tests" / "equivalence"))
+
+# Steps that read the pipeline's own datasets and that Apache Spark's
+# pipelines analyze early (docs/adr/0013-pipelines-from-the-same-plan.md):
+# drop (DROP), dropDuplicates (NODUPKEY), and distinct (SELECT DISTINCT).
+PIPELINE_PROGRAM = (
+    "sas/pipeline_steps",
+    "data scored; set customers(keep=customer_id country score); "
+    "where score ne .; run; "
+    "data trimmed; set scored; drop country; run; "
+    "proc sort data=scored out=unique_scores nodupkey; by score; run; "
+    "proc sql; create table countries as select distinct country from scored; "
+    "quit;",
+)
 
 
 def canonical(value: Any) -> Any:
@@ -72,12 +94,15 @@ def examples() -> list[tuple[str, Path, str | None]]:
     return found
 
 
-def local_results() -> tuple[
+def local_results(
+    extra: tuple[str, str] | None = None,
+) -> tuple[
     dict[str, tuple[str, list[str]]], dict[str, dict[str, tuple[str, list[str]]]]
 ]:
     """Each example's column types and rows on local Spark, and those of each
     table its notebook writes: a SQL query's result, named after its file, or
-    each data set of a SAS program (the last of each name)."""
+    each data set of a SAS program (the last of each name). With ``extra``, a
+    (name, SAS program) pair, that program's too."""
     from datasets import TABLES
     from pyspark.sql import SparkSession
 
@@ -95,13 +120,19 @@ def local_results() -> tuple[
             spark.createDataFrame(rows, schema).createOrReplaceTempView(name)
         results = {}
         tables = {}
-        for name, path, dialect in examples():
-            converted = sparkshift.convert(path.read_text(), dialect=dialect)
+        sources = [
+            (name, path.stem, path.read_text(), dialect)
+            for name, path, dialect in examples()
+        ]
+        if extra:
+            sources.append((extra[0], Path(extra[0]).name, extra[1], "sas"))
+        for name, stem, text, dialect in sources:
+            converted = sparkshift.convert(text, dialect=dialect)
             scope: dict[str, Any] = {"spark": spark}
             exec(converted.code, scope)
             frame = scope["result"]
             results[name] = (frame.schema.simpleString(), rows_of(frame))
-            written = {path.stem.lower(): "result"}
+            written = {stem.lower(): "result"}
             if converted.datasets:
                 written = {d.name: d.variable for d in converted.datasets}
             tables[name] = {
@@ -251,6 +282,183 @@ def upload_examples(
         raise SystemExit("uploading examples/sas failed")
 
 
+def tables_source(catalog: str, schema: str, *extra_schemas: str) -> str:
+    """A notebook that creates or replaces the test tables in
+    ``catalog``.``schema``, and creates ``extra_schemas`` (CATALOG.SCHEMA)."""
+    from datasets import TABLES
+
+    tables = {
+        name: (
+            ", ".join(f"`{f.name}` {f.dataType.simpleString()}" for f in struct),
+            rows,
+        )
+        for name, (struct, rows) in TABLES.items()
+    }
+    lines = [
+        "import datetime",
+        "import json",
+        "from decimal import Decimal",
+        "",
+        f'spark.sql("CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")',
+        *(
+            f'spark.sql("CREATE SCHEMA IF NOT EXISTS {extra}")'
+            for extra in extra_schemas
+        ),
+        f"_validation_tables = {tables!r}",
+        "for _name, (_ddl, _rows) in _validation_tables.items():",
+        "    (",
+        "        spark.createDataFrame(_rows, _ddl)",
+        '        .write.mode("overwrite")',
+        '        .option("overwriteSchema", "true")',
+        f'        .saveAsTable("{catalog}.{schema}." + _name)',
+        "    )",
+        "dbutils.notebook.exit(json.dumps({'tables': sorted(_validation_tables)}))",
+    ]
+    return "# Databricks notebook source\n" + "\n".join(lines) + "\n"
+
+
+def check_source(
+    expected: dict[str, tuple[str, list[str]]], pipeline_schema: str
+) -> str:
+    """A notebook that compares each materialized view in ``pipeline_schema``
+    with its expected column types and rows (as a multiset)."""
+    lines = [
+        "import datetime",
+        "import json",
+        "from typing import Any",
+        "",
+        'spark.conf.set("spark.sql.session.timeZone", "UTC")',
+        "",
+        inspect.getsource(canonical),
+        inspect.getsource(rows_of),
+        f"_expected = {expected!r}",
+        "_report = []",
+        "for _table, (_types, _rows) in _expected.items():",
+        f'    _frame = spark.table("{pipeline_schema}." + _table)',
+        "    _actual = rows_of(_frame)",
+        "    _entry = {'example': _table, 'status': 'pass'}",
+        "    if _frame.schema.simpleString() != _types:",
+        "        _entry['status'] = 'fail'",
+        "        _entry['types'] = [_types, _frame.schema.simpleString()]",
+        "    if sorted(_actual) != sorted(_rows):",
+        "        _entry['status'] = 'fail'",
+        "        _entry['missing'] = [r for r in _rows if r not in _actual][:10]",
+        "        _entry['unexpected'] = [r for r in _actual if r not in _rows][:10]",
+        "        _entry['counts'] = [len(_rows), len(_actual)]",
+        "    _report.append(_entry)",
+        "import pyspark",
+        "dbutils.notebook.exit(json.dumps({'spark_version': spark.version, "
+        "'pyspark_client': pyspark.__version__, 'results': _report}))",
+    ]
+    return "# Databricks notebook source\n" + "\n".join(lines) + "\n"
+
+
+def validate_pipeline(arguments: argparse.Namespace) -> int:
+    """Run every example as one pipeline, twice, and compare its tables with
+    local Spark after each run (see the module's description)."""
+    from databricks.sdk import WorkspaceClient
+
+    import sparkshift
+    from sparkshift.databricks import connect, redact
+    from sparkshift.pipelines import pipeline_settings
+
+    catalog, schema = arguments.schema.split(".")
+    print("computing the expected results on local Spark", file=sys.stderr)
+    _, written = local_results(PIPELINE_PROGRAM)
+    expected = {
+        table: rows for tables in written.values() for table, rows in tables.items()
+    }
+
+    workspace = connect(arguments.profile)
+    folder = arguments.folder.rstrip("/")
+    workspace.mkdirs(folder)
+    load = f"{folder}/load tables"
+    workspace.import_notebook(
+        load, tables_source(catalog, schema, arguments.pipeline), overwrite=True
+    )
+    run_driver(arguments.profile, load, arguments.environment)
+
+    sources = [
+        (name, path.read_text(), path.name, dialect)
+        for name, path, dialect in examples()
+    ]
+    sources.append(
+        (PIPELINE_PROGRAM[0], PIPELINE_PROGRAM[1], "pipeline_steps.sas", "sas")
+    )
+    paths = []
+    for name, text, source, dialect in sources:
+        code = sparkshift.to_pipeline(
+            sparkshift.convert(text, dialect=dialect),
+            source=source,
+            dialect=dialect,
+            catalog=catalog,
+            schema=schema,
+        )
+        path = f"{folder}/pipeline/{name}.py"
+        workspace.mkdirs(path.rsplit("/", 1)[0])
+        workspace.import_file(path, code, overwrite=True)
+        paths.append(path)
+    pipeline_catalog, pipeline_schema = arguments.pipeline.split(".")
+    settings = pipeline_settings(
+        "sparkshift validation",
+        f"{folder}/pipeline",
+        paths,
+        catalog=pipeline_catalog,
+        schema=pipeline_schema,
+    )
+    existing = workspace.pipelines_named(settings["name"])
+    if existing:
+        pipeline_id = existing[0]
+        workspace.edit_pipeline(pipeline_id, settings)
+    else:
+        pipeline_id = workspace.create_pipeline(settings)
+    print(f"pipeline {pipeline_id}: {len(paths)} source files", file=sys.stderr)
+
+    client = WorkspaceClient(profile=arguments.profile)
+    secrets = [client.config.token] if client.config.token else []
+    check = f"{folder}/check pipeline"
+    workspace.import_notebook(
+        check, check_source(expected, arguments.pipeline), overwrite=True
+    )
+    failed = 0
+    for attempt, full_refresh in ((1, True), (2, False)):
+        update = client.pipelines.start_update(
+            pipeline_id=pipeline_id, full_refresh=full_refresh
+        ).update_id
+        while True:
+            state = client.pipelines.get_update(pipeline_id, update).update.state.value
+            if state in ("COMPLETED", "FAILED", "CANCELED"):
+                break
+            time.sleep(15)
+        print(
+            f"run {attempt} ({'full refresh' if full_refresh else 'update'}): {state}"
+        )
+        if state != "COMPLETED":
+            for event in client.pipelines.list_pipeline_events(
+                pipeline_id=pipeline_id, max_results=50
+            ):
+                if event.level and event.level.value == "ERROR":
+                    for exception in (
+                        (event.error.exceptions or []) if event.error else []
+                    ):
+                        print("  ", redact(str(exception.message), secrets)[:600])
+            return 1
+        report = run_driver(arguments.profile, check, arguments.environment)
+        for entry in report["results"]:
+            print(f"{entry['status'].upper():5} {entry['example']}")
+            if entry["status"] != "pass":
+                failed += 1
+                details = {
+                    k: v for k, v in entry.items() if k not in ("status", "example")
+                }
+                print(json.dumps(details, indent=2, ensure_ascii=False))
+        matched = len(report["results"]) - sum(
+            entry["status"] != "pass" for entry in report["results"]
+        )
+        print(f"run {attempt}: {matched} of {len(expected)} tables match local Spark")
+    return 0 if failed == 0 else 1
+
+
 def run_driver(profile: str, path: str, environment: str) -> dict[str, Any]:
     """Run the driver notebook once on serverless compute, in the given
     serverless environment version; its exit value."""
@@ -309,7 +517,15 @@ def main(argv: list[str] | None = None) -> int:
         help="also write the notebooks' results to this CATALOG.SCHEMA, "
         "replacing its tables of the same names, and check them",
     )
+    parser.add_argument(
+        "--pipeline",
+        metavar="CATALOG.SCHEMA",
+        help="validate the examples as one Lakeflow pipeline, run twice, keeping "
+        "its tables in this CATALOG.SCHEMA, instead of as notebooks",
+    )
     arguments = parser.parse_args(argv)
+    if arguments.pipeline:
+        return validate_pipeline(arguments)
     catalog, schema = arguments.schema.split(".")
     write_schema = arguments.write_schema
 

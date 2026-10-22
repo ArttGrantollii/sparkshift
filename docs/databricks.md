@@ -122,6 +122,13 @@ same description: run it once in the workspace and it creates the job, or
 updates the one of the same name. See
 [ADR 0012](adr/0012-create-jobs-from-one-description.md).
 
+## Pipelines
+
+`--pipeline` writes source files for Lakeflow pipelines instead of notebooks,
+and `upload --pipeline` creates the pipeline: each data set, or a query's
+result, becomes a materialized view, and the pipeline orders them by what
+they read. See [pipelines.md](pipelines.md).
+
 ## Running on Databricks
 
 The generated code uses PySpark 4 APIs, such as `Column.outer()` for

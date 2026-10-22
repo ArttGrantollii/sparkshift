@@ -37,8 +37,10 @@ def convert(sql: str, dialect: str | None = None) -> ConversionResult:
                 DataSet(dataset.name, variables[dataset])
                 for dataset in translation.datasets
             ),
+            _plans=translation.datasets,
+            _printed=translation.result,
         )
     read = resolve_dialect(dialect)
     tree = parse_sql(sql, read)
     plan = translate(tree, read)
-    return ConversionResult(code=emit(plan))
+    return ConversionResult(code=emit(plan), _plans=(plan,))

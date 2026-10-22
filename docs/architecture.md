@@ -37,13 +37,14 @@ flowchart LR
 | Frontend | `parsing.py` | SQL text → SQLGlot syntax tree; converts SQLGlot errors into SparkShift errors ([ADR 0001](adr/0001-use-sqlglot-for-parsing.md)) |
 | Frontend | `translate.py` | Syntax tree → IR. Works from an allowlist: anything it does not explicitly handle is reported as unsupported, and all issues are collected before failing |
 | Middle | `ir.py` | SparkShift's own description of DataFrame operations ([ADR 0003](adr/0003-introduce-a-small-ir.md)) |
-| Backend | `emit.py` | IR → readable PySpark source |
+| Backend | `emit.py` | IR → readable PySpark source: plain code, or a pipeline source file's functions |
 | SAS frontend | `sas_lexer.py`, `sas_parser.py`, `sas_datalines.py`, `sas_translate.py` | SAS program → tokens → a small syntax tree → IR, one named relation per data set (DATA steps, with data lines read at conversion time, and PROC SORT, MEANS/SUMMARY, FREQ, and SQL), following SAS's documented rules ([ADR 0005](adr/0005-sas-has-its-own-front-end.md), [ADR 0006](adr/0006-proc-sql-follows-sas-rules.md), [sas.md](sas.md)) |
 | Entry point | `api.py` | `convert(sql, dialect)` runs the stages in order; with `dialect="sas"`, the SAS frontend's |
 | Notebooks | `notebook.py` | Generated code as a Databricks source-format notebook: a Markdown description, one cell per section, and `display(result)` ([ADR 0007](adr/0007-databricks-notebooks.md)) |
 | Analysis | `report.py` | Calls `convert` for many files and summarizes the outcomes: pure functions and data, with text, Markdown, and JSON formats; it reads no files |
 | Databricks | `databricks.py` | Imports notebooks into a workspace through the optional Databricks SDK, imported only when uploading; credentials come from the SDK's own sources and are redacted from every message ([ADR 0010](adr/0010-upload-notebooks-with-the-databricks-sdk.md)) |
 | Jobs | `jobs.py` | The Databricks job that runs uploaded notebooks in order, as one Jobs API body, and the notebook that creates it in a workspace ([ADR 0012](adr/0012-create-jobs-from-one-description.md)) |
+| Pipelines | `pipelines.py` | Generated code as a Lakeflow pipeline source file, one dataset per data set or query, emitted from the same plan as the plain code; and the pipeline itself, as one Pipelines API body, and the notebook that creates it ([ADR 0013](adr/0013-pipelines-from-the-same-plan.md)) |
 | Batches | `batch.py` | The rules for converting many files, shared by the command line and the playground: which files are converted, the dialect of each, and which output paths collide |
 | Command line | `cli.py` | Reads and writes files, and calls `convert`, `report`, or the upload |
 
@@ -128,7 +129,7 @@ These rules keep every planned interface possible:
 | **Python API** | Call the conversion function directly from Python code. | Structured results |
 | **CLI** | Read SQL from a file or stdin, print code to stdout, warnings to stderr, and return meaningful exit codes. | No I/O in core |
 | **Web playground** | Load the SparkShift and SQLGlot wheels into Pyodide in the browser and call the core from JavaScript. No backend server ([ADR 0004](adr/0004-run-the-playground-in-the-browser.md)). | Pure Python, no Spark |
-| **Databricks** | Wrap generated code in notebook format; optionally deploy it through the Databricks SDK as an optional extra (`sparkshift[databricks]`), with credentials from the environment. | No Spark, no I/O in core |
+| **Databricks** | Wrap generated code in notebook format, or as pipeline source files; optionally deploy them, with a job or a pipeline, through the Databricks SDK as an optional extra (`sparkshift[databricks]`), with credentials from the environment. | No Spark, no I/O in core |
 
 ## How correctness is verified
 

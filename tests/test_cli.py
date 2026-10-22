@@ -677,3 +677,90 @@ def test_report_usage_errors(
 
     err = usage_error(["report", str(empty), "-f", "html"], capsys)
     assert "invalid choice: 'html'" in err
+
+
+# --- Pipeline source files -----------------------------------------------------------
+
+
+def test_convert_writes_a_pipeline_source_file(
+    sql_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    arguments = ["convert", str(sql_file), "--pipeline", "--schema", "raw"]
+
+    assert main(arguments) == EXIT_CONVERTED
+
+    expected = sparkshift.to_pipeline(
+        sparkshift.convert(SQL), source=str(sql_file), schema="raw"
+    )
+    assert capsys.readouterr() == (expected, "")
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        (["--pipeline", "--notebook"], "not allowed with argument"),
+        (["--pipeline", "--output-schema", "x"], "are for notebooks"),
+        (["--pipeline", "--output-catalog", "x"], "are for notebooks"),
+        (["--pipeline", "--catalog", "main"], "--catalog needs --schema"),
+    ],
+)
+def test_pipeline_options(
+    sql_file: Path,
+    capsys: pytest.CaptureFixture[str],
+    options: list[str],
+    message: str,
+) -> None:
+    with pytest.raises(SystemExit) as caught:
+        main(["convert", str(sql_file), *options])
+
+    assert caught.value.code == EXIT_USAGE
+    assert message in capsys.readouterr().err
+
+
+def test_a_program_that_cannot_be_a_pipeline_is_reported(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "report.sas"
+    path.write_text("proc print data=t; run;", encoding="utf-8")
+
+    assert main(["convert", str(path), "--pipeline"]) == EXIT_NOT_CONVERTED
+
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err.startswith(
+        f"sparkshift: cannot convert {path}: 1 unsupported construct:\n"
+        "  - a pipeline of a program that creates no data set"
+    )
+
+
+def test_a_directory_of_pipeline_files_defines_each_dataset_once(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = tmp_path / "jobs"
+    (source / "a").mkdir(parents=True)
+    (source / "b").mkdir()
+    (source / "a" / "daily.sql").write_text("SELECT x FROM t", encoding="utf-8")
+    (source / "b" / "daily.sql").write_text("SELECT y FROM u", encoding="utf-8")
+    (source / "load.sas").write_text("data clean; set raw; run;", encoding="utf-8")
+    (source / "show.sas").write_text("proc print data=clean; run;", encoding="utf-8")
+    output = tmp_path / "out"
+
+    arguments = ["convert", str(source), "--pipeline", "-o", str(output)]
+    assert main(arguments) == EXIT_NOT_CONVERTED
+
+    err = capsys.readouterr().err
+    written = sorted(path.relative_to(output).as_posix() for path in output.rglob("*"))
+    assert written == ["load.py"]
+    first, second = source / "a" / "daily.sql", source / "b" / "daily.sql"
+    assert (
+        f"cannot convert {first}: its dataset daily is also defined by {second}; "
+        "a pipeline defines each dataset once"
+    ) in err
+    assert (
+        f"cannot convert {second}: its dataset daily is also defined by {first}" in err
+    )
+    assert err.endswith("converted 1 of 4 files; 3 could not be converted\n")
+    load = sparkshift.convert("data clean; set raw; run;", dialect="sas")
+    assert (output / "load.py").read_text(encoding="utf-8") == sparkshift.to_pipeline(
+        load, source="load.sas", dialect="sas"
+    )

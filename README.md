@@ -170,8 +170,11 @@ sparkshift upload jobs/ --to /Workspace/Users/you@example.com/migrated --catalog
 `--notebook` writes Databricks notebooks, with `catalog` and `schema` boxes at
 the top that choose where tables are read from; `upload` imports them into a
 workspace, with credentials only from the Databricks SDK's environment
-variables or profiles. The generated code needs a PySpark 4 client: on
-serverless compute, environment version 4 or later. See the
+variables or profiles, and `upload --job` also creates a job that runs them.
+`--pipeline` writes source files for Lakeflow pipelines instead, where each
+data set becomes a materialized view, and `upload --pipeline` creates the
+pipeline ([pipelines](docs/pipelines.md)). The generated code needs a PySpark
+4 client: on serverless compute, environment version 4 or later. See the
 [Databricks guide](docs/databricks.md).
 
 ## How correctness is verified
@@ -202,6 +205,7 @@ local Spark; see [docs/databricks-validation.md](docs/databricks-validation.md).
 - [Command line](docs/cli.md) — `convert`, `report`, and `upload`, with every option and exit code
 - [Python API](docs/api.md) — `convert`, `to_notebook`, results, warnings, and errors
 - [Databricks](docs/databricks.md) — notebooks, uploading, and running on Databricks
+- [Pipelines](docs/pipelines.md) — Lakeflow pipeline source files, and creating the pipeline
 - [Examples](examples/README.md) — a realistic query in each dialect, and SAS programs, next to the PySpark generated for them
 - [Playground](playground/README.md) — the in-browser converter: limits, privacy, and running it locally
 - [Architecture](docs/architecture.md), [testing](docs/testing.md), and [decision records](docs/adr/) — how SparkShift is built and why

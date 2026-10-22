@@ -664,6 +664,52 @@ Relation: TypeAlias = (
 )
 
 
+_RELATION_TYPES = get_args(Relation)
+
+
+def map_relations(
+    relation: Relation, function: Callable[[Relation], "Relation | None"]
+) -> Relation:
+    """Rebuild a relation from the top down: where ``function`` returns a
+    relation for a node, it takes the node's place; otherwise the node's own
+    relations are rebuilt the same way, including the subqueries inside its
+    expressions. Works for every relation type, because it inspects the
+    dataclass fields."""
+    replacement = function(relation)
+    if replacement is not None:
+        return replacement
+    changes = {
+        field.name: _map_relation_value(getattr(relation, field.name), function)
+        for field in fields(relation)
+    }
+    return replace(relation, **changes)
+
+
+def _map_relation_value(
+    value: object, function: Callable[[Relation], "Relation | None"]
+) -> object:
+    if isinstance(value, _RELATION_TYPES):
+        return map_relations(value, function)  # type: ignore[arg-type]
+    if isinstance(value, _EXPRESSION_TYPES):
+        return _map_subqueries(value, function)  # type: ignore[arg-type]
+    if isinstance(value, SortKey):
+        return replace(value, expression=_map_subqueries(value.expression, function))
+    if isinstance(value, tuple):
+        return tuple(_map_relation_value(item, function) for item in value)
+    return value
+
+
+def _map_subqueries(
+    expression: Expression, function: Callable[[Relation], "Relation | None"]
+) -> Expression:
+    """The expression with the relations of its subqueries rebuilt."""
+    if isinstance(expression, InSubquery | Exists | ScalarSubquery):
+        expression = replace(
+            expression, query=map_relations(expression.query, function)
+        )
+    return map_children(expression, lambda child: _map_subqueries(child, function))
+
+
 def helper_reference(name: str | HelperName) -> Expression:
     """A reference to a statically chosen or runtime-bound helper name."""
     return HelperColumn(name) if isinstance(name, HelperName) else Column((name,))
