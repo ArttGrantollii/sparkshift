@@ -1103,7 +1103,7 @@ function deployForm() {
       ? "Use an absolute path, such as /Workspace/Users/you@example.com/sparkshift." : "",
     "deploy-read": read ? "" : "Use catalog.schema, or only a schema.",
     "deploy-write": !write ? "Use catalog.schema, or only a schema."
-      : pipeline && !(write[0] && write[1]) ? "A pipeline keeps its tables in catalog.schema: type both."
+      : pipeline && write[1] && !write[0] ? "A pipeline keeps its tables in catalog.schema: type both."
         : "",
   };
   return {
@@ -1114,6 +1114,9 @@ function deployForm() {
     overwrite: elements["deploy-overwrite"].checked,
     problems,
     valid: Object.values(problems).every((problem) => !problem),
+    // A pipeline needs a catalog and a schema for its tables; an empty field
+    // is not wrong yet, as for the other fields, but cannot be deployed.
+    complete: !pipeline || Boolean(write?.[0] && write?.[1]),
   };
 }
 
@@ -1146,8 +1149,8 @@ function renderDeploy() {
   stepStates.forEach(([state, message], index) => markStep(index, state, message, false));
   elements.deploy.textContent = files
     ? `Deploy ${files.length} ${what.files}${files.length === 1 ? "" : "s"}` : "Deploy";
-  elements.deploy.disabled = !files || !form.valid || !form.origin || !form.folder ||
-    !elements["deploy-token"].value || !ready || working();
+  elements.deploy.disabled = !files || !form.valid || !form.complete || !form.origin ||
+    !form.folder || !elements["deploy-token"].value || !ready || working();
 }
 
 // A notebook's path has no suffix; a pipeline source file keeps its .py.
@@ -1192,7 +1195,8 @@ async function deploy(event) {
   const { files } = deployment();
   const form = deployForm();
   const token = elements["deploy-token"].value;
-  if (!files || !form.valid || !form.origin || !form.folder || !token || !ready || working()) return;
+  if (!files || !form.valid || !form.complete || !form.origin || !form.folder || !token ||
+    !ready || working()) return;
   deploying = true;
   stepStates = [];
   elements.deploy.disabled = true;

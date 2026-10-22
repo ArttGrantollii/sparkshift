@@ -1321,6 +1321,14 @@ def test_a_pipeline_needs_a_catalog_and_schema_to_keep_its_tables(
     page, _ = deploy_page
     page.check("#deploy-kind-pipeline")
     try:
+        # Empty is not wrong yet, as for the other fields, but cannot deploy.
+        fill_deploy_form(page, write="")
+        assert page.get_attribute("#deploy-write", "aria-invalid") == "false"
+        assert page.text_content("#deploy-write-hint") == (
+            "Where the pipeline keeps its tables, as catalog.schema."
+        )
+        assert page.is_disabled("#deploy")
+
         fill_deploy_form(page, write="claims")
 
         assert page.text_content("#deploy-write-hint") == (
