@@ -15,8 +15,9 @@ never leaves your browser.
 > joins, aggregation, ordering, window functions and `QUALIFY`, CTEs, set
 > operations, and subqueries, from generic SQL and six dialects (T-SQL,
 > PostgreSQL, MySQL, Snowflake, BigQuery, and Oracle), and a documented
-> subset of SAS: DATA steps and `PROC SORT`, `MEANS`, `SUMMARY`, `FREQ`, and
-> `SQL`. Everything else is rejected with a clear error. See
+> subset of SAS: DATA steps, also with data lines (`INPUT` and `DATALINES`),
+> and `PROC SORT`, `MEANS`, `SUMMARY`, `FREQ`, `PRINT`, and `SQL`. Everything
+> else is rejected with a clear error. See
 > [ROADMAP.md](ROADMAP.md) for what is planned.
 
 ## Why SparkShift

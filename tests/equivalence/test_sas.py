@@ -23,8 +23,6 @@ import pytest
 from compare import Snapshot
 from harness import assert_sas_result
 
-import sparkshift
-
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
 
@@ -46,133 +44,10 @@ class Sorted:
     result: Snapshot
 
 
-WHOLE_PROGRAM = """
-data customers_raw;
-    length customer_id 8 name $30 country $20 email $60;
-    format signup_date date9.;
-    input customer_id name $ country $ age signup_date :date9. email $;
-    datalines;
-101 John USA 25 01JAN2024 john@test.com
-102 Sarah UK 32 15FEB2024 sarah@test.com
-103 Michael USA . 20MAR2024 michael@test.com
-104 Emma Germany 17 05APR2024 emma@test.com
-105 David France 45 12MAY2024 david@test.com
-106 Lisa USA 29 15JUN2024 lisa@test.com
-107 James UK 16 01JUL2024 james@test.com
-108 Anna Germany 35 10AUG2024 anna@test.com
-;
-run;
-data customers_clean;
-    set customers_raw;
-    name = propcase(name);
-    country = upcase(country);
-    if missing(age) then age = 0;
-    if age >= 18 then customer_status = "ADULT";
-    else customer_status = "MINOR";
-    if age >= 30 then age_group = "30_PLUS";
-    else age_group = "UNDER_30";
-    signup_year = year(signup_date);
-    signup_month = month(signup_date);
-    if country = "USA" or country = "UK" then
-        region = "ANGLO";
-    else region = "EUROPE";
-    format signup_date date9.;
-run;
-proc sort data=customers_clean;
-    by country customer_id;
-run;
-proc print data=customers_clean;
-run;
-"""
-
 # A small table from data lines: amount is missing for id 2, kind for id 4.
 TABLE_T = (
     "data t; input id kind $ amount; datalines;\n1 A 10\n2 B .\n3 C 5\n4 . 7\n;\nrun; "
 )
-
-ACCOUNTS_PROGRAM = """
-data accounts;
-    input account_id customer_id balance account_type $;
-    datalines;
-1001 101 15000 SAVINGS
-1002 102 25000 CHECKING
-1003 103 8000 SAVINGS
-1004 104 120000 BUSINESS
-1005 105 45000 CHECKING
-;
-run;
-
-data transactions;
-    input transaction_id account_id amount transaction_type $;
-    datalines;
-1 1001 500 DEPOSIT
-2 1001 200 WITHDRAW
-3 1002 1500 DEPOSIT
-4 1002 300 WITHDRAW
-5 1003 700 DEPOSIT
-6 1004 5000 WITHDRAW
-7 1004 10000 DEPOSIT
-8 1005 250 DEPOSIT
-9 1005 100 WITHDRAW
-10 1001 1200 DEPOSIT
-;
-run;
-
-proc sql;
-    create table transaction_summary as
-    select
-        a.account_id,
-        a.customer_id,
-        a.account_type,
-        a.balance,
-        count(t.transaction_id) as transaction_count,
-
-        sum(case
-            when t.transaction_type = "DEPOSIT"
-            then t.amount
-            else 0
-        end) as total_deposits,
-
-        sum(case
-            when t.transaction_type = "WITHDRAW"
-            then t.amount
-            else 0
-        end) as total_withdrawals,
-
-        calculated total_deposits -
-        calculated total_withdrawals as net_change,
-
-        a.balance + calculated net_change as final_balance
-
-    from accounts a
-    left join transactions t
-        on a.account_id = t.account_id
-
-    group by
-        a.account_id,
-        a.customer_id,
-        a.account_type,
-        a.balance
-
-    order by a.account_id;
-quit;
-
-data account_risk;
-    set transaction_summary;
-
-    length risk_level $10;
-
-    if final_balance < 10000 then risk_level = "HIGH";
-    else if final_balance < 30000 then risk_level = "MEDIUM";
-    else risk_level = "LOW";
-
-    if final_balance > 50000 then vip_flag = 1;
-    else vip_flag = 0;
-run;
-
-proc print data=account_risk;
-run;
-"""
 
 SAS_SCENARIOS = {
     # SAS GROUP BY without a summary is a sort, not deduplication. Its explicit
@@ -1271,124 +1146,6 @@ SAS_SCENARIOS = {
             ("Christopher_", date(2023, 12, 1), 6.0, 12),
         ),
     ),
-    # A whole program: data lines, a step that cleans them (its new text
-    # variables take the length of their first value, so "UNDER_30" is
-    # stored as "UNDER_3" and "EUROPE" as "EUROP"), PROC SORT, PROC PRINT.
-    "a program from data lines to PROC PRINT": (
-        WHOLE_PROGRAM,
-        Sorted(
-            "country, customer_id",
-            _result(
-                "customer_id double, name string, country string, email string, "
-                "signup_date date, age double, customer_status string, "
-                "age_group string, signup_year int, signup_month int, region string",
-                (
-                    105.0,
-                    "David",
-                    "FRANCE",
-                    "david@test.com",
-                    date(2024, 5, 12),
-                    45.0,
-                    "ADULT",
-                    "30_PLUS",
-                    2024,
-                    5,
-                    "EUROP",
-                ),
-                (
-                    104.0,
-                    "Emma",
-                    "GERMANY",
-                    "emma@test.com",
-                    date(2024, 4, 5),
-                    17.0,
-                    "MINOR",
-                    "UNDER_3",
-                    2024,
-                    4,
-                    "EUROP",
-                ),
-                (
-                    108.0,
-                    "Anna",
-                    "GERMANY",
-                    "anna@test.com",
-                    date(2024, 8, 10),
-                    35.0,
-                    "ADULT",
-                    "30_PLUS",
-                    2024,
-                    8,
-                    "EUROP",
-                ),
-                (
-                    102.0,
-                    "Sarah",
-                    "UK",
-                    "sarah@test.com",
-                    date(2024, 2, 15),
-                    32.0,
-                    "ADULT",
-                    "30_PLUS",
-                    2024,
-                    2,
-                    "ANGLO",
-                ),
-                (
-                    107.0,
-                    "James",
-                    "UK",
-                    "james@test.com",
-                    date(2024, 7, 1),
-                    16.0,
-                    "MINOR",
-                    "UNDER_3",
-                    2024,
-                    7,
-                    "ANGLO",
-                ),
-                (
-                    101.0,
-                    "John",
-                    "USA",
-                    "john@test.com",
-                    date(2024, 1, 1),
-                    25.0,
-                    "ADULT",
-                    "UNDER_3",
-                    2024,
-                    1,
-                    "ANGLO",
-                ),
-                (
-                    103.0,
-                    "Michael",
-                    "USA",
-                    "michael@test.com",
-                    date(2024, 3, 20),
-                    0.0,
-                    "MINOR",
-                    "UNDER_3",
-                    2024,
-                    3,
-                    "ANGLO",
-                ),
-                (
-                    106.0,
-                    "Lisa",
-                    "USA",
-                    "lisa@test.com",
-                    date(2024, 6, 15),
-                    29.0,
-                    "ADULT",
-                    "UNDER_3",
-                    2024,
-                    6,
-                    "ANGLO",
-                ),
-            ),
-        ),
-    ),
     # CASE (SAS SQL Procedure User's Guide, "CASE Expression"): the value of
     # the first true WHEN, else ELSE's, else a missing value; with an operand,
     # each WHEN value is compared with it for equality. A missing number is
@@ -1431,70 +1188,6 @@ SAS_SCENARIOS = {
             (4, 22.0, 5.5, 10 / 22),
         ),
     ),
-    # A whole program: data lines, PROC SQL with a LEFT JOIN, GROUP BY, CASE
-    # inside SUM, and CALCULATED columns, then a DATA step and PROC PRINT.
-    "a program from data lines through PROC SQL to PROC PRINT": (
-        ACCOUNTS_PROGRAM,
-        _result(
-            "account_id double, customer_id double, account_type string, "
-            "balance double, transaction_count bigint, total_deposits double, "
-            "total_withdrawals double, net_change double, final_balance double, "
-            "risk_level string, vip_flag int",
-            (
-                1001.0,
-                101.0,
-                "SAVINGS",
-                15000.0,
-                3,
-                1700.0,
-                200.0,
-                1500.0,
-                16500.0,
-                "MEDIUM",
-                0,
-            ),
-            (
-                1002.0,
-                102.0,
-                "CHECKING",
-                25000.0,
-                2,
-                1500.0,
-                300.0,
-                1200.0,
-                26200.0,
-                "MEDIUM",
-                0,
-            ),
-            (1003.0, 103.0, "SAVINGS", 8000.0, 1, 700.0, 0.0, 700.0, 8700.0, "HIGH", 0),
-            (
-                1004.0,
-                104.0,
-                "BUSINESS",
-                120000.0,
-                2,
-                10000.0,
-                5000.0,
-                5000.0,
-                125000.0,
-                "LOW",
-                1,
-            ),
-            (
-                1005.0,
-                105.0,
-                "CHECKING",
-                45000.0,
-                2,
-                250.0,
-                100.0,
-                150.0,
-                45150.0,
-                "LOW",
-                0,
-            ),
-        ),
-    ),
 }
 
 
@@ -1509,16 +1202,3 @@ def test_sas_scenario(
         assert_sas_result(spark_tables, program, expected.result, keys)
     else:
         assert_sas_result(spark_tables, program, expected)
-
-
-def test_the_whole_program_warns_only_of_its_truncations() -> None:
-    warnings = sparkshift.convert(WHOLE_PROGRAM, dialect="sas").warnings
-
-    assert [(w.message, w.sql) for w in warnings] == [
-        ("text truncated to the length of age_group", 'age_group = "UNDER_30"'),
-        ("text truncated to the length of region", 'region = "EUROPE"'),
-    ]
-
-
-def test_the_accounts_program_converts_without_warnings() -> None:
-    assert sparkshift.convert(ACCOUNTS_PROGRAM, dialect="sas").warnings == ()

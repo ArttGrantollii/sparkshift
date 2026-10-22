@@ -2,7 +2,8 @@
 
 Realistic queries in each supported dialect, next to the PySpark code
 SparkShift generates for them. The queries run against the tables the test
-suite uses (`customers`, `orders`, and `products`).
+suite uses (`customers`, `orders`, and `products`); two SAS programs bring
+their own data, as data lines.
 
 Every example is verified: tests fail if a generated file differs from what
 SparkShift produces today, and each example runs on Apache Spark and must
@@ -24,6 +25,8 @@ return rows written by hand from SAS's documented rules
 | SAS | [customer_ratings.sas](sas/customer_ratings.sas) | [customer_ratings.py](pyspark/sas/customer_ratings.py) | A DATA step with `CATX`, an `IF`/`ELSE IF` chain as one `F.when(...)`, then `PROC SORT` |
 | SAS | [revenue_by_country.sas](sas/revenue_by_country.sas) | [revenue_by_country.py](pyspark/sas/revenue_by_country.py) | `PROC SQL` with a join that matches missing values (`eqNullSafe`) and `GROUP BY` |
 | SAS | [status_counts.sas](sas/status_counts.sas) | [status_counts.py](pyspark/sas/status_counts.py) | `PROC FREQ`: counts, and percentages that leave missing values out |
+| SAS | [customer_cleanup.sas](sas/customer_cleanup.sas) | [customer_cleanup.py](pyspark/sas/customer_cleanup.py) | Data lines (`INPUT`, `DATALINES`) as rows in the code; `PROPCASE`, `YEAR`, and the two values SAS truncates; `PROC SORT` and `PROC PRINT` |
+| SAS | [account_risk.sas](sas/account_risk.sas) | [account_risk.py](pyspark/sas/account_risk.py) | `PROC SQL` with a `LEFT JOIN`, `CASE` inside `SUM`, and `CALCULATED` columns added after the summaries |
 
 The generated files are produced by the command line, one folder per dialect
 and one for the SAS programs:

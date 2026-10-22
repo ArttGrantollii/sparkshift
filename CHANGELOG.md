@@ -51,6 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (from `LENGTH`, the informat, or 8), implied decimals, `FLOWOVER`, and
   `LOST CARD`, with a warning for each note SAS would write. Later steps know
   the columns of such a data set, their types, and their text lengths.
+- Two SAS examples bring their own data as data lines:
+  `customer_cleanup.sas` (cleaning, `PROC SORT`, `PROC PRINT`) and
+  `account_risk.sas` (`PROC SQL` with `CASE` and `CALCULATED`). They are in
+  the playground's examples too.
 - SAS PROC SQL: `CASE` expressions (with conditions, or an operand compared
   with each value; missing without `ELSE`), also inside summary functions, and
   `CALCULATED` columns in `SELECT` and `WHERE`; in a query with summaries, a
